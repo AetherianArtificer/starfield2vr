@@ -114,6 +114,108 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         return;
     }
 
+    // Matching-letters layout (default): each physical button sends the gamepad button with the
+    // same label, so in-game prompts match the controller. See docs/motion-controls.md "P2b".
+    if (GameFlow::gStore.internalSettings.controllerLayout == 0) {
+        using clock = std::chrono::steady_clock;
+        constexpr auto kTapPulse = std::chrono::milliseconds(100);
+        constexpr auto kMenuHold = std::chrono::milliseconds(500);
+        constexpr float kStickDeflection = 0.5f;
+
+        auto& buttons = pXinputGamepad->wButtons;
+
+        // Letters follow the physical labels: A/B on the right controller, X/Y on the left.
+        if (is_action_active_any_joystick(m_action_a_button_right)) buttons |= XINPUT_GAMEPAD_A;
+        if (is_action_active_any_joystick(m_action_b_button_right)) buttons |= XINPUT_GAMEPAD_B;
+        if (is_action_active_any_joystick(m_action_a_button_left))  buttons |= XINPUT_GAMEPAD_X;
+        if (is_action_active_any_joystick(m_action_b_button_left))  buttons |= XINPUT_GAMEPAD_Y;
+
+        if (is_left_joystick_click_down)  buttons |= XINPUT_GAMEPAD_LEFT_THUMB;
+        if (is_right_joystick_click_down) buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+
+        const auto left_trigger_down  = is_action_active(m_action_trigger, left_joystick);
+        const auto right_trigger_down = is_action_active(m_action_trigger, right_joystick);
+        const auto left_grip_down     = is_action_active(m_action_grip, left_joystick);
+        const auto right_grip_down    = is_action_active(m_action_grip, right_joystick);
+
+        if (left_trigger_down)  pXinputGamepad->bLeftTrigger  = 255;
+        if (right_trigger_down) pXinputGamepad->bRightTrigger = 255;
+        if (right_grip_down)    buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+
+        const auto now = clock::now();
+        const auto left_axis  = get_joystick_axis(left_joystick);
+        const auto right_axis = get_joystick_axis(right_joystick);
+
+        // Left grip: held with the left stick it is a D-pad; a tap with no stick use sends LB on release.
+        static bool              left_grip_was_down{false};
+        static bool              left_grip_used_as_modifier{false};
+        static clock::time_point lb_pulse_until{};
+
+        if (left_grip_down) {
+            if (std::abs(left_axis.x) >= kStickDeflection || std::abs(left_axis.y) >= kStickDeflection || is_left_joystick_click_down) {
+                left_grip_used_as_modifier = true;
+            }
+            if (left_axis.y >= kStickDeflection)  buttons |= XINPUT_GAMEPAD_DPAD_UP;
+            if (left_axis.y <= -kStickDeflection) buttons |= XINPUT_GAMEPAD_DPAD_DOWN;
+            if (left_axis.x >= kStickDeflection)  buttons |= XINPUT_GAMEPAD_DPAD_RIGHT;
+            if (left_axis.x <= -kStickDeflection) buttons |= XINPUT_GAMEPAD_DPAD_LEFT;
+
+            if (is_left_joystick_click_down) {
+                // Left grip + left stick click: toggle the flat-screen view (as in the legacy layout).
+                buttons &= ~XINPUT_GAMEPAD_LEFT_THUMB;
+                static clock::time_point last_flat_toggle{};
+                if (now - last_flat_toggle > kMenuHold) {
+                    last_flat_toggle = now;
+                    auto& flat_screen = ModSettings::g_internalSettings.forceFlatScreen;
+                    flat_screen = !flat_screen;
+                }
+            }
+        } else if (left_grip_was_down) {
+            if (!left_grip_used_as_modifier) {
+                lb_pulse_until = now + kTapPulse;
+            }
+            left_grip_used_as_modifier = false;
+        }
+        left_grip_was_down = left_grip_down;
+
+        if (now < lb_pulse_until) buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
+
+        // Menu button: tap = Start (pause), hold = View/Back (data menus).
+        static bool              menu_was_down{false};
+        static clock::time_point menu_down_since{};
+        static clock::time_point start_pulse_until{};
+
+        const auto menu_down = is_action_active_any_joystick(m_action_system_button);
+        if (menu_down) {
+            if (!menu_was_down) {
+                menu_down_since = now;
+            }
+            if (now - menu_down_since >= kMenuHold) {
+                buttons |= XINPUT_GAMEPAD_BACK;
+            }
+        } else if (menu_was_down && now - menu_down_since < kMenuHold) {
+            start_pulse_until = now + kTapPulse;
+        }
+        menu_was_down = menu_down;
+
+        if (now < start_pulse_until) buttons |= XINPUT_GAMEPAD_START;
+
+        // Explicit D-pad actions (controllers that have one).
+        if (is_action_active_any_joystick(m_action_dpad_up))    buttons |= XINPUT_GAMEPAD_DPAD_UP;
+        if (is_action_active_any_joystick(m_action_dpad_right)) buttons |= XINPUT_GAMEPAD_DPAD_RIGHT;
+        if (is_action_active_any_joystick(m_action_dpad_down))  buttons |= XINPUT_GAMEPAD_DPAD_DOWN;
+        if (is_action_active_any_joystick(m_action_dpad_left))  buttons |= XINPUT_GAMEPAD_DPAD_LEFT;
+
+        // Sticks. While the left grip turns the left stick into a D-pad, don't also move.
+        if (!left_grip_down) {
+            pXinputGamepad->sThumbLX = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbLX + left_axis.x * 32767.0f, -32767.0f, 32767.0f);
+            pXinputGamepad->sThumbLY = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbLY + left_axis.y * 32767.0f, -32767.0f, 32767.0f);
+        }
+        pXinputGamepad->sThumbRX = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbRX + right_axis.x * 32767.0f, -32767.0f, 32767.0f);
+        pXinputGamepad->sThumbRY = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbRY + right_axis.y * 32767.0f, -32767.0f, 32767.0f);
+        return;
+    }
+
     if (is_right_a_button_down) {
         pXinputGamepad->wButtons |= XINPUT_GAMEPAD_A;
     }

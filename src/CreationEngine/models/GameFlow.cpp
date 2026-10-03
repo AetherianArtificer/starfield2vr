@@ -16,7 +16,35 @@ namespace GameFlow
             {       "Interface/MonocleMenu_LRG.swf"_DJB,   { 0.6f, 100 } }
     };
 
+    // Loading-screen tracking for automatic recentering. The startup recenter fires on the first
+    // valid HMD pose, which a headset lying on the desk already reports; the end of a loading
+    // screen is a moment when the player is reliably wearing it.
+    namespace
+    {
+        constexpr int kFramesAfterLoadingToRecenter = 30;
+
+        bool loading_seen_this_frame{false};
+        bool loading_pending{false};
+        int  frames_since_loading{0};
+
+        void update_loading_recenter()
+        {
+            if (loading_seen_this_frame) {
+                loading_pending      = true;
+                frames_since_loading = 0;
+            } else if (loading_pending && ++frames_since_loading >= kFramesAfterLoadingToRecenter) {
+                loading_pending = false;
+                if (gStore.internalSettings.recenterAfterLoading) {
+                    spdlog::info("[GameFlow] Loading screen ended, requesting recenter");
+                    vr->get_runtime()->wants_reset_origin = true;
+                }
+            }
+            loading_seen_this_frame = false;
+        }
+    }
+
     void resetGameState() {
+        update_loading_recenter();
         gStore.debugData.ui_parts.clear();
         gState.uiData.modulino++;
         gState.uiData.rendered_menus_count[gState.uiData.modulino % 2] = 0;
@@ -67,8 +95,13 @@ namespace GameFlow
         case "Interface/DataMenu_LRG.swf"_DJB:
         case "Interface/InventoryMenu.swf"_DJB:
         case "Interface/InventoryMenu_LRG.swf"_DJB:
+            gState.uiData.rendered_menus_count[gState.uiData.modulino % 2]++;
+            break;
         case "Interface/LoadingMenu.swf"_DJB:
         case "Interface/LoadingMenu_LRG.swf"_DJB:
+            loading_seen_this_frame = true;
+            gState.uiData.rendered_menus_count[gState.uiData.modulino % 2]++;
+            break;
         case "Interface/PauseMenu.swf"_DJB:
         case "Interface/PauseMenu_LRG.swf"_DJB:
         case "Interface/GalaxyStarMapMenu.swf"_DJB:

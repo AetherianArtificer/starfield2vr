@@ -24,6 +24,8 @@ namespace GameFlow
             bool nvidiaAndTAAfix{true};
             bool preventZoom{false};
             bool alternativeJoyLayout{false};
+            int  controllerLayout{0}; // 0 = matching letters (Quest/Touch), 1 = legacy
+            bool recenterAfterLoading{true};
             bool decoupledPitch{false};
             bool pawnControl{true};
         } internalSettings{};

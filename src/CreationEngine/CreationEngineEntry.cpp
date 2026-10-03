@@ -33,9 +33,17 @@ void CreationEngineEntry::on_draw_ui()
     {
         GameFlow::gStore.hudSettings.perspective = (int) m_hud_perspective->value();
     }
-    if(m_alternative_joy_layout->draw("Alternative Joy Layout"))
+    if(m_controller_layout->draw("Controller Layout"))
+    {
+        GameFlow::gStore.internalSettings.controllerLayout = m_controller_layout->value();
+    }
+    if(GameFlow::gStore.internalSettings.controllerLayout == 1 && m_alternative_joy_layout->draw("Alternative Joy Layout"))
     {
         GameFlow::gStore.internalSettings.alternativeJoyLayout = m_alternative_joy_layout->value();
+    }
+    if(m_recenter_after_loading->draw("Recenter After Loading Screens"))
+    {
+        GameFlow::gStore.internalSettings.recenterAfterLoading = m_recenter_after_loading->value();
     }
     if(m_dominant_eye->draw("Dominant Eye"))
     {
@@ -204,6 +212,8 @@ void CreationEngineEntry::on_config_load(const utility::Config& cfg, bool set_de
     GameFlow::gStore.hudSettings.perspective = (int) m_hud_perspective->value();
     GameFlow::gStore.internalSettings.alternativeJoyLayout = m_alternative_joy_layout->value();
     GameFlow::gStore.internalSettings.decoupledPitch = m_decoupled_pitch->value();
+    GameFlow::gStore.internalSettings.controllerLayout = m_controller_layout->value();
+    GameFlow::gStore.internalSettings.recenterAfterLoading = m_recenter_after_loading->value();
 }
 
 void CreationEngineEntry::on_config_save(utility::Config& cfg)
