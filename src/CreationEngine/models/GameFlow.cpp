@@ -27,6 +27,10 @@ namespace GameFlow
         bool loading_pending{false};
         int  frames_since_loading{0};
 
+        // The ship HUD is only drawn while piloting; snap turn must leave the stick to the ship then.
+        bool ship_hud_seen_this_frame{false};
+        std::atomic<bool> ship_hud_last_frame{false};
+
         void update_loading_recenter()
         {
             if (loading_seen_this_frame) {
@@ -45,6 +49,8 @@ namespace GameFlow
 
     void resetGameState() {
         update_loading_recenter();
+        ship_hud_last_frame.store(ship_hud_seen_this_frame);
+        ship_hud_seen_this_frame = false;
         gStore.debugData.ui_parts.clear();
         gState.uiData.modulino++;
         gState.uiData.rendered_menus_count[gState.uiData.modulino % 2] = 0;
@@ -52,10 +58,12 @@ namespace GameFlow
 
     void renderMenu(std::string_view menuNameHash) {
         switch (djb2Hash(menuNameHash.data())) {
-        case "Interface/HUDMenu.gfx"_DJB:
-        case "Interface/HUDMenu_LRG.gfx"_DJB:
         case "Interface/SpaceshipHudMenu.swf"_DJB:
         case "Interface/SpaceshipHudMenu_LRG.swf"_DJB:
+            ship_hud_seen_this_frame = true;
+            [[fallthrough]];
+        case "Interface/HUDMenu.gfx"_DJB:
+        case "Interface/HUDMenu_LRG.gfx"_DJB:
             //            case "Interface/HUDMessagesMenu.gfx"_DJB:
         case "Interface/ScopeMenu.swf"_DJB:
         case "Interface/ScopeMenu_LRG.swf"_DJB:
@@ -134,6 +142,10 @@ namespace GameFlow
 
     bool isShowingMenu() {
         return gState.uiData.rendered_menus_count[(gState.uiData.modulino + 1) % 2] >= 0;
+    }
+
+    bool isPilotingShip() {
+        return ship_hud_last_frame.load();
     }
 
     bool isAimingDownSights() {

@@ -45,6 +45,14 @@ void CreationEngineEntry::on_draw_ui()
     {
         GameFlow::gStore.internalSettings.recenterAfterLoading = m_recenter_after_loading->value();
     }
+    if(m_turn_mode->draw("Turn Mode"))
+    {
+        GameFlow::gStore.internalSettings.turnMode = m_turn_mode->value();
+    }
+    if(GameFlow::gStore.internalSettings.turnMode == 0 && m_snap_turn_degrees->draw("Snap Turn Angle"))
+    {
+        GameFlow::gStore.internalSettings.snapTurnDegrees = m_snap_turn_degrees->value();
+    }
     if(m_dominant_eye->draw("Dominant Eye"))
     {
         ModConstants::dominantEye = m_dominant_eye->value();
@@ -214,6 +222,8 @@ void CreationEngineEntry::on_config_load(const utility::Config& cfg, bool set_de
     GameFlow::gStore.internalSettings.decoupledPitch = m_decoupled_pitch->value();
     GameFlow::gStore.internalSettings.controllerLayout = m_controller_layout->value();
     GameFlow::gStore.internalSettings.recenterAfterLoading = m_recenter_after_loading->value();
+    GameFlow::gStore.internalSettings.turnMode = m_turn_mode->value();
+    GameFlow::gStore.internalSettings.snapTurnDegrees = m_snap_turn_degrees->value();
 }
 
 void CreationEngineEntry::on_config_save(utility::Config& cfg)

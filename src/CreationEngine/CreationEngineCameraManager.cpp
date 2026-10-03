@@ -329,6 +329,17 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
         // order of extraction Pitch->Yaw->Roll (Havok X->Z->Y)
         auto p_player = CreationEngineSingletonManager::GetPlayerRef();
 
+        // Apply a queued snap turn. The rotation computed above is already final for this frame, so the
+        // new yaw shows on the next one; applying it on the right-eye frame makes it land at the start of
+        // an eye pair, so the two eyes of a pair never disagree about yaw.
+        if (p_player && vr->get_current_render_eye() == VRRuntime::Eye::RIGHT) {
+            if (const float snap = GameFlow::pendingSnapYaw.exchange(0.0f); snap != 0.0f) {
+                const float two_pi = 2.0f * glm::pi<float>();
+                p_player->data.angle.z = std::fmod(p_player->data.angle.z + snap + two_pi, two_pi);
+                spdlog::info("[SnapTurn] Applied {:.0f} degrees on engine frame {}", glm::degrees(snap), vr->m_engine_frame_count);
+            }
+        }
+
         RE::NiMatrix3 havok_rotation;
         quat_out->ToMatrix(havok_rotation);
         float pitch, yaw, roll;
@@ -363,5 +374,6 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
         }
     } else {
         yaw_offset = 0.0f;
+        GameFlow::pendingSnapYaw.store(0.0f); // don't let a turn queued before a dialogue fire after it
     }
 }

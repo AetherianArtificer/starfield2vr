@@ -26,6 +26,8 @@ namespace GameFlow
             bool alternativeJoyLayout{false};
             int  controllerLayout{0}; // 0 = matching letters (Quest/Touch), 1 = legacy
             bool recenterAfterLoading{true};
+            int   turnMode{0}; // 0 = snap, 1 = smooth (game's own stick look)
+            float snapTurnDegrees{45.0f};
             bool decoupledPitch{false};
             bool pawnControl{true};
         } internalSettings{};

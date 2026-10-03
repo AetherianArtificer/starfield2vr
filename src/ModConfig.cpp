@@ -11,6 +11,7 @@
 #include "CreationEngine/CreationEngineEntry.h"
 #include "CreationEngine/GameSettingsComponent.h"
 #include "CreationEngine/models/ModSettingsStore.h"
+#include "CreationEngine/models/GameFlow.h"
 
 namespace ModSettings {
     // HudScale g_hudScale;
@@ -114,6 +115,30 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         return;
     }
 
+    // Snap turn (docs/motion-controls.md "C1"): a right-stick flick queues a discrete yaw step that the
+    // camera hook applies once; the stick's X axis is then withheld from the game. Menus and ship
+    // piloting keep the raw stick.
+    const auto& internal_settings = GameFlow::gStore.internalSettings;
+    const bool snap_turn_active = internal_settings.turnMode == 0 && !GameFlow::isShowingMenu() && !GameFlow::isPilotingShip();
+    if (snap_turn_active) {
+        constexpr float kSnapTrigger = 0.7f;
+        constexpr float kSnapRearm   = 0.3f;
+        constexpr auto  kSnapRepeat  = std::chrono::milliseconds(300);
+
+        static bool                                  snap_armed{true};
+        static std::chrono::steady_clock::time_point last_snap{};
+
+        const float x = get_joystick_axis(right_joystick).x;
+        if (std::abs(x) < kSnapRearm) {
+            snap_armed = true;
+        } else if (snap_armed && std::abs(x) >= kSnapTrigger && now - last_snap >= kSnapRepeat) {
+            snap_armed = false;
+            last_snap  = now;
+            const float step = glm::radians(internal_settings.snapTurnDegrees) * (x > 0.0f ? 1.0f : -1.0f);
+            GameFlow::pendingSnapYaw.fetch_add(step);
+        }
+    }
+
     // Matching-letters layout (default): each physical button sends the gamepad button with the
     // same label, so in-game prompts match the controller. See docs/motion-controls.md "P2b".
     if (GameFlow::gStore.internalSettings.controllerLayout == 0) {
@@ -211,7 +236,9 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             pXinputGamepad->sThumbLX = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbLX + left_axis.x * 32767.0f, -32767.0f, 32767.0f);
             pXinputGamepad->sThumbLY = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbLY + left_axis.y * 32767.0f, -32767.0f, 32767.0f);
         }
-        pXinputGamepad->sThumbRX = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbRX + right_axis.x * 32767.0f, -32767.0f, 32767.0f);
+        if (!snap_turn_active) {
+            pXinputGamepad->sThumbRX = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbRX + right_axis.x * 32767.0f, -32767.0f, 32767.0f);
+        }
         pXinputGamepad->sThumbRY = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbRY + right_axis.y * 32767.0f, -32767.0f, 32767.0f);
         return;
     }
@@ -338,7 +365,9 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     pXinputGamepad->sThumbLX = (int16_t)std::clamp<float>(((float)pXinputGamepad->sThumbLX + left_joystick_axis.x * 32767.0f), -32767.0f, 32767.0f);
     pXinputGamepad->sThumbLY = (int16_t)std::clamp<float>(((float)pXinputGamepad->sThumbLY + left_joystick_axis.y * 32767.0f), -32767.0f, 32767.0f);
 
-    pXinputGamepad->sThumbRX = (int16_t)std::clamp<float>(((float)pXinputGamepad->sThumbRX + right_joystick_axis.x * 32767.0f), -32767.0f, 32767.0f);
+    if (!snap_turn_active) {
+        pXinputGamepad->sThumbRX = (int16_t)std::clamp<float>(((float)pXinputGamepad->sThumbRX + right_joystick_axis.x * 32767.0f), -32767.0f, 32767.0f);
+    }
     pXinputGamepad->sThumbRY = (int16_t)std::clamp<float>(((float)pXinputGamepad->sThumbRY + right_joystick_axis.y * 32767.0f), -32767.0f, 32767.0f);
 
 
