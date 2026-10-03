@@ -534,3 +534,6 @@ FodyWeavers.xsd
 build/
 
 artifact/*
+
+# Local install staging
+dist/
