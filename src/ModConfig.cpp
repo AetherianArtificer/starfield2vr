@@ -115,9 +115,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         return;
     }
 
-    // Snap turn (docs/motion-controls.md "C1"): a right-stick flick queues a discrete yaw step that the
-    // camera hook applies once; the stick's X axis is then withheld from the game. Menus and ship
-    // piloting keep the raw stick.
+    // Snap turn: a right-stick flick queues a yaw step; menus and ship piloting keep the raw stick.
     const auto& internal_settings = GameFlow::gStore.internalSettings;
     const bool snap_turn_active = internal_settings.turnMode == 0 && !GameFlow::isShowingMenu() && !GameFlow::isPilotingShip();
     if (snap_turn_active) {
@@ -139,8 +137,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         }
     }
 
-    // Matching-letters layout (default): each physical button sends the gamepad button with the
-    // same label, so in-game prompts match the controller. See docs/motion-controls.md "P2b".
+    // Matching letters: each button sends the gamepad button with the same label.
     if (GameFlow::gStore.internalSettings.controllerLayout == 0) {
         using clock = std::chrono::steady_clock;
         constexpr auto kTapPulse = std::chrono::milliseconds(100);
@@ -149,7 +146,6 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
 
         auto& buttons = pXinputGamepad->wButtons;
 
-        // Letters follow the physical labels: A/B on the right controller, X/Y on the left.
         if (is_action_active_any_joystick(m_action_a_button_right)) buttons |= XINPUT_GAMEPAD_A;
         if (is_action_active_any_joystick(m_action_b_button_right)) buttons |= XINPUT_GAMEPAD_B;
         if (is_action_active_any_joystick(m_action_a_button_left))  buttons |= XINPUT_GAMEPAD_X;
@@ -186,7 +182,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             if (left_axis.x <= -kStickDeflection) buttons |= XINPUT_GAMEPAD_DPAD_LEFT;
 
             if (is_left_joystick_click_down) {
-                // Left grip + left stick click: toggle the flat-screen view (as in the legacy layout).
+                // Left grip + left stick click toggles the flat-screen view.
                 buttons &= ~XINPUT_GAMEPAD_LEFT_THUMB;
                 static clock::time_point last_flat_toggle{};
                 if (now - last_flat_toggle > kMenuHold) {
@@ -225,13 +221,12 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
 
         if (now < start_pulse_until) buttons |= XINPUT_GAMEPAD_START;
 
-        // Explicit D-pad actions (controllers that have one).
         if (is_action_active_any_joystick(m_action_dpad_up))    buttons |= XINPUT_GAMEPAD_DPAD_UP;
         if (is_action_active_any_joystick(m_action_dpad_right)) buttons |= XINPUT_GAMEPAD_DPAD_RIGHT;
         if (is_action_active_any_joystick(m_action_dpad_down))  buttons |= XINPUT_GAMEPAD_DPAD_DOWN;
         if (is_action_active_any_joystick(m_action_dpad_left))  buttons |= XINPUT_GAMEPAD_DPAD_LEFT;
 
-        // Sticks. While the left grip turns the left stick into a D-pad, don't also move.
+        // The left stick is a D-pad while the left grip is held.
         if (!left_grip_down) {
             pXinputGamepad->sThumbLX = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbLX + left_axis.x * 32767.0f, -32767.0f, 32767.0f);
             pXinputGamepad->sThumbLY = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbLY + left_axis.y * 32767.0f, -32767.0f, 32767.0f);

@@ -214,14 +214,31 @@ void CreationEngineRendererModule::SetWindowSize(int width, int height)
         }
     }
 
-    auto window       = (*m_creationEngineSettings)->pHwindow;
-    int  windowWidth  = window->windowCX - window->windowX;
-    int  windowHeight = window->windowCY - window->windowY;
-    if (windowWidth == width && windowHeight == height) {
+    // Compare the render target, not the window: Windows clamps bordered windows to the screen size.
+    constexpr int kMaxResizeAttempts = 3;
+    static int    resize_attempts{ 0 };
+    static int    last_target_width{ 0 };
+    static int    last_target_height{ 0 };
+
+    const auto backbuffer = VR::get()->get_backbuffer_size();
+    if ((int)backbuffer[0] == width && (int)backbuffer[1] == height) {
+        resize_attempts = 0;
         return;
     }
+    if (width != last_target_width || height != last_target_height) {
+        last_target_width  = width;
+        last_target_height = height;
+        resize_attempts    = 0;
+    }
+    if (resize_attempts >= kMaxResizeAttempts) {
+        if (resize_attempts++ == kMaxResizeAttempts) {
+            spdlog::warn("Render size is still {}x{} after {} resize requests for {}x{}; giving up", backbuffer[0], backbuffer[1], kMaxResizeAttempts, width, height);
+        }
+        return;
+    }
+    ++resize_attempts;
 
-    spdlog::info("Setting window size to {} {}", width, height);
+    spdlog::info("Setting window size to {} {} (back buffer {}x{}, attempt {})", width, height, backbuffer[0], backbuffer[1], resize_attempts);
     auto ce_rect = &(*m_creationEngineSettings)->displayGameSettings.displayRect;
 
     ce_rect->cx = width + ce_rect->x;

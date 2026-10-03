@@ -226,6 +226,15 @@ void CreationEngineEntry::on_config_load(const utility::Config& cfg, bool set_de
     GameFlow::gStore.internalSettings.snapTurnDegrees = m_snap_turn_degrees->value();
 }
 
+void CreationEngineEntry::sync_from_store()
+{
+    const auto& s = GameFlow::gStore.internalSettings;
+    m_turn_mode->value() = s.turnMode;
+    m_snap_turn_degrees->value() = s.snapTurnDegrees;
+    m_recenter_after_loading->value() = s.recenterAfterLoading;
+    m_controller_layout->value() = s.controllerLayout;
+}
+
 void CreationEngineEntry::on_config_save(utility::Config& cfg)
 {
     for (IModValue& option : m_options) {

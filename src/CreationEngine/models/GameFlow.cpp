@@ -16,9 +16,7 @@ namespace GameFlow
             {       "Interface/MonocleMenu_LRG.swf"_DJB,   { 0.6f, 100 } }
     };
 
-    // Loading-screen tracking for automatic recentering. The startup recenter fires on the first
-    // valid HMD pose, which a headset lying on the desk already reports; the end of a loading
-    // screen is a moment when the player is reliably wearing it.
+    // Recenter after loading screens; the startup recenter can fire before the headset is worn.
     namespace
     {
         constexpr int kFramesAfterLoadingToRecenter = 30;
@@ -27,7 +25,7 @@ namespace GameFlow
         bool loading_pending{false};
         int  frames_since_loading{0};
 
-        // The ship HUD is only drawn while piloting; snap turn must leave the stick to the ship then.
+        // The ship HUD is only drawn while piloting.
         bool ship_hud_seen_this_frame{false};
         std::atomic<bool> ship_hud_last_frame{false};
 

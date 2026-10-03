@@ -3,8 +3,7 @@
 #include <cstdint>
 #include <windows.h>
 
-// Mirrors SFSEPluginVersionData / SFSEInterface from ianpatt/sfse sfse/PluginAPI.h.
-// Declared locally because this build uses sdk-lite rather than CommonLibSF.
+// From sfse/PluginAPI.h.
 namespace
 {
     struct SFSEInterface
@@ -29,11 +28,24 @@ namespace
         std::uint32_t reservedBreaking;
     };
 
+    struct SFSEMenuInterface
+    {
+        std::uint32_t interfaceVersion;
+        void (*RegisterMenuMovieCreated)(void (*callback)(void* menu));
+    };
+
+    constexpr std::uint32_t kInterface_Menu = 3;
+
     constexpr std::uint32_t kAddressIndependence_Signatures         = 1 << 0;
     constexpr std::uint32_t kStructureIndependence_1_14_70_Layout = 1 << 3;
 } // namespace
 
 void StartVR();
+
+namespace VRSettingsMenu
+{
+    void OnMenuMovieCreated(void* menu);
+}
 
 extern "C" {
 __declspec(dllexport) SFSEPluginVersionData SFSEPlugin_Version = {
@@ -49,8 +61,13 @@ __declspec(dllexport) SFSEPluginVersionData SFSEPlugin_Version = {
     0,
 };
 
-__declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface*)
+__declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
 {
+    if (sfse && sfse->QueryInterface) {
+        if (auto menu = static_cast<SFSEMenuInterface*>(sfse->QueryInterface(kInterface_Menu)); menu && menu->RegisterMenuMovieCreated) {
+            menu->RegisterMenuMovieCreated(&VRSettingsMenu::OnMenuMovieCreated);
+        }
+    }
     StartVR();
     return true;
 }

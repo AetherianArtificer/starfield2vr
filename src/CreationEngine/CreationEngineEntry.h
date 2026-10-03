@@ -17,6 +17,8 @@ public:
     void                       on_config_load(const utility::Config& cfg, bool ) override;
     void                       on_config_save(utility::Config& cfg) override;
 
+    void sync_from_store();
+
 private:
     inline static const std::vector<std::string> s_dominant_eye{
         "Right",

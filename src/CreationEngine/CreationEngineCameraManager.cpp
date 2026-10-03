@@ -11,6 +11,7 @@
 #include <CreationEngine/memory/offsets.h>
 #include <CreationEngine/models/GameFlow.h>
 #include <CreationEngine/models/ModSettingsStore.h>
+#include <CreationEngine/ui/VRSettingsMenu.h>
 #include <REL/Relocation.h>
 #include <cstdlib>
 #include <glm/gtx/vector_angle.hpp>
@@ -170,6 +171,7 @@ CreationEngineCameraManager::onScaleformSetViewPortInternal(uintptr_t *thisMovie
     auto cc = reinterpret_cast<RE::Scaleform::GFx::MovieImpl *>(thisMovie);
     auto file_url = cc->GetMovieDef()->GetFileURL();
     GameFlow::renderMenu(file_url);
+    VRSettingsMenu::OnMovieFrame(thisMovie, file_url);
 
     auto backbuffer_size = vr->get_backbuffer_size();
     auto viewport_buffer_width = viewport->bufferWidth;
@@ -329,9 +331,7 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
         // order of extraction Pitch->Yaw->Roll (Havok X->Z->Y)
         auto p_player = CreationEngineSingletonManager::GetPlayerRef();
 
-        // Apply a queued snap turn. The rotation computed above is already final for this frame, so the
-        // new yaw shows on the next one; applying it on the right-eye frame makes it land at the start of
-        // an eye pair, so the two eyes of a pair never disagree about yaw.
+        // Applied on the right-eye frame so the turn lands at the start of an eye pair.
         if (p_player && vr->get_current_render_eye() == VRRuntime::Eye::RIGHT) {
             if (const float snap = GameFlow::pendingSnapYaw.exchange(0.0f); snap != 0.0f) {
                 const float two_pi = 2.0f * glm::pi<float>();
@@ -374,6 +374,6 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
         }
     } else {
         yaw_offset = 0.0f;
-        GameFlow::pendingSnapYaw.store(0.0f); // don't let a turn queued before a dialogue fire after it
+        GameFlow::pendingSnapYaw.store(0.0f);
     }
 }
