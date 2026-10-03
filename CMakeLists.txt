@@ -35,6 +35,12 @@ endif()
 add_library(common INTERFACE)
 target_link_libraries(vr_framework PRIVATE common)
 
+# Write vr_log.txt in non-debug builds too (vrframework otherwise uses a null logger).
+option(VR_LOGGING "Enable vr_log.txt in release builds" ON)
+if(VR_LOGGING)
+  target_compile_definitions(common INTERFACE VR_ENABLE_LOGGING)
+endif()
+
 
 file(
   GLOB_RECURSE
