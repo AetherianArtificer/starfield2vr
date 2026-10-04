@@ -361,6 +361,7 @@ uintptr_t CreationEngineRendererModule::setReflexMarkerInternal(uintptr_t rcx, u
                 sync_marker_started = false;
             }
         }
+        CreationEngineCameraManager::SnapshotAimPose();
         cameraModule->UpdateWorldCamera();
     }
     // Reset notification if marker is 1

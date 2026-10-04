@@ -93,8 +93,8 @@ VROptions::VROptions()
         { "Matching letters", "Legacy" }, 0);
     add(kMoveDirection, kCategoryControls, Kind::Choice, "MoveDirection", "Movement Direction", "Move toward where your head or your left hand points.",
         { "Head", "Left Hand" }, 1);
-    add(kAimWith, kCategoryControls, Kind::Choice, "AimWith", "Aim With", "How your weapon follows your head.",
-        { "Head when aiming", "Free", "Always head" }, 0);
+    add(kAimWith, kCategoryControls, Kind::Choice, "AimWith", "Aim With", "Aim with your head, or point your weapon with your right hand.",
+        { "Head when aiming", "Free", "Always head", "Right Hand" }, 0);
 }
 
 const VROptions::Option* VROptions::find(std::uint32_t id) const

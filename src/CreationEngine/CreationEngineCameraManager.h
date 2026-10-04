@@ -89,6 +89,7 @@ public:
     }
 
     void                          UpdateWorldCamera();
+    static void                   SnapshotAimPose();
     static void onNiAVObjectUpdateWorld(RE::NiAVObject* obj, RE::NiUpdateData* a_data);
     void onScaleformSetViewPort(uintptr_t* thisMovie, Scaleform::Gfx::Viewport* viewport);
 

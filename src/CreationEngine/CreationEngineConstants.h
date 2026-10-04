@@ -15,4 +15,5 @@ namespace ModConstants
     inline std::array<int, NUM_STAGES> rgResourceCount{2,2,2,2,2,2,2,1,2,2,2,2};
     inline int dominantEye{0};
     inline int headTrackingType{0};
+    inline constexpr int kAimWithRightHand = 3;
 }

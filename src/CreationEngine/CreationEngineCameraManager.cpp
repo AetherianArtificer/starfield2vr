@@ -14,6 +14,7 @@
 #include <CreationEngine/ui/VRSettingsMenu.h>
 #include <REL/Relocation.h>
 #include <cstdlib>
+#include <mutex>
 #include <glm/gtx/vector_angle.hpp>
 #include <mods/VR.hpp>
 
@@ -96,6 +97,45 @@ void CreationEngineCameraManager::InstallHooks() {
 }
 
 
+namespace
+{
+    // Aim rotation (stage space) sampled once per engine frame, shared by the view, the aim and the meshes.
+    std::mutex g_aim_mutex;
+    glm::mat4  g_aim_rotation{ 1.0f };
+    // The rotation last written into the game camera, and the engine frame it was written on.
+    glm::mat4  g_applied_aim_rotation{ 1.0f };
+    int        g_applied_aim_frame{ -1000 };
+
+    glm::mat4 AimRotation()
+    {
+        std::scoped_lock _{ g_aim_mutex };
+        return g_aim_rotation;
+    }
+
+    void RecordAppliedAim(const glm::mat4& rotation, int frame)
+    {
+        std::scoped_lock _{ g_aim_mutex };
+        g_applied_aim_rotation = rotation;
+        g_applied_aim_frame    = frame;
+    }
+
+    // The rotation the camera's parent will carry this frame. If the game stopped updating its camera
+    // (paused by a menu or popup), it still carries the last applied one.
+    glm::mat4 CameraParentAimRotation(int frame)
+    {
+        std::scoped_lock _{ g_aim_mutex };
+        return frame - g_applied_aim_frame <= 2 ? g_aim_rotation : g_applied_aim_rotation;
+    }
+}
+
+void CreationEngineCameraManager::SnapshotAimPose() {
+    static auto vr = VR::get();
+    const bool hand = ModConstants::headTrackingType == ModConstants::kAimWithRightHand && vr->is_using_controllers();
+    const auto rotation = vr->get_rotation(hand ? vr->get_right_controller_index() : 0);
+    std::scoped_lock _{ g_aim_mutex };
+    g_aim_rotation = rotation;
+}
+
 RE::NiAVObject *getCameraRootNode() {
     auto playerCamera = CreationEngineSingletonManager::GetPlayerCameraSingleton();
 
@@ -124,7 +164,7 @@ void UpdateMesh(RE::NiAVObject* camera) {
     auto camera_quat = RE::NiQuaternion(camera->world.rotate);
     auto glm_camera_quat = glm::normalize(glm::quat(camera_quat.w, camera_quat.x, camera_quat.y, camera_quat.z));
 
-    auto current_hmd_rotation = vr->get_rotation(0);
+    auto current_hmd_rotation = AimRotation();
     auto hmd_rotation_quat = glm::normalize(
             glm::quat_cast(current_hmd_rotation));
     hmd_rotation_quat = {hmd_rotation_quat.w, hmd_rotation_quat.x, -hmd_rotation_quat.z, hmd_rotation_quat.y};
@@ -295,7 +335,8 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
         hmd_transform[3].y -= standing_origin[3].y;
         hmd_transform[3].z -= standing_origin[3].z;
         auto eye = vr->get_current_eye_transform();
-        hmd_transform      = glm::inverse(glm::extractMatrixRotation(hmd_transform)) * hmd_transform * eye;
+        // The camera's parent carries the aim rotation; keep the view on the head.
+        hmd_transform      = glm::inverse(CameraParentAimRotation(vr->m_engine_frame_count)) * hmd_transform * eye;
         hmd_transform = to_havok_space(hmd_transform);
         worldCamera->local.rotate = originalRotation * *(RE::NiMatrix3*) & hmd_transform;
         worldCamera->local.translate.x = hmd_transform[3][0];
@@ -318,38 +359,6 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
 }
 
 
-namespace
-{
-    void SampleMotion(const RE::PlayerCharacter* player)
-    {
-        using clock = std::chrono::steady_clock;
-        static clock::time_point last_time{};
-        static RE::NiPoint3      last_position{};
-        static bool              has_sample{ false };
-
-        const auto  now = clock::now();
-        const float dt  = std::chrono::duration<float>(now - last_time).count();
-        if (has_sample && dt < 0.005f) {
-            return;  // called several times per frame
-        }
-
-        const auto position = player->data.location;
-        if (has_sample && dt < 0.25f) {
-            const float dx = position.x - last_position.x;
-            const float dy = position.y - last_position.y;
-            const float dz = position.z - last_position.z;
-
-            // Game units/s; vertical motion weighs more. Very large jumps are teleports or loads.
-            const float speed = std::max(std::sqrt(dx * dx + dy * dy), std::abs(dz) * 1.5f) / dt;
-            const float activity = speed > 3000.0f ? 0.0f : std::clamp((speed - 40.0f) / 260.0f, 0.0f, 1.0f);
-            GameFlow::motionActivity.store(activity);
-        }
-        last_time     = now;
-        last_position = position;
-        has_sample    = true;
-    }
-}
-
 void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *fps, RE::NiQuaternion *quat_out) {
     static auto instance = CreationEngineCameraManager::Get();
     static auto original_func = instance->m_onGetCameraRotationHook->get_original<decltype(onFPSGetCameraRotation)>();
@@ -362,9 +371,6 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
     if (!GameFlow::isImmovable() && !GameFlow::isControlledByAI()) {
         // order of extraction Pitch->Yaw->Roll (Havok X->Z->Y)
         auto p_player = CreationEngineSingletonManager::GetPlayerRef();
-        if (p_player) {
-            SampleMotion(p_player);
-        }
 
         // Applied on the right-eye frame so the turn lands at the start of an eye pair.
         if (p_player && vr->get_current_render_eye() == VRRuntime::Eye::RIGHT) {
@@ -383,6 +389,9 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
         auto current_hmd_rotation = vr->get_rotation(0);
         auto rotation_quat = glm::normalize(glm::quat_cast(to_havok_space(current_hmd_rotation)));
         auto ni_hmd_rotation = RE::NiQuaternion(rotation_quat.w, rotation_quat.x, rotation_quat.y, rotation_quat.z);
+        const auto aim_rotation = AimRotation();
+        const auto aim_quat = glm::normalize(glm::quat_cast(to_havok_space(aim_rotation)));
+        const auto ni_aim_rotation = RE::NiQuaternion(aim_quat.w, aim_quat.x, aim_quat.y, aim_quat.z);
         {
             if (GameFlow::gStore.internalSettings.pawnControl) {
                 yaw -= yaw_offset;
@@ -405,11 +414,11 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
                 pitch = 0.0f;
             }
             havok_rotation.FromEulerAnglesXYZ(pitch, roll, yaw);
-            *quat_out = RE::NiQuaternion(havok_rotation) * ni_hmd_rotation;
+            *quat_out = RE::NiQuaternion(havok_rotation) * ni_aim_rotation;
+            RecordAppliedAim(aim_rotation, vr->m_engine_frame_count);
         }
     } else {
         yaw_offset = 0.0f;
         GameFlow::pendingSnapYaw.store(0.0f);
-        GameFlow::motionActivity.store(0.0f);
     }
 }

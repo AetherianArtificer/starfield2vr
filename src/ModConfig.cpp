@@ -206,7 +206,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         const float dt = std::min(std::chrono::duration<float>(now - last_update).count(), 0.1f);
         last_update    = now;
 
-        float activity = on_foot ? std::max(glm::length(move_axis), GameFlow::motionActivity.load()) : 0.0f;
+        float activity = on_foot ? glm::length(move_axis) : 0.0f;
         if (on_foot && !snap_turn_active) {
             activity = std::max(activity, std::abs(look_axis.x));
         }
