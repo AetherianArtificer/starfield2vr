@@ -46,6 +46,8 @@ public:
         kDominantEye,
         kRecenterView,
         kTurnFade,
+        kWeaponFollowsHand,
+        kMatchBodyHeight,
 
         kFirstId = 8600,
         kLastId  = 8699,

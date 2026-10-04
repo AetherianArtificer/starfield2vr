@@ -76,6 +76,8 @@ VROptions::VROptions()
         { "70%", "80%", "90%", "100%", "110%", "120%", "130%", "150%" }, 3);
     add(kWorldScale, kCategoryDisplay, Kind::Choice, "WorldScale", "World Scale", "Make the world feel larger or smaller around you.",
         { "90%", "95%", "100%", "105%", "110%" }, 2);
+    add(kMatchBodyHeight, kCategoryDisplay, Kind::Toggle, "MatchBodyHeight", "Match Body Height",
+        "Scale your movement so your eyes and reach match your character's body. Measured when the view recenters.", on_off, 1);
     add(kHudSize, kCategoryDisplay, Kind::Choice, "HudSize", "HUD Size", "Size of the in-game HUD.", { "Small", "Medium", "Large" }, 1);
     add(kHudDepth, kCategoryDisplay, Kind::Choice, "HudDepth", "HUD Depth", "How far away the in-game HUD appears.", { "Near", "Medium", "Far" }, 1);
     add(kMenuDistance, kCategoryDisplay, Kind::Choice, "MenuDistance", "Menu Distance", "How far away full-screen menus appear.",
@@ -95,6 +97,8 @@ VROptions::VROptions()
         { "Head", "Left Hand" }, 1);
     add(kAimWith, kCategoryControls, Kind::Choice, "AimWith", "Aim With", "Aim with your head, or point your weapon with your right hand.",
         { "Head when aiming", "Free", "Always head", "Right Hand" }, 0);
+    add(kWeaponFollowsHand, kCategoryControls, Kind::Toggle, "WeaponFollowsHand", "Full Body (Experimental)",
+        "Show your character's body in first person. With Aim With set to Right Hand, your right hand and weapon follow the controller.", on_off, 0);
 }
 
 const VROptions::Option* VROptions::find(std::uint32_t id) const
@@ -175,7 +179,9 @@ void VROptions::apply() const
     s.vignetteStrength     = Pick(kVignetteStrengths, get(kVignette));
     s.preventZoom          = get(kAimZoom) == 0;
     s.controllerLayout     = get(kControllerLayout);
+    s.weaponFollowsHand    = get(kWeaponFollowsHand) != 0;
     s.recenterAfterLoading = get(kRecenterAfterLoading) != 0;
+    s.matchBodyHeight      = get(kMatchBodyHeight) != 0;
 
     auto& hud       = GameFlow::gStore.hudSettings;
     hud.hudScale    = Pick(kHudSizes, get(kHudSize));
