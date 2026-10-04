@@ -9,6 +9,7 @@
 
 #include "ModSettings.h"
 #include "CreationEngine/CreationEngineEntry.h"
+#include "CreationEngine/VROptions.h"
 #include "CreationEngine/GameSettingsComponent.h"
 #include "CreationEngine/models/ModSettingsStore.h"
 #include "CreationEngine/models/GameFlow.h"
@@ -29,6 +30,7 @@ Mods::Mods() {
     m_mods.emplace_back(ShaderDebugOverlay::Get());
 #endif
     m_mods.emplace_back(CreationEngineEntry::Get());
+    m_mods.emplace_back(VROptions::Get());
     m_mods.emplace_back(GameSettingsComponent::Get());
 }
 
@@ -73,6 +75,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         }
 
     if (!is_using_controllers()) {
+        set_comfort_vignette(0.0f);
         return;
     }
 
@@ -112,6 +115,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     }
 
     if (g_framework->is_drawing_ui()) {
+        set_comfort_vignette(0.0f);
         return;
     }
 
@@ -135,6 +139,76 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             const float step = glm::radians(internal_settings.snapTurnDegrees) * (x > 0.0f ? 1.0f : -1.0f);
             GameFlow::pendingSnapYaw.fetch_add(step);
         }
+    }
+
+    // Comfort shaping of the sticks, on foot only.
+    const bool on_foot = !GameFlow::isShowingMenu() && !GameFlow::isPilotingShip();
+    const bool block_sprint = on_foot && internal_settings.speedLimit < 1.0f;
+
+    Vector2f look_axis = get_joystick_axis(right_joystick);
+    if (on_foot) {
+        look_axis.x *= internal_settings.smoothTurnSpeed;
+        if (!internal_settings.stickPitch) {
+            look_axis.y = 0.0f;
+        }
+    }
+
+    const Vector2f move_axis = [&] {
+        Vector2f axis = get_joystick_axis(left_joystick);
+        if (!on_foot) {
+            return axis;
+        }
+        if (internal_settings.moveDirection == 1) {
+            const auto yaw_of = [](const Matrix4x4f& m) {
+                const auto forward = -Vector3f{ m[2] };
+                return std::atan2(forward.x, -forward.z);
+            };
+            const float delta = yaw_of(get_transform(get_left_controller_index())) - yaw_of(get_transform(0));
+            const float c = std::cos(delta), s = std::sin(delta);
+            axis = Vector2f{ axis.x * c + axis.y * s, -axis.x * s + axis.y * c };
+        }
+
+        // Ease the magnitude toward its target and keep the last direction while decelerating.
+        static Vector2f                              last_direction{ 0.0f, 1.0f };
+        static float                                 shaped_magnitude{ 0.0f };
+        static std::chrono::steady_clock::time_point last_update{ now };
+
+        const float magnitude = std::min(glm::length(axis), 1.0f);
+        if (magnitude > 0.05f) {
+            last_direction = axis / glm::length(axis);
+        }
+        const float target = std::min(magnitude, internal_settings.speedLimit);
+        const float dt     = std::min(std::chrono::duration<float>(now - last_update).count(), 0.1f);
+        last_update        = now;
+
+        if (internal_settings.smoothAcceleration) {
+            constexpr float kAccelPerSecond = 1.0f / 0.4f;
+            constexpr float kDecelPerSecond = 1.0f / 0.15f;
+            const float rate = target > shaped_magnitude ? kAccelPerSecond : kDecelPerSecond;
+            const float step = rate * dt;
+            shaped_magnitude = std::abs(target - shaped_magnitude) <= step ? target : shaped_magnitude + (target > shaped_magnitude ? step : -step);
+        } else {
+            shaped_magnitude = target;
+        }
+        return last_direction * shaped_magnitude;
+    }();
+
+    // Vignette while moving or turning smoothly on foot.
+    {
+        static float                                 vignette{ 0.0f };
+        static std::chrono::steady_clock::time_point last_update{ now };
+        const float dt = std::min(std::chrono::duration<float>(now - last_update).count(), 0.1f);
+        last_update    = now;
+
+        float activity = on_foot ? glm::length(move_axis) : 0.0f;
+        if (on_foot && !snap_turn_active) {
+            activity = std::max(activity, std::abs(look_axis.x));
+        }
+        const float t      = std::clamp((activity - 0.1f) / 0.4f, 0.0f, 1.0f);
+        const float target = internal_settings.vignetteStrength * t * t * (3.0f - 2.0f * t);
+        const float step   = (target > vignette ? 1.0f / 0.15f : 1.0f / 0.3f) * dt;
+        vignette           = std::abs(target - vignette) <= step ? target : vignette + (target > vignette ? step : -step);
+        set_comfort_vignette(vignette);
     }
 
     // Matching letters: each button sends the gamepad button with the same label.
@@ -165,7 +239,6 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
 
         const auto now = clock::now();
         const auto left_axis  = get_joystick_axis(left_joystick);
-        const auto right_axis = get_joystick_axis(right_joystick);
 
         // Left grip: held with the left stick it is a D-pad; a tap with no stick use sends LB on release.
         static bool              left_grip_was_down{false};
@@ -228,13 +301,16 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
 
         // The left stick is a D-pad while the left grip is held.
         if (!left_grip_down) {
-            pXinputGamepad->sThumbLX = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbLX + left_axis.x * 32767.0f, -32767.0f, 32767.0f);
-            pXinputGamepad->sThumbLY = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbLY + left_axis.y * 32767.0f, -32767.0f, 32767.0f);
+            pXinputGamepad->sThumbLX = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbLX + move_axis.x * 32767.0f, -32767.0f, 32767.0f);
+            pXinputGamepad->sThumbLY = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbLY + move_axis.y * 32767.0f, -32767.0f, 32767.0f);
         }
         if (!snap_turn_active) {
-            pXinputGamepad->sThumbRX = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbRX + right_axis.x * 32767.0f, -32767.0f, 32767.0f);
+            pXinputGamepad->sThumbRX = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbRX + look_axis.x * 32767.0f, -32767.0f, 32767.0f);
         }
-        pXinputGamepad->sThumbRY = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbRY + right_axis.y * 32767.0f, -32767.0f, 32767.0f);
+        pXinputGamepad->sThumbRY = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbRY + look_axis.y * 32767.0f, -32767.0f, 32767.0f);
+        if (block_sprint && !left_grip_down) {
+            buttons &= ~XINPUT_GAMEPAD_LEFT_THUMB;
+        }
         return;
     }
 
@@ -351,19 +427,19 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         pXinputGamepad->wButtons |= XINPUT_GAMEPAD_DPAD_LEFT;
     }
 
-    const auto left_joystick_axis = get_joystick_axis(left_joystick);
-    const auto right_joystick_axis = get_joystick_axis(right_joystick);
-
     const auto true_left_joystick_axis = get_joystick_axis(m_left_joystick);
     const auto true_right_joystick_axis = get_joystick_axis(m_right_joystick);
 
-    pXinputGamepad->sThumbLX = (int16_t)std::clamp<float>(((float)pXinputGamepad->sThumbLX + left_joystick_axis.x * 32767.0f), -32767.0f, 32767.0f);
-    pXinputGamepad->sThumbLY = (int16_t)std::clamp<float>(((float)pXinputGamepad->sThumbLY + left_joystick_axis.y * 32767.0f), -32767.0f, 32767.0f);
+    pXinputGamepad->sThumbLX = (int16_t)std::clamp<float>(((float)pXinputGamepad->sThumbLX + move_axis.x * 32767.0f), -32767.0f, 32767.0f);
+    pXinputGamepad->sThumbLY = (int16_t)std::clamp<float>(((float)pXinputGamepad->sThumbLY + move_axis.y * 32767.0f), -32767.0f, 32767.0f);
 
     if (!snap_turn_active) {
-        pXinputGamepad->sThumbRX = (int16_t)std::clamp<float>(((float)pXinputGamepad->sThumbRX + right_joystick_axis.x * 32767.0f), -32767.0f, 32767.0f);
+        pXinputGamepad->sThumbRX = (int16_t)std::clamp<float>(((float)pXinputGamepad->sThumbRX + look_axis.x * 32767.0f), -32767.0f, 32767.0f);
     }
-    pXinputGamepad->sThumbRY = (int16_t)std::clamp<float>(((float)pXinputGamepad->sThumbRY + right_joystick_axis.y * 32767.0f), -32767.0f, 32767.0f);
+    pXinputGamepad->sThumbRY = (int16_t)std::clamp<float>(((float)pXinputGamepad->sThumbRY + look_axis.y * 32767.0f), -32767.0f, 32767.0f);
+    if (block_sprint && !is_left_grip_down) {
+        pXinputGamepad->wButtons &= ~XINPUT_GAMEPAD_LEFT_THUMB;
+    }
 
 
     // Touching the thumbrest allows us to use the thumbstick as a dpad.  Additional options are for controllers without capacitives/games that rely solely on DPad

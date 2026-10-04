@@ -1,13 +1,11 @@
 #include "VRSettingsMenu.h"
 
-#include <array>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 
 #include "GFx.h"
-#include "Framework.hpp"
-#include <CreationEngine/CreationEngineEntry.h>
-#include <CreationEngine/models/ModSettingsStore.h>
+#include <CreationEngine/VROptions.h>
 
 namespace VRSettingsMenu
 {
@@ -16,60 +14,15 @@ namespace VRSettingsMenu
         // Category IDs 0-6 are the game's; anything else opens the generic options page.
         constexpr std::uint32_t kCategoryId = 86;
 
-        enum RowId : std::uint32_t
-        {
-            kSnapTurn = 8601,
-            kSnapTurnAngle,
-            kRecenterAfterLoading,
-            kControllerLayout,
-        };
-
         // SettingsOptionListEntry.SDT_*
         constexpr std::uint32_t kTypeStepper  = 1;
         constexpr std::uint32_t kTypeCheckBox = 3;
 
-        constexpr std::array<float, 4>       kSnapAngles{ 30.0f, 45.0f, 60.0f, 90.0f };
-        constexpr std::array<const char*, 4> kSnapAngleLabels{ "30\xC2\xB0", "45\xC2\xB0", "60\xC2\xB0", "90\xC2\xB0" };
-        constexpr std::array<const char*, 2> kLayoutLabels{ "Matching letters", "Legacy" };
-
         constexpr int kTickInterval = 5;
 
-        bool IsOurRow(std::uint32_t id) { return id >= kSnapTurn && id <= kControllerLayout; }
+        bool IsOurRow(std::uint32_t id) { return id >= VROptions::kFirstId && id <= VROptions::kLastId; }
 
-        std::uint32_t SnapAngleIndex(float degrees)
-        {
-            std::uint32_t best = 0;
-            for (std::uint32_t i = 1; i < kSnapAngles.size(); ++i) {
-                if (std::abs(kSnapAngles[i] - degrees) < std::abs(kSnapAngles[best] - degrees)) {
-                    best = i;
-                }
-            }
-            return best;
-        }
-
-        void ApplyChange(std::uint32_t id, double value)
-        {
-            auto& s = GameFlow::gStore.internalSettings;
-            switch (id) {
-            case kSnapTurn:
-                s.turnMode = value != 0.0 ? 0 : 1;
-                break;
-            case kSnapTurnAngle:
-                s.snapTurnDegrees = kSnapAngles[std::min<std::size_t>((std::size_t)value, kSnapAngles.size() - 1)];
-                break;
-            case kRecenterAfterLoading:
-                s.recenterAfterLoading = value != 0.0;
-                break;
-            case kControllerLayout:
-                s.controllerLayout = std::min<int>((int)value, (int)kLayoutLabels.size() - 1);
-                break;
-            default:
-                return;
-            }
-            spdlog::info("[VRSettingsMenu] Setting {} changed to {}", id, value);
-            CreationEngineEntry::Get()->sync_from_store();
-            g_framework->request_save_config();
-        }
+        std::atomic<bool> g_rows_dirty{ false };
 
         class ValueChangeHandler final : public GFx::FunctionHandler
         {
@@ -92,7 +45,11 @@ namespace VRSettingsMenu
 
                 // Our IDs must not reach the game's settings code.
                 event.Invoke("stopPropagation", nullptr, nullptr, 0);
-                ApplyChange(setting_id, value.GetNumber());
+
+                const auto new_value = static_cast<int>(value.GetNumber());
+                spdlog::info("[VRSettingsMenu] Setting {} changed to {}", setting_id, new_value);
+                VROptions::Get()->set(setting_id, new_value);
+                g_rows_dirty = true;  // the preset row and linked rows need redrawing
             }
         };
 
@@ -100,19 +57,29 @@ namespace VRSettingsMenu
         void*              g_listened_list{ nullptr };
         int                g_frame{ 0 };
 
-        std::mutex                          g_menus_mutex;
-        std::unordered_map<void*, void*>    g_menu_by_movie;  // movie -> IMenu
+        std::mutex                       g_menus_mutex;
+        std::unordered_map<void*, void*> g_menu_by_movie;  // movie -> IMenu
 
         void SetText(GFx::Value& obj, const char* name, const char* text) { obj.SetMember(name, GFx::Value(text)); }
 
-        void MakeRow(GFx::MovieRoot* root, GFx::Value* out, std::uint32_t id, std::uint32_t type, const char* text, const char* description)
+        std::uint32_t RowType(VROptions::Kind kind)
+        {
+            switch (kind) {
+            case VROptions::Kind::Toggle:
+                return kTypeCheckBox;
+            default:
+                return kTypeStepper;
+            }
+        }
+
+        void MakeRow(GFx::MovieRoot* root, GFx::Value* out, const VROptions::Option& option)
         {
             root->CreateObject(out);
-            out->SetMember("uID", GFx::Value(id));
+            out->SetMember("uID", GFx::Value(static_cast<std::uint32_t>(option.id)));
             out->SetMember("uCategory", GFx::Value(kCategoryId));
-            out->SetMember("uType", GFx::Value(type));
-            SetText(*out, "sText", text);
-            SetText(*out, "sDescription", description);
+            out->SetMember("uType", GFx::Value(RowType(option.kind)));
+            SetText(*out, "sText", option.label);
+            SetText(*out, "sDescription", option.description);
             SetText(*out, "sPreview", "");
             out->SetMember("bEnabled", GFx::Value(true));
             out->SetMember("bSubSetting", GFx::Value(false));
@@ -124,10 +91,15 @@ namespace VRSettingsMenu
             SetText(slider, "sDisplayValue", "");
             out->SetMember("sliderData", slider);
 
-            GFx::Value stepper, options;
+            GFx::Value stepper, choices;
             root->CreateObject(&stepper);
-            root->CreateArray(&options);
-            stepper.SetMember("aStepperOptions", options);
+            root->CreateArray(&choices);
+            if (option.kind == VROptions::Kind::Choice || option.kind == VROptions::Kind::Preset) {
+                for (auto& choice : option.choices) {
+                    choices.PushBack(GFx::Value(choice.c_str()));
+                }
+            }
+            stepper.SetMember("aStepperOptions", choices);
             stepper.SetMember("uIndex", GFx::Value(0u));
             out->SetMember("stepperData", stepper);
 
@@ -137,46 +109,23 @@ namespace VRSettingsMenu
             out->SetMember("checkBoxData", checkbox);
         }
 
-        template <std::size_t N>
-        void SetStepperOptions(GFx::MovieRoot* root, GFx::Value& row, const std::array<const char*, N>& labels)
-        {
-            GFx::Value stepper, options;
-            if (!row.GetMember("stepperData", &stepper)) {
-                return;
-            }
-            root->CreateArray(&options);
-            for (auto label : labels) {
-                options.PushBack(GFx::Value(label));
-            }
-            stepper.SetMember("aStepperOptions", options);
-        }
-
         void RefreshRowValue(GFx::Value& row, std::uint32_t id)
         {
-            const auto& s = GameFlow::gStore.internalSettings;
+            const auto options = VROptions::Get();
+            const auto value   = options->get(id);
             GFx::Value block;
-            switch (id) {
-            case kSnapTurn:
-                if (row.GetMember("checkBoxData", &block)) block.SetMember("bChecked", GFx::Value(s.turnMode == 0));
-                break;
-            case kRecenterAfterLoading:
-                if (row.GetMember("checkBoxData", &block)) block.SetMember("bChecked", GFx::Value(s.recenterAfterLoading));
-                break;
-            case kSnapTurnAngle:
-                if (row.GetMember("stepperData", &block)) block.SetMember("uIndex", GFx::Value(SnapAngleIndex(s.snapTurnDegrees)));
-                break;
-            case kControllerLayout:
-                if (row.GetMember("stepperData", &block)) block.SetMember("uIndex", GFx::Value((std::uint32_t)s.controllerLayout));
-                break;
-            default:
-                break;
+            if (row.GetMember("checkBoxData", &block)) {
+                block.SetMember("bChecked", GFx::Value(value != 0));
+            }
+            if (row.GetMember("stepperData", &block)) {
+                block.SetMember("uIndex", GFx::Value(static_cast<std::uint32_t>(value)));
             }
         }
 
         bool ArrayHasId(GFx::Value& array, std::uint32_t wanted, bool refreshOurs)
         {
-            bool found = false;
-            const auto size = array.GetArraySize();
+            bool       found = false;
+            const auto size  = array.GetArraySize();
             for (std::uint32_t i = 0; i < size; ++i) {
                 GFx::Value element, uid;
                 if (!array.GetElement(i, &element) || !element.GetMember("uID", &uid)) {
@@ -230,40 +179,25 @@ namespace VRSettingsMenu
             if (!GetProvider(dataManager, "SettingsData", &provider, &data) || !data.GetMember("aGeneralSettingsList", &rows)) {
                 return;
             }
-            if (ArrayHasId(rows, kSnapTurn, true)) {
+
+            const bool present = ArrayHasId(rows, VROptions::kComfortPreset, true);
+            if (present) {
+                if (g_rows_dirty.exchange(false)) {
+                    provider.Invoke("DispatchChange", nullptr, nullptr, 0);
+                }
                 return;
             }
 
-            {
+            for (auto& option : VROptions::Get()->options()) {
+                if (option.kind == VROptions::Kind::Header) {
+                    continue;  // the game's option lists don't render headers
+                }
                 GFx::Value row;
-                MakeRow(root, &row, kSnapTurn, kTypeCheckBox, "Snap Turn",
-                    "Turn in fixed steps with the right stick. Turn it off to turn smoothly instead.");
-                RefreshRowValue(row, kSnapTurn);
+                MakeRow(root, &row, option);
+                RefreshRowValue(row, option.id);
                 rows.PushBack(row);
             }
-            {
-                GFx::Value row;
-                MakeRow(root, &row, kSnapTurnAngle, kTypeStepper, "Snap Turn Angle", "How far each snap turn rotates you.");
-                SetStepperOptions(root, row, kSnapAngleLabels);
-                RefreshRowValue(row, kSnapTurnAngle);
-                rows.PushBack(row);
-            }
-            {
-                GFx::Value row;
-                MakeRow(root, &row, kRecenterAfterLoading, kTypeCheckBox, "Recenter After Loading Screens",
-                    "Reset your view height and direction when a loading screen ends.");
-                RefreshRowValue(row, kRecenterAfterLoading);
-                rows.PushBack(row);
-            }
-            {
-                GFx::Value row;
-                MakeRow(root, &row, kControllerLayout, kTypeStepper, "Controller Layout",
-                    "Matching letters: each controller button sends the gamepad button with the same label, so on-screen prompts match.");
-                SetStepperOptions(root, row, kLayoutLabels);
-                RefreshRowValue(row, kControllerLayout);
-                rows.PushBack(row);
-            }
-
+            g_rows_dirty = false;
             provider.Invoke("DispatchChange", nullptr, nullptr, 0);
             spdlog::info("[VRSettingsMenu] Added VR rows");
         }
@@ -326,25 +260,12 @@ namespace VRSettingsMenu
                 stage_root = reinterpret_cast<const GFx::Value*>(static_cast<std::uint8_t*>(it->second) + 0x58);
             }
         }
-        GFx::Value variable_root;
         if (!stage_root || !stage_root->IsObjectLike()) {
-            if (root->GetVariable(&variable_root, "root")) {
-                stage_root = &variable_root;
-            }
+            return;
         }
 
         GFx::Value panel, visible;
-        if (!stage_root || !stage_root->GetMember("SettingsPanel_mc", &panel)) {
-            static bool logged = false;
-            if (!logged) {
-                logged = true;
-                spdlog::warn("[VRSettingsMenu] SettingsPanel_mc not found in {} (menu root {}, type {})", fileUrl,
-                    stage_root == &variable_root ? "from GetVariable" : (stage_root ? "from IMenu" : "missing"),
-                    stage_root ? (int)stage_root->GetType() : -1);
-            }
-            return;
-        }
-        if (!panel.GetMember("visible", &visible) || !visible.GetBool()) {
+        if (!stage_root->GetMember("SettingsPanel_mc", &panel) || !panel.GetMember("visible", &visible) || !visible.GetBool()) {
             return;
         }
 
