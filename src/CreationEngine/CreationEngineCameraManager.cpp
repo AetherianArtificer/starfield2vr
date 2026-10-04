@@ -318,6 +318,38 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
 }
 
 
+namespace
+{
+    void SampleMotion(const RE::PlayerCharacter* player)
+    {
+        using clock = std::chrono::steady_clock;
+        static clock::time_point last_time{};
+        static RE::NiPoint3      last_position{};
+        static bool              has_sample{ false };
+
+        const auto  now = clock::now();
+        const float dt  = std::chrono::duration<float>(now - last_time).count();
+        if (has_sample && dt < 0.005f) {
+            return;  // called several times per frame
+        }
+
+        const auto position = player->data.location;
+        if (has_sample && dt < 0.25f) {
+            const float dx = position.x - last_position.x;
+            const float dy = position.y - last_position.y;
+            const float dz = position.z - last_position.z;
+
+            // Game units/s; vertical motion weighs more. Very large jumps are teleports or loads.
+            const float speed = std::max(std::sqrt(dx * dx + dy * dy), std::abs(dz) * 1.5f) / dt;
+            const float activity = speed > 3000.0f ? 0.0f : std::clamp((speed - 40.0f) / 260.0f, 0.0f, 1.0f);
+            GameFlow::motionActivity.store(activity);
+        }
+        last_time     = now;
+        last_position = position;
+        has_sample    = true;
+    }
+}
+
 void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *fps, RE::NiQuaternion *quat_out) {
     static auto instance = CreationEngineCameraManager::Get();
     static auto original_func = instance->m_onGetCameraRotationHook->get_original<decltype(onFPSGetCameraRotation)>();
@@ -330,6 +362,9 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
     if (!GameFlow::isImmovable() && !GameFlow::isControlledByAI()) {
         // order of extraction Pitch->Yaw->Roll (Havok X->Z->Y)
         auto p_player = CreationEngineSingletonManager::GetPlayerRef();
+        if (p_player) {
+            SampleMotion(p_player);
+        }
 
         // Applied on the right-eye frame so the turn lands at the start of an eye pair.
         if (p_player && vr->get_current_render_eye() == VRRuntime::Eye::RIGHT) {
@@ -375,5 +410,6 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
     } else {
         yaw_offset = 0.0f;
         GameFlow::pendingSnapYaw.store(0.0f);
+        GameFlow::motionActivity.store(0.0f);
     }
 }

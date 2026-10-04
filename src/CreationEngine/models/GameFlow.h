@@ -5,6 +5,8 @@
 namespace GameFlow {
     // Snap-turn yaw (radians) requested by the input thread, applied once by the camera hook.
     inline std::atomic<float> pendingSnapYaw{0.0f};
+    // 0-1 from the player's actual speed (jumps, falls, jetpack, knockback), for the comfort vignette.
+    inline std::atomic<float> motionActivity{0.0f};
 
     struct MenuSettings
     {
