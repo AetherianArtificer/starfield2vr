@@ -25,25 +25,9 @@ void CreationEngineEntry::on_draw_ui()
         return;
     }
     auto vr = VR::get();
-    if(m_hud_scale->draw("HUD Scale"))
-    {
-        GameFlow::gStore.hudSettings.hudScale = m_hud_scale->value();
-    }
-    if(m_hud_perspective->draw("HUD Perspective"))
-    {
-        GameFlow::gStore.hudSettings.perspective = (int) m_hud_perspective->value();
-    }
     if(GameFlow::gStore.internalSettings.controllerLayout == 1 && m_alternative_joy_layout->draw("Alternative Joy Layout"))
     {
         GameFlow::gStore.internalSettings.alternativeJoyLayout = m_alternative_joy_layout->value();
-    }
-    if(m_dominant_eye->draw("Dominant Eye"))
-    {
-        ModConstants::dominantEye = m_dominant_eye->value();
-    }
-    if(m_head_tracking_type->draw("Head Tracking Type"))
-    {
-        ModConstants::headTrackingType = m_head_tracking_type->value();
     }
     if(m_pawn_control_rotation->draw("Pawn Control Rotation"))
     {
@@ -60,9 +44,6 @@ void CreationEngineEntry::on_draw_ui()
     if(m_taa_anf_nvidia_fix->draw("Nvidia DLSS and TAA Fix"))
     {
         GameFlow::gStore.internalSettings.nvidiaAndTAAfix = m_taa_anf_nvidia_fix->value();
-    }
-    if(m_disable_zoom->draw("Prevent Game controlled Zooming")) {
-        GameFlow::gStore.internalSettings.preventZoom = m_disable_zoom->value();
     }
 
     for(auto& ui_part : GameFlow::gStore.debugData.ui_parts)
@@ -194,14 +175,9 @@ void CreationEngineEntry::on_config_load(const utility::Config& cfg, bool set_de
     for (IModValue& option : m_options) {
         option.config_load(cfg, set_defaults);
     }
-    ModConstants::dominantEye = m_dominant_eye->value();
     ModConstants::headTrackingMultiplier = m_head_tracking_multiplier->value();
-    ModConstants::headTrackingType = m_head_tracking_type->value();
     GameFlow::gStore.internalSettings.nvidiaAndTAAfix = m_taa_anf_nvidia_fix->value();
     GameFlow::gStore.internalSettings.pawnControl = m_pawn_control_rotation->value();
-    GameFlow::gStore.internalSettings.preventZoom = m_disable_zoom->value();
-    GameFlow::gStore.hudSettings.hudScale = m_hud_scale->value();
-    GameFlow::gStore.hudSettings.perspective = (int) m_hud_perspective->value();
     GameFlow::gStore.internalSettings.alternativeJoyLayout = m_alternative_joy_layout->value();
     GameFlow::gStore.internalSettings.decoupledPitch = m_decoupled_pitch->value();
 }

@@ -11,12 +11,10 @@ namespace VRSettingsMenu
 {
     namespace
     {
-        // Category IDs 0-6 are the game's; anything else opens the generic options page.
-        constexpr std::uint32_t kCategoryId = 86;
-
         // SettingsOptionListEntry.SDT_*
         constexpr std::uint32_t kTypeStepper  = 1;
         constexpr std::uint32_t kTypeCheckBox = 3;
+        constexpr std::uint32_t kTypeLink     = 4;
 
         constexpr int kTickInterval = 5;
 
@@ -67,6 +65,8 @@ namespace VRSettingsMenu
             switch (kind) {
             case VROptions::Kind::Toggle:
                 return kTypeCheckBox;
+            case VROptions::Kind::Action:
+                return kTypeLink;
             default:
                 return kTypeStepper;
             }
@@ -76,7 +76,7 @@ namespace VRSettingsMenu
         {
             root->CreateObject(out);
             out->SetMember("uID", GFx::Value(static_cast<std::uint32_t>(option.id)));
-            out->SetMember("uCategory", GFx::Value(kCategoryId));
+            out->SetMember("uCategory", GFx::Value(static_cast<std::uint32_t>(option.category)));
             out->SetMember("uType", GFx::Value(RowType(option.kind)));
             SetText(*out, "sText", option.label);
             SetText(*out, "sDescription", option.description);
@@ -158,19 +158,28 @@ namespace VRSettingsMenu
             if (!GetProvider(dataManager, "SettingsCategoriesData", &provider, &data) || !data.GetMember("aCategoryHeaders", &headers)) {
                 return;
             }
-            if (headers.GetArraySize() == 0 || ArrayHasId(headers, kCategoryId, false)) {
+            if (headers.GetArraySize() == 0) {
                 return;
             }
 
-            GFx::Value header;
-            root->CreateObject(&header);
-            header.SetMember("uID", GFx::Value(kCategoryId));
-            SetText(header, "sText", "VR");
-            header.SetMember("bDisabled", GFx::Value(false));
-            headers.PushBack(header);
+            bool added = false;
+            for (auto& category : VROptions::categories()) {
+                if (ArrayHasId(headers, category.id, false)) {
+                    continue;
+                }
+                GFx::Value header;
+                root->CreateObject(&header);
+                header.SetMember("uID", GFx::Value(static_cast<std::uint32_t>(category.id)));
+                SetText(header, "sText", category.label);
+                header.SetMember("bDisabled", GFx::Value(false));
+                headers.PushBack(header);
+                added = true;
+            }
 
-            provider.Invoke("DispatchChange", nullptr, nullptr, 0);
-            spdlog::info("[VRSettingsMenu] Added VR category");
+            if (added) {
+                provider.Invoke("DispatchChange", nullptr, nullptr, 0);
+                spdlog::info("[VRSettingsMenu] Added VR categories");
+            }
         }
 
         void EnsureRows(GFx::MovieRoot* root, GFx::Value& dataManager)
@@ -189,9 +198,6 @@ namespace VRSettingsMenu
             }
 
             for (auto& option : VROptions::Get()->options()) {
-                if (option.kind == VROptions::Kind::Header) {
-                    continue;  // the game's option lists don't render headers
-                }
                 GFx::Value row;
                 MakeRow(root, &row, option);
                 RefreshRowValue(row, option.id);

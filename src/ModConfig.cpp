@@ -104,16 +104,6 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     const auto is_left_joystick_click_down = is_action_active(m_action_joystick_click, left_joystick);
     const auto is_right_joystick_click_down = is_action_active(m_action_joystick_click, right_joystick);
 
-    static bool ui_toggle_active = false;
-    bool both_clicks_down = is_left_joystick_click_down && is_right_joystick_click_down;
-
-    if (both_clicks_down && !ui_toggle_active) {
-        ui_toggle_active = true;
-        g_framework->set_draw_ui(!g_framework->is_drawing_ui());
-    } else if (!is_left_joystick_click_down || !is_right_joystick_click_down) {
-        ui_toggle_active = false;
-    }
-
     if (g_framework->is_drawing_ui()) {
         set_comfort_vignette(0.0f);
         return;

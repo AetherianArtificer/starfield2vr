@@ -2,6 +2,7 @@
 // Created by sergp on 6/26/2024.
 //
 
+#include "PerfStats.h"
 #include "CreationEngineRendererModule.h"
 #include "CreationEngineCameraManager.h"
 #include "CreationEngineConstants.h"
@@ -373,6 +374,7 @@ uintptr_t CreationEngineRendererModule::setReflexMarkerInternal(uintptr_t rcx, u
 
     if (marker == 4) {
         vr->m_presenter_frame_count = oldFrameIndex;
+        PerfStats::OnPresent();
     }
 
 
@@ -385,6 +387,7 @@ uintptr_t CreationEngineRendererModule::setReflexMarkerInternal(uintptr_t rcx, u
         sync_marker_started = false;
     } else if(frames_since_reset > 100 && marker > 1 && marker < 5 && sync_marker_started && vr->get_runtime()->loaded) {
         spdlog::info("Detected frame inconsistency, resetting frame sync m={}", marker);
+        PerfStats::OnFrameResync();
         vr->m_skip_next_present = true;
         frames_since_reset = 0;
         sync_marker_started = false;

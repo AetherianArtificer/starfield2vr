@@ -41,6 +41,11 @@ if(VR_LOGGING)
   target_compile_definitions(common INTERFACE VR_ENABLE_LOGGING)
 endif()
 
+option(VR_DEV_OVERLAY "Enable the developer ImGui overlay" OFF)
+if(VR_DEV_OVERLAY)
+  target_compile_definitions(common INTERFACE VR_DEV_OVERLAY)
+endif()
+
 
 file(
   GLOB_RECURSE

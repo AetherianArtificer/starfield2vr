@@ -2,16 +2,24 @@
 #include <array>
 #include <Mod.hpp>
 
-// Player-facing VR options shown in the in-game Settings menu and the overlay.
+// Player-facing VR options, shown as VR categories in the game's Settings menu.
 class VROptions : public Mod
 {
 public:
     enum class Kind
     {
-        Header,
         Toggle,
         Choice,
         Preset,
+        Action,
+    };
+
+    // Category IDs 0-6 are the game's.
+    enum Category : std::uint32_t
+    {
+        kCategoryComfort  = 86,
+        kCategoryDisplay  = 87,
+        kCategoryControls = 88,
     };
 
     enum Id : std::uint32_t
@@ -27,11 +35,16 @@ public:
         kSpeedLimit,
         kSmoothAcceleration,
         kVignette,
-
-        kHeaderTurning = 8650,
-        kHeaderMovement,
-        kHeaderControls,
-        kHeaderView,
+        kAimZoom,
+        kAimWith,
+        kRenderResolution,
+        kWorldScale,
+        kHudSize,
+        kHudDepth,
+        kMenuDistance,
+        kMenuSize,
+        kDominantEye,
+        kRecenterView,
 
         kFirstId = 8600,
         kLastId  = 8699,
@@ -39,9 +52,16 @@ public:
 
     static constexpr int kCustomPreset = 3;
 
+    struct CategoryInfo
+    {
+        Category    id;
+        const char* label;
+    };
+
     struct Option
     {
         Id                       id;
+        Category                 category;
         Kind                     kind;
         const char*              label;
         const char*              description;
@@ -60,19 +80,19 @@ public:
 
     [[nodiscard]] std::string_view get_name() const override { return "VROptions"; }
 
-    void on_draw_ui() override;
     void on_config_load(const utility::Config& cfg, bool set_defaults) override;
     void on_config_save(utility::Config& cfg) override;
 
-    [[nodiscard]] const std::vector<Option>& options() const { return m_options; }
-    [[nodiscard]] int                        get(std::uint32_t id) const;
-    void                                     set(std::uint32_t id, int value);
+    [[nodiscard]] static const std::array<CategoryInfo, 3>& categories();
+    [[nodiscard]] const std::vector<Option>&                options() const { return m_options; }
+    [[nodiscard]] int                                       get(std::uint32_t id) const;
+    void                                                    set(std::uint32_t id, int value);
 
 private:
     [[nodiscard]] const Option* find(std::uint32_t id) const;
     [[nodiscard]] int           current_preset() const;
     void                        apply_preset(int preset);
-    void                        apply_to_store() const;
+    void                        apply() const;
 
     std::vector<Option> m_options;
 };
