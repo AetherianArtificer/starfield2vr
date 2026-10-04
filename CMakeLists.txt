@@ -74,7 +74,11 @@ target_compile_definitions(common INTERFACE GLM_ENABLE_EXPERIMENTAL)
 add_library(${PROJECT_NAME}::${PROJECT_NAME} ALIAS ${PROJECT_NAME})
 
 # Pose and IK math relies on NaN/infinity checks, which /fp:fast may remove.
-set_source_files_properties(src/CreationEngine/CreationEngineCameraManager.cpp PROPERTIES COMPILE_OPTIONS "/fp:precise")
+set_source_files_properties(
+  src/CreationEngine/CreationEngineCameraManager.cpp
+  src/CreationEngine/vr/TrackingSpace.cpp
+  src/CreationEngine/body/BodyIK.cpp
+  PROPERTIES COMPILE_OPTIONS "/fp:precise")
 
 target_link_libraries("${PROJECT_NAME}" PUBLIC common vr_framework::vr_framework)
 target_link_libraries("${PROJECT_NAME}" PUBLIC ViGEmClient)
