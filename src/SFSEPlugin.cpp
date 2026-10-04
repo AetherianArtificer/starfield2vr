@@ -51,7 +51,7 @@ extern "C" {
 __declspec(dllexport) SFSEPluginVersionData SFSEPlugin_Version = {
     1, // kVersion
     1,
-    "Starfield VR",
+    "SFVR",
     "mutars, AetherianArtificer",
     kAddressIndependence_Signatures,
     kStructureIndependence_1_14_70_Layout,

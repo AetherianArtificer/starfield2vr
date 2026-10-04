@@ -151,7 +151,7 @@
       "name": "release-msvc-sfse",
       "displayName": "1b. Release SFSE plugin (MSVC)",
       "configurePreset": "build-release-msvc-sfse",
-      "description": "Release build as an SFSE plugin (Data/SFSE/Plugins/StarfieldVR.dll) for MO2/Nexus."
+      "description": "Release build as an SFSE plugin (Data/SFSE/Plugins/SFVR.dll) for MO2/Nexus."
     },
     {
       "name": "debug-msvc",

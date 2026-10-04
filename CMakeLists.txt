@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.27)
 
 project(
-  starfield_vr
+  sfvr
   VERSION 1.0.0
   LANGUAGES C CXX
 )
@@ -73,6 +73,9 @@ target_compile_definitions(common INTERFACE GLM_ENABLE_EXPERIMENTAL)
 
 add_library(${PROJECT_NAME}::${PROJECT_NAME} ALIAS ${PROJECT_NAME})
 
+# Pose and IK math relies on NaN/infinity checks, which /fp:fast may remove.
+set_source_files_properties(src/CreationEngine/CreationEngineCameraManager.cpp PROPERTIES COMPILE_OPTIONS "/fp:precise")
+
 target_link_libraries("${PROJECT_NAME}" PUBLIC common vr_framework::vr_framework)
 target_link_libraries("${PROJECT_NAME}" PUBLIC ViGEmClient)
 
@@ -125,7 +128,7 @@ elseif(HOOK_METHOD STREQUAL "PHYSX")
 elseif(HOOK_METHOD STREQUAL "inject")
   set(OUTPUT_NAME "vrmod")
 elseif(HOOK_METHOD STREQUAL "sfse")
-  set(OUTPUT_NAME "StarfieldVR")
+  set(OUTPUT_NAME "SFVR")
   target_compile_definitions(common INTERFACE USE_SFSE_PLUGIN)
 endif()
 
