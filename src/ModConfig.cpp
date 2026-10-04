@@ -210,6 +210,16 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         if (on_foot && !snap_turn_active) {
             activity = std::max(activity, std::abs(look_axis.x));
         }
+
+        // Jump and jetpack (gamepad A): held, plus a short tail to cover the airtime.
+        const auto& jump_action = internal_settings.controllerLayout == 0 || !wants_swap ? m_action_a_button_right : m_action_a_button_left;
+        static std::chrono::steady_clock::time_point last_jump{};
+        if (on_foot && is_action_active_any_joystick(jump_action)) {
+            last_jump = now;
+        }
+        if (on_foot && now - last_jump < std::chrono::milliseconds(900)) {
+            activity = 1.0f;
+        }
         const float t      = std::clamp((activity - 0.1f) / 0.4f, 0.0f, 1.0f);
         const float target = internal_settings.vignetteStrength * t * t * (3.0f - 2.0f * t);
         const float step   = (target > vignette ? 1.0f / 0.15f : 1.0f / 0.3f) * dt;
