@@ -45,6 +45,7 @@ public:
         kMenuSize,
         kDominantEye,
         kRecenterView,
+        kTurnFade,
 
         kFirstId = 8600,
         kLastId  = 8699,

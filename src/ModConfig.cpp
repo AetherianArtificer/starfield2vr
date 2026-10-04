@@ -76,6 +76,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
 
     if (!is_using_controllers()) {
         set_comfort_vignette(0.0f);
+        set_comfort_fade(0.0f);
         return;
     }
 
@@ -106,8 +107,11 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
 
     if (g_framework->is_drawing_ui()) {
         set_comfort_vignette(0.0f);
+        set_comfort_fade(0.0f);
         return;
     }
+
+    static std::chrono::steady_clock::time_point last_snap_fade{};
 
     // Snap turn: a right-stick flick queues a yaw step; menus and ship piloting keep the raw stick.
     const auto& internal_settings = GameFlow::gStore.internalSettings;
@@ -128,7 +132,19 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             last_snap  = now;
             const float step = glm::radians(internal_settings.snapTurnDegrees) * (x > 0.0f ? 1.0f : -1.0f);
             GameFlow::pendingSnapYaw.fetch_add(step);
+            if (internal_settings.turnFade) {
+                last_snap_fade = now;
+            }
         }
+    }
+
+    // Black long enough for the turn to land, then fade back in.
+    {
+        constexpr float kHoldSeconds = 0.05f;
+        constexpr float kFadeSeconds = 0.12f;
+        const float since = std::chrono::duration<float>(now - last_snap_fade).count();
+        const float fade = since < kHoldSeconds ? 1.0f : std::clamp(1.0f - (since - kHoldSeconds) / kFadeSeconds, 0.0f, 1.0f);
+        set_comfort_fade(fade);
     }
 
     // Comfort shaping of the sticks, on foot only.

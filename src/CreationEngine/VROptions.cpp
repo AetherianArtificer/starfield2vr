@@ -55,6 +55,8 @@ VROptions::VROptions()
         on_off, 1, { 0, 1, 1 });
     add(kSnapTurnAngle, kCategoryComfort, Kind::Choice, "SnapTurnAngle", "Snap Turn Angle", "How far each snap turn rotates you.",
         { "30\xC2\xB0", "45\xC2\xB0", "60\xC2\xB0", "90\xC2\xB0" }, 1);
+    add(kTurnFade, kCategoryComfort, Kind::Toggle, "TurnFade", "Turn Fade", "Briefly fade to black on each snap turn so it reads as a cut.",
+        on_off, 0, { 0, 0, 1 });
     add(kSmoothTurnSpeed, kCategoryComfort, Kind::Choice, "SmoothTurnSpeed", "Smooth Turn Speed",
         "How fast the right stick turns you when Snap Turn is off.", { "Slow", "Medium", "Fast" }, 1);
     add(kStickPitch, kCategoryComfort, Kind::Toggle, "StickPitch", "Stick Looks Up and Down",
@@ -164,6 +166,7 @@ void VROptions::apply() const
     auto& s                = GameFlow::gStore.internalSettings;
     s.turnMode             = get(kSnapTurn) ? 0 : 1;
     s.snapTurnDegrees      = Pick(kSnapAngles, get(kSnapTurnAngle));
+    s.turnFade             = get(kTurnFade) != 0;
     s.smoothTurnSpeed      = Pick(kSmoothTurnSpeeds, get(kSmoothTurnSpeed));
     s.stickPitch           = get(kStickPitch) != 0;
     s.moveDirection        = get(kMoveDirection);

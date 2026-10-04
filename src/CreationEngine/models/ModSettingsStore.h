@@ -28,6 +28,7 @@ namespace GameFlow
             bool recenterAfterLoading{true};
             int   turnMode{0}; // 0 = snap, 1 = smooth (game's own stick look)
             float snapTurnDegrees{45.0f};
+            bool  turnFade{false};
             float smoothTurnSpeed{0.7f};
             bool  stickPitch{false};
             int   moveDirection{1}; // 0 = head, 1 = left hand
