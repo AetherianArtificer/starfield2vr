@@ -97,6 +97,14 @@ VROptions::VROptions()
         { "Head", "Left Hand" }, 1);
     add(kAimWith, kCategoryControls, Kind::Choice, "AimWith", "Aim With", "Aim with your head, or point your weapon with your right hand.",
         { "Head when aiming", "Free", "Always head", "Right Hand" }, 0);
+    add(kBodyLean, kCategoryControls, Kind::Toggle, "BodyLean", "Body Lean",
+        "Bend the body's spine when you lean, keeping the hips in place.", on_off, 1);
+    add(kBodyFacing, kCategoryControls, Kind::Toggle, "BodyFacing", "Body Faces Hands",
+        "Turn the torso partly toward your hands instead of only following your head.", on_off, 1);
+    add(kSupportHand, kCategoryControls, Kind::Toggle, "SupportHand", "Two-Handed Grip",
+        "Your left hand holds the weapon's foregrip when you bring it close.", on_off, 1);
+    add(kFingerPoses, kCategoryControls, Kind::Toggle, "FingerPoses", "Finger Tracking",
+        "Fingers follow the controller's trigger, grip and thumb touch.", on_off, 1);
     add(kWeaponFollowsHand, kCategoryControls, Kind::Toggle, "WeaponFollowsHand", "Full Body (Experimental)",
         "Show your character's body in first person. With Aim With set to Right Hand, your right hand and weapon follow the controller.", on_off, 0);
 }
@@ -182,6 +190,10 @@ void VROptions::apply() const
     s.weaponFollowsHand    = get(kWeaponFollowsHand) != 0;
     s.recenterAfterLoading = get(kRecenterAfterLoading) != 0;
     s.matchBodyHeight      = get(kMatchBodyHeight) != 0;
+    s.bodyLean             = get(kBodyLean) != 0;
+    s.bodyFacing           = get(kBodyFacing) != 0;
+    s.supportHand          = get(kSupportHand) != 0;
+    s.fingerPoses          = get(kFingerPoses) != 0;
 
     auto& hud       = GameFlow::gStore.hudSettings;
     hud.hudScale    = Pick(kHudSizes, get(kHudSize));

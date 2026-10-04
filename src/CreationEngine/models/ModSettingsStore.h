@@ -27,6 +27,10 @@ namespace GameFlow
             int  controllerLayout{0}; // 0 = matching letters (Quest/Touch), 1 = legacy
             bool recenterAfterLoading{true};
             bool matchBodyHeight{true};
+            bool bodyLean{true};
+            bool bodyFacing{true};
+            bool supportHand{true};
+            bool fingerPoses{true};
             int   turnMode{0}; // 0 = snap, 1 = smooth (game's own stick look)
             float snapTurnDegrees{45.0f};
             bool  turnFade{false};

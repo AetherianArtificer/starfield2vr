@@ -47,6 +47,10 @@ public:
         kRecenterView,
         kTurnFade,
         kWeaponFollowsHand,
+        kBodyLean,
+        kBodyFacing,
+        kSupportHand,
+        kFingerPoses,
         kMatchBodyHeight,
 
         kFirstId = 8600,

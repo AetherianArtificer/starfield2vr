@@ -1,6 +1,7 @@
 #include "BodyIK.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -164,6 +165,16 @@ namespace body
 
             Xf GameWorld(int i) const { return Compose(to_world, World(i)); }
 
+            void SetLocalRotation(int i, const RE::NiMatrix3& rotation) const
+            {
+                auto [entry, first] = g_written.try_emplace(i);
+                if (first) {
+                    entry->second.animated = local[i];
+                }
+                local[i].rotate       = rotation;
+                entry->second.written = local[i];
+            }
+
             void ScaleTranslation(int i, float k) const
             {
                 auto [entry, first] = g_written.try_emplace(i);
@@ -229,6 +240,10 @@ namespace body
                 int thigh{ -1 }, calf{ -1 }, foot{ -1 };
             } left_leg, right_leg;
             int pelvis{ -1 };  // lowest bone above both a thigh and the neck
+            std::vector<int> spine;  // bones from above the pelvis up to the neck, base first
+            // Finger chains (base, middle, tip) per hand: thumb, index, middle, ring, pinky.
+            std::array<std::array<int, 3>, 5> fingers[2]{};
+            std::unordered_map<std::string, int> by_name;
             RE::NiAVObject* weapon_node{ nullptr };
             RE::NiAVObject* r_wrist_node{ nullptr };
             // Legacy accessors used by diagnostics.
@@ -329,6 +344,23 @@ namespace body
                     arm->clavicle = pose.parent[arm->biceps];
                 }
             }
+            for (const auto& [idx, name] : named) {
+                g_bones.by_name[name] = idx;
+            }
+            {
+                static constexpr const char* kFingerNames[5][3] = { { "thumb", "Thumb1", "Thumb2" }, { "Index", "Index1", "Index2" },
+                    { "Middle", "Middle1", "Middle2" }, { "Ring", "Ring1", "Ring2" }, { "Pinky", "Pinky1", "Pinky2" } };
+                for (int side = 0; side < 2; ++side) {
+                    const std::string prefix = side == 0 ? "L_" : "R_";
+                    for (int f = 0; f < 5; ++f) {
+                        for (int j = 0; j < 3; ++j) {
+                            const auto it                = g_bones.by_name.find(prefix + kFingerNames[f][j]);
+                            g_bones.fingers[side][f][j] = it != g_bones.by_name.end() ? it->second : -1;
+                        }
+                    }
+                }
+            }
+
             // Leg bones by name fragment when the exact names differ; twist helpers excluded.
             auto find_leg = [&](int& slot, std::string_view side, std::string_view part) {
                 if (slot >= 0) {
@@ -362,6 +394,14 @@ namespace body
                     }
                     i = i < pose.top ? -1 : pose.parent[i];
                 }
+            }
+            // Spine: from the neck down to (not including) the pelvis, then reversed.
+            if (g_bones.neck >= 0 && g_bones.pelvis >= 0) {
+                for (int i = g_bones.neck >= pose.top ? pose.parent[g_bones.neck] : -1, guard = 0; i >= 0 && i != g_bones.pelvis && guard < 16; ++guard) {
+                    g_bones.spine.push_back(i);
+                    i = i < pose.top ? -1 : pose.parent[i];
+                }
+                std::reverse(g_bones.spine.begin(), g_bones.spine.end());
             }
             {
                 std::string all;
@@ -643,6 +683,188 @@ namespace body
             SolveLeg(pose, r, right_foot, forward);
         }
 
+        // Body yaw toward the hands, after FRIK's getNeckYaw: the torso turns 0.7 of the angle between the head's
+        // facing and the direction between the hands (clamped to 50 degrees), less when a hand is above the head.
+        float g_facing_yaw{ 0.0f };
+
+        float FacingYaw(const Pose& pose, const glm::vec3& eye)
+        {
+            const auto left  = HandWorld(tracking::GripPose(true));
+            const auto right = HandWorld(tracking::GripPose(false));
+            auto       forward = pose.root.r[1];
+            forward.z          = 0.0f;
+            float      target  = 0.0f;
+            if (left && right && glm::length(forward) > 1e-3f) {
+                forward             = glm::normalize(forward);
+                const auto to_left  = left->position - eye;
+                const auto to_right = right->position - eye;
+                if (glm::length(to_left) > 0.14f && glm::length(to_right) > 0.14f) {
+                    float weight = 1.0f;
+                    if (to_left.z > 0.0f) weight = std::max(weight - 3.5f * to_left.z, 0.0f);
+                    if (to_right.z > 0.0f) weight = std::max(weight - 3.5f * to_right.z, 0.0f);
+                    auto sum = to_left + to_right;
+                    sum.z    = 0.0f;
+                    if (glm::length(sum) > 1e-3f) {
+                        sum               = glm::normalize(sum);
+                        const float angle = std::atan2(forward.x * sum.y - forward.y * sum.x, glm::dot(forward, sum));
+                        target            = std::clamp(angle * weight, glm::radians(-50.0f), glm::radians(50.0f)) * 0.7f;
+                    }
+                }
+            }
+            g_facing_yaw += (target - g_facing_yaw) * 0.25f;
+            return g_facing_yaw;
+        }
+
+        // Horizontal offset of the head from the neck that the spine absorbs this frame (the rest moves the body).
+        glm::vec3 g_lean{ 0.0f };
+        float     g_lean_applied{ 0.0f };
+
+        // Spine lean: the bones between pelvis and neck share the rotation that brings the neck to its target, so
+        // the hips stay planted (FRIK's posture bends the spine toward the head the same way).
+        void ApplyLean(const Pose& pose)
+        {
+            g_lean_applied = 0.0f;
+            if (!GameFlow::gStore.internalSettings.bodyLean || g_bones.spine.empty() || g_bones.neck < 0 || glm::length(g_lean) < 0.005f) {
+                return;
+            }
+            const auto target = pose.GameWorld(g_bones.neck).t + g_lean;
+            const auto count  = static_cast<int>(g_bones.spine.size());
+            for (int k = 0; k < count; ++k) {
+                const int  bone   = g_bones.spine[k];
+                const auto world  = pose.GameWorld(bone);
+                const auto neck   = pose.GameWorld(g_bones.neck).t;
+                const auto turn   = glm::quat_cast(RotationBetween(neck - world.t, target - world.t));
+                const auto share  = glm::slerp(glm::quat{ 1.0f, 0.0f, 0.0f, 0.0f }, turn, 1.0f / static_cast<float>(count - k));
+                auto       bent   = world;
+                bent.r            = glm::mat3_cast(share) * world.r;
+                pose.SetGameWorld(bone, bent);
+            }
+            g_lean_applied = glm::length(g_lean);
+        }
+
+        // Finger poses. The side the fingers curl toward (the palm) is measured from the animated hand.
+        struct FingerPalm
+        {
+            bool      valid{ false };
+            glm::vec3 palm{};  // wrist space
+        };
+        FingerPalm g_finger_palm[2];
+
+        void MeasurePalmSide(const Pose& pose, int side, const HandShape& shape, int wrist)
+        {
+            auto& out = g_finger_palm[side];
+            if (out.valid || !shape.valid || wrist < 0) {
+                return;
+            }
+            const auto w      = pose.GameWorld(wrist);
+            const auto normal = glm::normalize(glm::cross(shape.forward, shape.up));  // wrist space, one of the palm/back sides
+            float      score  = 0.0f;
+            for (int f = 1; f < 5; ++f) {
+                const auto& chain = g_bones.fingers[side][f];
+                if (chain[0] < 0 || chain[2] < 0) {
+                    continue;
+                }
+                const auto bend = glm::transpose(w.r) * (pose.GameWorld(chain[2]).t - pose.GameWorld(chain[0]).t) / w.s;
+                score += glm::dot(bend, normal);
+            }
+            if (std::abs(score) < 0.005f) {
+                return;  // fingers straight in this pose; measure later
+            }
+            out.palm  = score > 0.0f ? normal : -normal;
+            out.valid = true;
+            spdlog::info("[BodyIK] {} palm side ({:.2f},{:.2f},{:.2f}) in wrist space", side == 0 ? "left" : "right", out.palm.x, out.palm.y, out.palm.z);
+        }
+
+        // Bends a finger chain toward the palm: base and middle joints by the given angles.
+        void CurlFinger(const Pose& pose, const std::array<int, 3>& chain, int wrist, const glm::vec3& palm_l, float base_deg, float mid_deg)
+        {
+            if (chain[0] < 0 || chain[1] < 0 || chain[2] < 0) {
+                return;
+            }
+            const auto wrist_w = pose.GameWorld(wrist);
+            const auto palm    = glm::normalize(wrist_w.r * palm_l);
+            glm::vec3  parent_dir{ 0.0f };
+            {
+                const auto base = pose.GameWorld(chain[0]);
+                parent_dir      = glm::normalize(base.t - wrist_w.t);
+            }
+            const float angles[2] = { glm::radians(base_deg), glm::radians(mid_deg) };
+            for (int j = 0; j < 2; ++j) {
+                const auto joint = pose.GameWorld(chain[j]);
+                const auto child = pose.GameWorld(chain[j + 1]).t;
+                const auto dir   = child - joint.t;
+                if (glm::length(dir) < 1e-4f) {
+                    return;
+                }
+                auto axis = glm::cross(parent_dir, palm);
+                if (glm::length(axis) < 1e-4f) {
+                    return;
+                }
+                axis              = glm::normalize(axis);
+                const auto wanted = glm::mat3_cast(glm::angleAxis(angles[j], axis)) * parent_dir;
+                auto       posed  = joint;
+                posed.r           = RotationBetween(dir, wanted) * joint.r;
+                pose.SetGameWorld(chain[j], posed);
+                parent_dir = glm::normalize(wanted);
+            }
+        }
+
+        struct FingerDiag
+        {
+            float trigger{ 0.0f };
+            float grip{ 0.0f };
+            bool  thumb{ false };
+            int   copied{ 0 };
+        };
+        FingerDiag g_finger_diag[2];
+
+        // Fingers from the controller: index from the trigger (extended off the trigger), the other three from the
+        // grip, the thumb from touch. A hand holding the weapon keeps the first-person grip's finger pose and only
+        // the index finger follows the trigger.
+        void ApplyFingers(const Pose& pose, int side, int wrist, RE::NiAVObject* first_wrist)
+        {
+            if (!GameFlow::gStore.internalSettings.fingerPoses || wrist < 0) {
+                return;
+            }
+            static auto vr    = VR::get();
+            const auto  input = vr->get_finger_state(side == 0);
+            auto&       diag  = g_finger_diag[side];
+            diag              = { input.trigger, input.grip, input.thumb_touch, 0 };
+
+            if (first_wrist) {
+                // Same finger names on both rigs: copy the first-person grip's finger rotations.
+                static constexpr const char* kFingerNames[5][3] = { { "thumb", "Thumb1", "Thumb2" }, { "Index", "Index1", "Index2" },
+                    { "Middle", "Middle1", "Middle2" }, { "Ring", "Ring1", "Ring2" }, { "Pinky", "Pinky1", "Pinky2" } };
+                for (int f = 0; f < 5; ++f) {
+                    for (int j = 0; j < 3; ++j) {
+                        const int bone = g_bones.fingers[side][f][j];
+                        if (bone < 0) {
+                            continue;
+                        }
+                        const std::string name = std::string(side == 0 ? "L_" : "R_") + kFingerNames[f][j];
+                        if (auto node = FindDescendant(first_wrist, name)) {
+                            pose.SetLocalRotation(bone, node->local.rotate);
+                            ++diag.copied;
+                        }
+                    }
+                }
+            }
+
+            if (!g_finger_palm[side].valid) {
+                return;
+            }
+            const auto& palm   = g_finger_palm[side].palm;
+            const auto& chains = g_bones.fingers[side];
+            const float index  = input.trigger_touch ? 0.3f + 0.7f * input.trigger : 0.0f;
+            CurlFinger(pose, chains[1], wrist, palm, 10.0f + 50.0f * index, 10.0f + 70.0f * index);
+            if (!first_wrist) {
+                CurlFinger(pose, chains[2], wrist, palm, 10.0f + 65.0f * input.grip, 10.0f + 85.0f * input.grip);
+                CurlFinger(pose, chains[3], wrist, palm, 10.0f + 65.0f * input.grip, 10.0f + 85.0f * input.grip);
+                CurlFinger(pose, chains[4], wrist, palm, 10.0f + 65.0f * input.grip, 10.0f + 85.0f * input.grip);
+                CurlFinger(pose, chains[0], wrist, palm, input.thumb_touch ? 25.0f : 5.0f, input.thumb_touch ? 30.0f : 5.0f);
+            }
+        }
+
         // Measures the hand frame from the animated pose (before any write this frame).
         void MeasureElbow(const Pose& pose, Arm& arm, const char* label)
         {
@@ -710,6 +932,8 @@ namespace body
             float right_gap{ 0.0f };
             float left_gap{ 0.0f };
             bool  weapon_aligned{ false };
+            float support_distance{ -1.0f };
+            bool  support_held{ false };
         };
         Diagnostics g_diag;
 
@@ -751,10 +975,11 @@ namespace body
             RE::NiAVObject* wrist{ nullptr };
             HandShape       shape;
         };
-        FirstPersonHand g_first_hand;
+        FirstPersonHand g_first_hands[2];  // left, right
 
-        void MeasureFirstPersonHand(RE::NiAVObject* wrist)
+        void MeasureFirstPersonHand(RE::NiAVObject* wrist, bool left)
         {
+            auto& g_first_hand = g_first_hands[left ? 0 : 1];
             if (!wrist || (g_first_hand.wrist == wrist && g_first_hand.shape.valid)) {
                 return;
             }
@@ -800,15 +1025,15 @@ namespace body
             g_first_hand.shape.up       = glm::normalize(to_l * up);
             g_first_hand.shape.palm     = 0.5f * glm::length(to_bases) / w.s;
             g_first_hand.shape.valid    = true;
-            spdlog::info("[BodyIK] 1P hand measured: forward ({:.2f},{:.2f},{:.2f}) up ({:.2f},{:.2f},{:.2f}) palm {:.3f}", g_first_hand.shape.forward.x,
+            spdlog::info("[BodyIK] 1P {} hand measured: forward ({:.2f},{:.2f},{:.2f}) up ({:.2f},{:.2f},{:.2f}) palm {:.3f}", left ? "left" : "right", g_first_hand.shape.forward.x,
                 g_first_hand.shape.forward.y, g_first_hand.shape.forward.z, g_first_hand.shape.up.x, g_first_hand.shape.up.y, g_first_hand.shape.up.z,
                 g_first_hand.shape.palm);
         }
 
         // The body's wrist transform equivalent to the first-person wrist: same anatomical frame, same palm centre.
-        Xf BodyWristFromFirstPerson(const Xf& first_wrist, const HandShape& body)
+        Xf BodyWristFromFirstPerson(const Xf& first_wrist, const HandShape& body, bool left)
         {
-            const auto& f    = g_first_hand.shape;
+            const auto& f    = g_first_hands[left ? 0 : 1].shape;
             Xf          out  = first_wrist;
             out.r            = first_wrist.r * FrameOf(f.forward, f.up) * glm::transpose(FrameOf(body.forward, body.up));
             const auto palm  = first_wrist.t + first_wrist.r * (f.forward * f.palm) * first_wrist.s;
@@ -896,11 +1121,19 @@ namespace body
             MeasureElbow(pose, g_bones.right, "right");
             MeasureElbow(pose, g_bones.left, "left");
             ApplyCrouch(pose);
+            ApplyLean(pose);
+            MeasurePalmSide(pose, 0, g_bones.left.shape, g_bones.left.wrist);
+            MeasurePalmSide(pose, 1, g_bones.right.shape, g_bones.right.wrist);
 
             const auto room = tracking::RoomRotation();
             if (!room) {
                 return;
             }
+            std::optional<Xf>   held_weapon;
+            RE::NiAVObject*     first_weapon_node{ nullptr };
+            RE::NiAVObject*     first_right_wrist{ nullptr };
+            RE::NiAVObject*     first_left_wrist{ nullptr };
+
             auto& r = g_bones.right;
             if (r.biceps >= 0 && r.forearm >= 0 && r.wrist >= 0 && r.shape.valid) {
                 const auto grip = HandWorld(tracking::GripPose(false));
@@ -913,22 +1146,28 @@ namespace body
                     if (player && player->IsWeaponDrawn() && g_bones.weapon >= 0) {
                         static RE::NiAVObject* first_root{ nullptr };
                         static RE::NiAVObject* first_wrist{ nullptr };
+                        static RE::NiAVObject* first_left{ nullptr };
                         static RE::NiAVObject* first_weapon{ nullptr };
                         if (auto root = FirstPersonRoot(player); root != first_root) {
                             first_root   = root;
                             first_wrist  = root ? FindDescendant(root, "R_Wrist") : nullptr;
+                            first_left   = root ? FindDescendant(root, "L_Wrist") : nullptr;
                             first_weapon = root ? FindDescendant(root, "Weapon") : nullptr;
-                            spdlog::info("[BodyIK] 1P rig: R_Wrist {} Weapon {}", first_wrist != nullptr, first_weapon != nullptr);
+                            spdlog::info("[BodyIK] 1P rig: R_Wrist {} L_Wrist {} Weapon {}", first_wrist != nullptr, first_left != nullptr,
+                                first_weapon != nullptr);
                         }
+                        first_weapon_node = first_weapon;
+                        first_right_wrist = first_wrist;
+                        first_left_wrist  = first_left;
                         auto muzzle   = g_bones.weapon_node ? FindDescendant(g_bones.weapon_node, "ProjectileNode") : nullptr;
                         g_body_muzzle = muzzle;
                         SampleWeaponBasis(first_weapon);
                         if (first_wrist && first_weapon) {
                             // The animation's grip: the hand in the weapon's space, transferred onto the body's hand by anatomy.
-                            MeasureFirstPersonHand(first_wrist);
+                            MeasureFirstPersonHand(first_wrist, false);
                             Xf first_hand_world = FromNi(first_wrist->world);
-                            if (g_first_hand.shape.valid) {
-                                first_hand_world = BodyWristFromFirstPerson(first_hand_world, r.shape);
+                            if (g_first_hands[1].shape.valid) {
+                                first_hand_world = BodyWristFromFirstPerson(first_hand_world, r.shape, false);
                             }
                             auto hand_in_weapon = Compose(Inverse(FromNi(first_weapon->world)), first_hand_world);
 
@@ -962,11 +1201,13 @@ namespace body
                             g_barrel.aim_forward   = aim->forward;
                             pose.SetGameWorld(g_bones.weapon, weapon_xf);
                             g_diag.weapon_aligned = true;
+                            held_weapon           = weapon_xf;
                         }
                     } else {
                         g_body_muzzle = nullptr;
                     }
                     g_diag.right_gap = SolveArm(pose, r, false, wrist_target);
+                    ApplyFingers(pose, 1, r.wrist, held_weapon ? first_right_wrist : nullptr);
                 }
             }
 
@@ -975,7 +1216,30 @@ namespace body
                 const auto grip = HandWorld(tracking::GripPose(true));
                 const auto aim  = HandWorld(tracking::AimPose(true));
                 if (grip && aim) {
-                    g_diag.left_gap = SolveArm(pose, l, true, WristTarget(pose, l, *aim, *grip));
+                    auto target   = WristTarget(pose, l, *aim, *grip);
+                    bool on_grip  = false;
+                    // Two-handed grip: the first-person rig's support hand on the weapon, transferred by anatomy, taken
+                    // when the left hand is brought near it and kept until it moves clearly away.
+                    if (GameFlow::gStore.internalSettings.supportHand && held_weapon && first_weapon_node && first_left_wrist) {
+                        MeasureFirstPersonHand(first_left_wrist, true);
+                        if (g_first_hands[0].shape.valid) {
+                            const auto support_in_weapon = Compose(Inverse(FromNi(first_weapon_node->world)),
+                                BodyWristFromFirstPerson(FromNi(first_left_wrist->world), l.shape, true));
+                            const auto support    = Compose(*held_weapon, support_in_weapon);
+                            const auto palm       = support.t + support.r * (l.shape.forward * l.shape.palm) * support.s;
+                            const float distance  = glm::length(palm - grip->position);
+                            static bool held      = false;
+                            held                  = distance < (held ? 0.25f : 0.12f);
+                            g_diag.support_distance = distance;
+                            if (held) {
+                                target  = support;
+                                on_grip = true;
+                            }
+                        }
+                    }
+                    g_diag.support_held = on_grip;
+                    g_diag.left_gap     = SolveArm(pose, l, true, target);
+                    ApplyFingers(pose, 0, l.wrist, on_grip ? first_left_wrist : nullptr);
                 }
             }
         }
@@ -1078,22 +1342,44 @@ namespace body
                     // Both transforms are final from the previous frame here.
                     MeasureBarrel();
 
-                    // Body placed so the neck is under and behind the eyes (horizontal only).
+                    // Body placed so the neck is under and behind the eyes (horizontal only). Small offsets are taken
+                    // by the spine (lean); beyond kLeanReach the body follows.
                     constexpr float kNeckBehindEyes = 0.12f;
+                    constexpr float kLeanReach      = 0.20f;
                     shifted_root                    = *root_local;
+                    g_lean                          = glm::vec3{ 0.0f };
                     auto world_camera               = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
                     if (world_camera && g_bones.neck >= 0) {
+                        const auto eye = ToVec(world_camera->world.translate);
+                        // Torso partly toward the hands (FRIK: 0.7 of the hands' yaw, within 50 degrees).
+                        if (GameFlow::gStore.internalSettings.bodyFacing) {
+                            const auto yaw = FacingYaw(pose, eye);
+                            Xf         root = FromNi(shifted_root);
+                            const auto turn = glm::mat3_cast(glm::angleAxis(yaw, glm::vec3{ 0.0f, 0.0f, 1.0f }));
+                            const auto pivot = glm::vec3{ eye.x, eye.y, root.t.z };
+                            root.r          = turn * root.r;
+                            root.t          = pivot + turn * (root.t - pivot);
+                            ToNi(root, shifted_root);
+                            pose.root = root;
+                        } else {
+                            g_facing_yaw = 0.0f;
+                        }
                         auto forward = pose.root.r[1];
                         forward.z    = 0.0f;
                         if (glm::length(forward) > 1e-3f) {
                             forward            = glm::normalize(forward);
-                            const auto eye     = ToVec(world_camera->world.translate);
                             const auto neck    = pose.GameWorld(g_bones.neck).t;
                             auto       delta   = eye - forward * kNeckBehindEyes - neck;
                             delta.z            = 0.0f;
-                            if (glm::length(delta) < 1.0f) {
-                                shifted_root.translate.x += delta.x;
-                                shifted_root.translate.y += delta.y;
+                            const float length = glm::length(delta);
+                            if (length < 1.0f) {
+                                auto body = delta;
+                                if (GameFlow::gStore.internalSettings.bodyLean) {
+                                    body   = length > kLeanReach ? delta * ((length - kLeanReach) / length) : glm::vec3{ 0.0f };
+                                    g_lean = delta - body;
+                                }
+                                shifted_root.translate.x += body.x;
+                                shifted_root.translate.y += body.y;
                             }
                         }
                     }
@@ -1211,6 +1497,10 @@ namespace body
                     spdlog::info("[BodyIK] layout error {:.4f} | reach gap R {:.3f} L {:.3f} | weapon aligned {} barrel error {:.2f} deg placement error {:.3f} m | shoulder-eye ({:.2f},{:.2f},{:.2f}) | thread {}",
                         error, g_diag.right_gap, g_diag.left_gap, g_diag.weapon_aligned, g_barrel.error_deg, g_barrel.placement_error, r_sh.x - eye.x, r_sh.y - eye.y, r_sh.z - eye.z,
                         GetCurrentThreadId());
+                    spdlog::info("[BodyIK] lean {:.3f} m | facing {:.1f} deg | support {} ({:.2f} m) | fingers R trig {:.2f} grip {:.2f} thumb {} copied {} | L trig {:.2f} grip {:.2f} thumb {} copied {}",
+                        g_lean_applied, glm::degrees(g_facing_yaw), g_diag.support_held, g_diag.support_distance, g_finger_diag[1].trigger,
+                        g_finger_diag[1].grip, g_finger_diag[1].thumb, g_finger_diag[1].copied, g_finger_diag[0].trigger, g_finger_diag[0].grip,
+                        g_finger_diag[0].thumb, g_finger_diag[0].copied);
                 }
             }
             return result;
