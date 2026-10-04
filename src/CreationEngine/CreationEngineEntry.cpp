@@ -10,12 +10,14 @@
 #include "CreationEngineCameraManager.h"
 #include "CreationEngineInputManager.h"
 #include "CreationEngineRendererModule.h"
+#include "MuzzleFire.h"
 
 std::optional<std::string> CreationEngineEntry::on_initialize()
 {
     CreationEngineCameraManager::Get()->InstallHooks();
     CreationEngineRendererModule::Get()->InstallHooks();
     CreationEngineInputManager::Get()->Init();
+    MuzzleFire::Install();
     return Mod::on_initialize();
 }
 
