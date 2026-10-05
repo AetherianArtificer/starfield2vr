@@ -32,10 +32,10 @@ namespace GameFlow
             bool fingerPoses{true};
             bool walkingLegs{true};
             bool bodyTracking{true};
-            bool firstPersonArms{true};
-            bool holsters{true};
-            bool manualReload{true};
-            bool raiseToAim{true};
+            bool firstPersonArms{false};
+            bool holsters{false};
+            bool manualReload{false};
+            bool raiseToAim{false};
             bool handTracking{true};
             bool hudPanel{true};
             float hudPanelWidth{1.86f};
