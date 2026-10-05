@@ -24,6 +24,7 @@
 #include <CreationEngine/models/ModSettingsStore.h>
 #include <CreationEngine/vr/TrackingSpace.h>
 #include <CreationEngine/input/InputRequests.h>
+#include <CreationEngine/StereoViewModule.h>
 
 #include "BodyMath.h"
 #include "SceneGraph.h"
@@ -228,6 +229,21 @@ namespace body
                     spdlog::info("[Body] third-person rig in first person wanted: {}", want);
                 } else if (want && fps && !Active(player)) {
                     SetFirstPerson(player);  // the game left the mode (furniture exit, camera change)
+                }
+
+                // One pair of eye screenshots a few seconds into each of the first draws, for checking the grip.
+                static std::chrono::steady_clock::time_point drawn_since{};
+                static bool taken_this_draw{ false };
+                static int  taken{ 0 };
+                const auto  now = std::chrono::steady_clock::now();
+                if (!player->IsWeaponDrawn()) {
+                    drawn_since     = now;
+                    taken_this_draw = false;
+                } else if (!taken_this_draw && taken < 3 && now - drawn_since > std::chrono::seconds(4)) {
+                    taken_this_draw = true;
+                    ++taken;
+                    StereoViewModule::Get()->RequestEyeScreenshots();
+                    spdlog::info("[Body] eye screenshots requested with the weapon drawn");
                 }
             }
         }
@@ -1182,6 +1198,21 @@ namespace body
         };
         NativeDiag g_native_diag;
 
+        // Where the drawn hand and weapon ended up against where they were placed (read from the scene next frame).
+        struct HandCheck
+        {
+            bool      placed{ false };
+            Xf        wrist_target{};
+            Xf        weapon_target{};
+            float     wrist_error{ 0.0f };
+            float     wrist_angle{ 0.0f };
+            float     weapon_error{ 0.0f };
+            glm::vec3 drawn_hand_in_weapon{};
+            glm::vec3 model_offset{};
+            std::string model_name;
+        };
+        HandCheck g_hand_check;
+
         // Support hand on the held weapon this frame.
         struct Support
         {
@@ -1582,6 +1613,25 @@ namespace body
             }
             const auto weapon_world = FromNi(weapon->world);
             const auto shot_world   = glm::normalize(FromNi(muzzle->world).r[1]);
+            if (g_hand_check.placed && (*g_active_bones).r_wrist_node) {
+                const auto wrist_world            = FromNi((*g_active_bones).r_wrist_node->world);
+                g_hand_check.wrist_error          = glm::length(wrist_world.t - g_hand_check.wrist_target.t);
+                const auto relative               = glm::transpose(g_hand_check.wrist_target.r) * wrist_world.r;
+                g_hand_check.wrist_angle          = glm::degrees(std::acos(std::clamp((relative[0][0] + relative[1][1] + relative[2][2] - 1.0f) * 0.5f, -1.0f, 1.0f)));
+                g_hand_check.weapon_error         = glm::length(weapon_world.t - g_hand_check.weapon_target.t);
+                g_hand_check.drawn_hand_in_weapon = Compose(Inverse(weapon_world), wrist_world).t;
+                // The weapon model hangs under the weapon bone; its own offset there moves the grip.
+                RE::NiAVObject* children[8]{};
+                const auto      count = ReadChildren(weapon, children, 8);
+                for (std::uint16_t i = 0; i < count; ++i) {
+                    if (children[i] && children[i] != muzzle && std::strcmp(children[i]->name.c_str(), "R_HandIk") && std::strcmp(children[i]->name.c_str(), "L_HandIk")) {
+                        g_hand_check.model_offset = Compose(Inverse(weapon_world), FromNi(children[i]->world)).t;
+                        g_hand_check.model_name   = children[i]->name.c_str();
+                        break;
+                    }
+                }
+                g_hand_check.placed = false;
+            }
             if (g_barrel.placed) {
                 g_barrel.error_deg       = glm::degrees(std::acos(std::clamp(glm::dot(shot_world, g_barrel.aim_forward), -1.0f, 1.0f)));
                 g_barrel.placement_error = glm::length(weapon_world.t - g_barrel.placed_weapon.t);
@@ -1894,6 +1944,9 @@ namespace body
                             g_diag.weapon_aligned = true;
                             held_weapon           = weapon_xf;
                             g_native_diag.native  = true;
+                            g_hand_check.placed        = true;
+                            g_hand_check.wrist_target  = wrist_target;
+                            g_hand_check.weapon_target = weapon_xf;
                         } else {
                         SampleWeaponBasis(first_weapon);
                         if (first_wrist && first_weapon) {
@@ -2862,6 +2915,10 @@ namespace body
                             player_ref ? (third_person_mode::Flags(player_ref, third_person_mode::kLiveBodyFlags) & 8) != 0 : false,
                             camera && camera->IsInFirstPerson(), player_ref && player_ref->IsWeaponDrawn(), g_native_diag.native,
                             g_native_diag.hand_in_weapon.x, g_native_diag.hand_in_weapon.y, g_native_diag.hand_in_weapon.z);
+                        spdlog::info("[Body] hand check: wrist off target {:.3f} m {:.1f} deg | weapon off target {:.3f} m | drawn hand in weapon ({:.3f},{:.3f},{:.3f}) | weapon model '{}' at ({:.3f},{:.3f},{:.3f}) in the weapon bone",
+                            g_hand_check.wrist_error, g_hand_check.wrist_angle, g_hand_check.weapon_error, g_hand_check.drawn_hand_in_weapon.x,
+                            g_hand_check.drawn_hand_in_weapon.y, g_hand_check.drawn_hand_in_weapon.z, g_hand_check.model_name, g_hand_check.model_offset.x,
+                            g_hand_check.model_offset.y, g_hand_check.model_offset.z);
                     }
                     spdlog::info("[BodyIK] first-person arms: setting {} root hits {} body active {} shoulders {} | active {} live {} origin ({:.1f},{:.1f},{:.1f}) root ({:.2f},{:.2f},{:.2f}) shoulders apart {:.2f} m {:.0f} deg, branch {}, after {:.3f} m | weapon {} support {}",
                         GameFlow::gStore.internalSettings.firstPersonArms, g_fp_root_hits.exchange(0), g_state.active, g_body_shoulders.valid,
