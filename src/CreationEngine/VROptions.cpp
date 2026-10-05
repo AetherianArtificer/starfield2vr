@@ -105,6 +105,8 @@ VROptions::VROptions()
         "Your left hand holds the weapon's foregrip when you bring it close.", on_off, 1);
     add(kFingerPoses, kCategoryControls, Kind::Toggle, "FingerPoses", "Finger Tracking",
         "Fingers follow the controller's trigger, grip and thumb touch.", on_off, 1);
+    add(kWalkingLegs, kCategoryControls, Kind::Toggle, "WalkingLegs", "Walking Legs",
+        "The body's legs step whenever you move.", on_off, 1);
     add(kWeaponFollowsHand, kCategoryControls, Kind::Toggle, "WeaponFollowsHand", "Full Body (Experimental)",
         "Show your character's body in first person. With Aim With set to Right Hand, your right hand and weapon follow the controller.", on_off, 0);
 }
@@ -194,6 +196,7 @@ void VROptions::apply() const
     s.bodyFacing           = get(kBodyFacing) != 0;
     s.supportHand          = get(kSupportHand) != 0;
     s.fingerPoses          = get(kFingerPoses) != 0;
+    s.walkingLegs          = get(kWalkingLegs) != 0;
 
     auto& hud       = GameFlow::gStore.hudSettings;
     hud.hudScale    = Pick(kHudSizes, get(kHudSize));

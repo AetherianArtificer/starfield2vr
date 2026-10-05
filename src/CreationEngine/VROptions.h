@@ -51,6 +51,7 @@ public:
         kBodyFacing,
         kSupportHand,
         kFingerPoses,
+        kWalkingLegs,
         kMatchBodyHeight,
 
         kFirstId = 8600,

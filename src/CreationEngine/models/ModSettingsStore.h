@@ -31,6 +31,7 @@ namespace GameFlow
             bool bodyFacing{true};
             bool supportHand{true};
             bool fingerPoses{true};
+            bool walkingLegs{true};
             int   turnMode{0}; // 0 = snap, 1 = smooth (game's own stick look)
             float snapTurnDegrees{45.0f};
             bool  turnFade{false};
