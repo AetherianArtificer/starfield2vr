@@ -26,6 +26,7 @@
 #include <mods/VR.hpp>
 
 #include "ModSettings.h"
+#include "StereoViewModule.h"
 #include "body/BodyIK.h"
 #include "vr/TrackingSpace.h"
 
@@ -58,9 +59,7 @@ void onScaleformMovieSetProjectionMatrix3DDetour(uintptr_t* thisMovie, Matrix4x4
 */
 
 bool isValidCamera(RE::NiCamera *pCamera) {
-    static auto sceneGraphRoot = CreationEngineSingletonManager::GetSceneGraphRoot();
-    return pCamera == sceneGraphRoot->worldCamera || pCamera == sceneGraphRoot->starfieldScene.pStarFieldCamera ||
-           sceneGraphRoot->starfieldScene.pGalaxyCamera == pCamera;
+    return StereoViewModule::Get()->EyeOf(pCamera) >= 0;
 }
 
 void CreationEngineCameraManager::InstallHooks() {
@@ -186,12 +185,44 @@ CreationEngineCameraManager::onScaleformSetViewPortInternal(uintptr_t *thisMovie
 
     auto settings = GameFlow::getMenuSettings(file_url);
 
-    if (ModSettings::showFlatScreenDisplay() || !vr->is_hmd_active()) {
+    if (!vr->is_hmd_active()) {
+        return;
+    }
+    if (ModSettings::showFlatScreenDisplay()) {
+        // The flat menu screen shows the left half of a side-by-side buffer.
+        if (vr->is_native_stereo()) {
+            viewport->left = 0;
+            viewport->top = 0;
+            viewport->width = viewport_buffer_width / 2;
+            viewport->height = viewport_buffer_height;
+            viewport->flags &= ~(uint32_t) Scaleform::Gfx::Viewport::Flag::kStereo_AnySplit;
+        }
         return;
     }
 
     auto width_multiplier = settings.hud_scale;
     auto height_multiplier = settings.hud_scale;
+
+    if (vr->is_native_stereo()) {
+        auto visible_height = std::min((int) ((float) backbuffer_size[1] * height_multiplier), viewport_buffer_height);
+        viewport->height = visible_height;
+        viewport->top = (int) (viewport_buffer_height - visible_height) / 2;
+        // The left eye's half of the UI layer; with Both Eyes the stereo module repeats it in the right half.
+        const auto eye_width = viewport_buffer_width / 2;
+        // Same share of the eye as the HUD takes with alternate eye rendering.
+        const float eye_share = std::min(1.0f, (float) (backbuffer_size[0] / 2) * width_multiplier / (float) viewport_buffer_width);
+        const auto visible_width = (int) ((float) eye_width * eye_share);
+        viewport->width = visible_width;
+        viewport->left = (eye_width - visible_width) / 2;
+        viewport->flags &= ~(uint32_t) Scaleform::Gfx::Viewport::Flag::kStereo_AnySplit;
+        static uint32_t logged_flags{ 0xFFFFFFFF };
+        if (logged_flags != viewport->flags) {
+            logged_flags = viewport->flags;
+            spdlog::info("[Stereo] HUD viewport {}x{} at ({}, {}) in {}x{}, flags {:x}", viewport->width, viewport->height, viewport->left, viewport->top,
+                         viewport_buffer_width, viewport_buffer_height, viewport->flags);
+        }
+        return;
+    }
 
     // Implement offset based on dominant eye and menu-specific offset_value
     auto current_eye = vr->get_current_render_eye();
@@ -233,7 +264,7 @@ void CreationEngineCameraManager::onSetNiFrustumInternal(RE::NiCamera *pCamera, 
     if (!vr->is_hmd_active()) {
         return;
     }
-    auto eye = vr->get_current_render_eye() == VRRuntime::Eye::LEFT ? 0 : 1;
+    auto eye = vr->is_native_stereo() ? StereoViewModule::Get()->EyeOf(pCamera) : (vr->get_current_render_eye() == VRRuntime::Eye::LEFT ? 0 : 1);
     auto runtime = vr->get_runtime();
     Vector4f frustum = runtime->frustums[eye];
     aiming_adjustments(frustum, get_fov_adjustment());
@@ -292,30 +323,39 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
         return;
     }
 
-    if(!GameFlow::isImmovable() && !GameFlow::isControlledByAI() && GameFlow::isInFirstPerson()) {
-        auto hmd_transform = vr->get_transform(0);
-        hmd_transform[3] -= glm::vec4{ tracking::StandingOriginPosition(), 0.0f };
-        const float tracking_scale = tracking::TrackingScale();
-        hmd_transform[3]           = glm::vec4{ glm::vec3{ hmd_transform[3] } * tracking_scale, 1.0f };
-        auto eye = vr->get_current_eye_transform();
-        eye[3]   = glm::vec4{ glm::vec3{ eye[3] } * tracking_scale, 1.0f };
-        // The camera's parent carries the aim rotation; keep the view on the head.
-        hmd_transform      = glm::inverse(tracking::CameraParentAimRotation(vr->m_engine_frame_count)) * hmd_transform * eye;
-        hmd_transform = tracking::ToHavokSpace(hmd_transform);
-        worldCamera->local.rotate = originalRotation * *(RE::NiMatrix3*) & hmd_transform;
-        worldCamera->local.translate.x = hmd_transform[3][0];
-        worldCamera->local.translate.y = hmd_transform[3][1];
-        worldCamera->local.translate.z = hmd_transform[3][2];
+    // In native stereo the world camera is the left eye and the right eye camera shares its parent.
+    auto right_camera = vr->is_native_stereo() ? StereoViewModule::Get()->RightCamera() : nullptr;
+    auto place = [&](RE::NiCamera* camera, const glm::mat4& eye_transform) {
+        glm::mat4 local;
+        if (!GameFlow::isImmovable() && !GameFlow::isControlledByAI() && GameFlow::isInFirstPerson()) {
+            auto hmd_transform = vr->get_transform(0);
+            hmd_transform[3] -= glm::vec4{ tracking::StandingOriginPosition(), 0.0f };
+            const float tracking_scale = tracking::TrackingScale();
+            hmd_transform[3]           = glm::vec4{ glm::vec3{ hmd_transform[3] } * tracking_scale, 1.0f };
+            auto eye = eye_transform;
+            eye[3]   = glm::vec4{ glm::vec3{ eye[3] } * tracking_scale, 1.0f };
+            // The camera's parent carries the aim rotation; keep the view on the head.
+            local = glm::inverse(tracking::CameraParentAimRotation(vr->m_engine_frame_count)) * hmd_transform * eye;
+        } else {
+            auto head_rotation = vr->get_transform(0);
+            head_rotation[3] -= glm::vec4{ tracking::StandingOriginPosition(), 0.0f };
+            local = head_rotation * eye_transform;
+        }
+        local = tracking::ToHavokSpace(local);
+        camera->local.rotate = originalRotation * *(RE::NiMatrix3*) &local;
+        camera->local.translate.x = local[3][0];
+        camera->local.translate.y = local[3][1];
+        camera->local.translate.z = local[3][2];
+    };
+
+    if (right_camera) {
+        place(worldCamera, vr->get_eye_transform(VRRuntime::Eye::LEFT));
+        place(right_camera, vr->get_eye_transform(VRRuntime::Eye::RIGHT));
+        if (auto left_camera = StereoViewModule::Get()->LeftCamera()) {
+            left_camera->local = worldCamera->local;
+        }
     } else {
-        auto head_rotation = vr->get_transform(0);
-        head_rotation[3] -= glm::vec4{ tracking::StandingOriginPosition(), 0.0f };
-        auto eye = vr->get_current_eye_transform();
-        head_rotation = head_rotation * eye;
-        head_rotation = tracking::ToHavokSpace(head_rotation);
-        worldCamera->local.rotate = originalRotation * *(RE::NiMatrix3 *) &head_rotation;
-        worldCamera->local.translate.x = head_rotation[3][0];
-        worldCamera->local.translate.y = head_rotation[3][1];
-        worldCamera->local.translate.z = head_rotation[3][2];
+        place(worldCamera, vr->get_current_eye_transform());
     }
 }
 
@@ -333,8 +373,8 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
         // order of extraction Pitch->Yaw->Roll (Havok X->Z->Y)
         auto p_player = CreationEngineSingletonManager::GetPlayerRef();
 
-        // Applied on the right-eye frame so the turn lands at the start of an eye pair.
-        if (p_player && vr->get_current_render_eye() == VRRuntime::Eye::RIGHT) {
+        // With alternate eye rendering it waits for the right-eye frame so the turn lands at the start of an eye pair.
+        if (p_player && (vr->is_native_stereo() || vr->get_current_render_eye() == VRRuntime::Eye::RIGHT)) {
             if (const float snap = GameFlow::pendingSnapYaw.exchange(0.0f); snap != 0.0f) {
                 const float two_pi = 2.0f * glm::pi<float>();
                 p_player->data.angle.z = std::fmod(p_player->data.angle.z + snap + two_pi, two_pi);

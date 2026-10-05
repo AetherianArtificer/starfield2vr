@@ -8,6 +8,9 @@
 #include "CreationEngineConstants.h"
 #include "CreationEngineSingletonManager.h"
 #include "REL/Relocation.h"
+#include <mutex>
+#include <string>
+#include <unordered_set>
 #include <CreationEngine/memory/offsets.h>
 #include <CreationEngine/models/GameFlow.h>
 #include <CreationEngine/models/ModSettingsStore.h>
@@ -16,6 +19,7 @@
 #include <safetyhook/easy.hpp>
 
 #include "ModSettings.h"
+#include "StereoViewModule.h"
 
 uintptr_t onUpdateConstantBufferViewDetour(uint8_t copyPresentToPast, uint8_t orphoProjection, uintptr_t pCameraTransforms, uintptr_t vararg1Parent, uintptr_t vararg3Parent,
                                            double unk, char unk2, RE::RenderPassConstantBufferView* camerablocks)
@@ -163,6 +167,15 @@ void CreationEngineRendererModule::RenderGraphStart(RE::CreationRendererPrivate:
         m_framePass = pGraph;
     }
     auto vr = VR::get();
+    if (before && vr->is_native_stereo() && pGraph->name != nullptr) {
+        static std::mutex                      seen_mutex;
+        static std::unordered_set<std::string> seen;
+        std::scoped_lock                       _{ seen_mutex };
+        if (seen.size() < 256 && seen.emplace(pGraph->name).second) {
+            spdlog::info("[Stereo] Render graph '{}' view {:x}", pGraph->name, *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(pGraph) + 0x24));
+        }
+    }
+    const bool aer_history_fix = GameFlow::gStore.internalSettings.nvidiaAndTAAfix && !vr->is_native_stereo();
     if (m_startFramePass == pGraph && before) {
         GameFlow::resetGameState();
         ModSettings::g_internalSettings.showQuadDisplay = GameFlow::isShowingMenu();
@@ -170,7 +183,7 @@ void CreationEngineRendererModule::RenderGraphStart(RE::CreationRendererPrivate:
         auto fc          = GameFlow::renderLoopFrameCount();
         auto context     = reinterpret_cast<RE::RenderGraphDataD3D12Context*>(pRenderGraphData->getCommandList());
         auto commandList = context->pID3D12CommandList;
-        if (vr->is_hmd_active() && GameFlow::gStore.internalSettings.nvidiaAndTAAfix && ModConstants::enabledResourcesToCopy[1]) {
+        if (vr->is_hmd_active() && aer_history_fix && ModConstants::enabledResourcesToCopy[1]) {
             auto resource = pRenderGraphData->getResourceByIndex(1, (fc - 1) & 1);
             SwapBuffer(commandList, resource, 1, (fc - 1) & 1, fc & 1);
         }
@@ -208,7 +221,7 @@ void CreationEngineRendererModule::SetWindowSize(int width, int height)
         if (!vr->is_hmd_active()) {
             return;
         }
-        width   = vr->get_hmd_width();
+        width   = vr->get_hmd_width() * (StereoViewModule::Get()->WantsSideBySide() ? 2 : 1);
         height  = vr->get_hmd_height();
         if(width == 0 || height == 0) {
             return;
@@ -276,7 +289,7 @@ uintptr_t CreationEngineRendererModule::onUpdateConstantBufferView(uint8_t copyC
     auto        result        = original_func(copyCurrentToPast, resetHistory, i2, i3, i4, d, i5, pView);
     //    spdlog::info("update camera blocks {} index {} handles[{},{},{}] st ptr {}", fmt::ptr(pView), indexAfterPresent, cameraHandleId, cameraHandleId2, cameraHandleId3,
     //    fmt::ptr(cameraBlocks->data));
-    if (copyCurrentToPast && vr->is_hmd_active() && GameFlow::gStore.internalSettings.nvidiaAndTAAfix) {
+    if (copyCurrentToPast && vr->is_hmd_active() && GameFlow::gStore.internalSettings.nvidiaAndTAAfix && !vr->is_native_stereo()) {
         auto key = reinterpret_cast<uintptr_t>(pView) & 0xFFFFFFFFFFFFFFC0;
         if (pastProjections.find(key) != pastProjections.end()) {
             auto temp                         = pastProjections[key];
@@ -307,7 +320,7 @@ uintptr_t CreationEngineRendererModule::onTaaPass(RE::CreationRendererPrivate::R
     static auto instance    = Get();
     static auto original_fn = instance->taa_vfunc7_hook->get_original<decltype(CreationEngineRendererModule::onTaaPass)>();
     auto        result      = original_fn(pPass, pRenderGraphData, renderPassData);
-    if(!GameFlow::gStore.internalSettings.nvidiaAndTAAfix) {
+    if(!GameFlow::gStore.internalSettings.nvidiaAndTAAfix || VR::get()->is_native_stereo()) {
         return result;
     }
     auto        fc          = GameFlow::renderLoopFrameCount();
@@ -361,6 +374,7 @@ uintptr_t CreationEngineRendererModule::setReflexMarkerInternal(uintptr_t rcx, u
                 sync_marker_started = false;
             }
         }
+        StereoViewModule::Get()->OnFrameStart();
         CreationEngineCameraManager::SnapshotAimPose();
         cameraModule->UpdateWorldCamera();
     }
@@ -386,7 +400,7 @@ uintptr_t CreationEngineRendererModule::setReflexMarkerInternal(uintptr_t rcx, u
          * if we detect async frame we reset sync and let engine to handle it
          */
         sync_marker_started = false;
-    } else if(frames_since_reset > 100 && marker > 1 && marker < 5 && sync_marker_started && vr->get_runtime()->loaded) {
+    } else if(frames_since_reset > 100 && marker > 1 && marker < 5 && sync_marker_started && vr->get_runtime()->loaded && !vr->is_native_stereo()) {
         spdlog::info("Detected frame inconsistency, resetting frame sync m={}", marker);
         PerfStats::OnFrameResync();
         vr->m_skip_next_present = true;

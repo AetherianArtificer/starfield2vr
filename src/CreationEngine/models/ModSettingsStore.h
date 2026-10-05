@@ -31,6 +31,10 @@ namespace GameFlow
             bool bodyFacing{true};
             bool supportHand{true};
             bool fingerPoses{true};
+            int  stereoMode{1}; // 1 = native, 2 = alternate eye
+            bool nativeStereo{true};
+            bool stereoHudBothEyes{true};
+            bool stereoDoubleWidth{true};
             int   turnMode{0}; // 0 = snap, 1 = smooth (game's own stick look)
             float snapTurnDegrees{45.0f};
             bool  turnFade{false};

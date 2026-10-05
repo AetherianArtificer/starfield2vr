@@ -78,6 +78,14 @@ VROptions::VROptions()
         { "90%", "95%", "100%", "105%", "110%" }, 2);
     add(kMatchBodyHeight, kCategoryDisplay, Kind::Toggle, "MatchBodyHeight", "Match Body Height",
         "Scale your movement so your eyes and reach match your character's body. Measured when the view recenters.", on_off, 1);
+    add(kStereoRendering, kCategoryDisplay, Kind::Choice, "StereoRenderingV3", "Stereo Rendering",
+        "Native renders both eyes every frame from the same moment. Alternate Eye renders one eye per frame; use it if Native misbehaves.",
+        { "Native", "Alternate Eye" }, 0);
+    add(kStereoHud, kCategoryDisplay, Kind::Choice, "NativeHudModeV2", "Native HUD Mode",
+        "How the HUD and menus are drawn with Native stereo rendering.", { "Both Eyes", "Left Eye Only" }, 0);
+    add(kStereoLayout, kCategoryDisplay, Kind::Choice, "NativeEyeLayout", "Native Eye Layout",
+        "How Native stereo rendering fits both eyes into the game window. Double Width is sharper; Window Width works when the game cannot use a wider window.",
+        { "Window Width", "Double Width" }, 1);
     add(kHudSize, kCategoryDisplay, Kind::Choice, "HudSize", "HUD Size", "Size of the in-game HUD.", { "Small", "Medium", "Large" }, 1);
     add(kHudDepth, kCategoryDisplay, Kind::Choice, "HudDepth", "HUD Depth", "How far away the in-game HUD appears.", { "Near", "Medium", "Far" }, 1);
     add(kMenuDistance, kCategoryDisplay, Kind::Choice, "MenuDistance", "Menu Distance", "How far away full-screen menus appear.",
@@ -194,6 +202,10 @@ void VROptions::apply() const
     s.bodyFacing           = get(kBodyFacing) != 0;
     s.supportHand          = get(kSupportHand) != 0;
     s.fingerPoses          = get(kFingerPoses) != 0;
+    s.stereoMode           = get(kStereoRendering) == 0 ? 1 : 2;
+    s.nativeStereo         = s.stereoMode == 1;
+    s.stereoHudBothEyes    = get(kStereoHud) == 0;
+    s.stereoDoubleWidth    = get(kStereoLayout) == 1;
 
     auto& hud       = GameFlow::gStore.hudSettings;
     hud.hudScale    = Pick(kHudSizes, get(kHudSize));

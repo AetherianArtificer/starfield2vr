@@ -52,6 +52,9 @@ public:
         kSupportHand,
         kFingerPoses,
         kMatchBodyHeight,
+        kStereoRendering,
+        kStereoHud,
+        kStereoLayout,
 
         kFirstId = 8600,
         kLastId  = 8699,
