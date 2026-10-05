@@ -65,6 +65,11 @@ private:
     [[nodiscard]] std::string Variant() const;
     std::atomic<bool> m_renew_right_camera{ false };
     int               m_right_camera_generation{ 0 };
+    // Diagnostic sequence: each configuration is captured once during first-person gameplay.
+    void              AdvanceExperiment();
+    int               m_experiment_stage{ 0 };
+    bool              m_exp_left_first{ false };
+    bool              m_exp_swap_graphs{ false };
     std::string       m_last_variant{};
     void MirrorMainView();
     struct MirroredRows;

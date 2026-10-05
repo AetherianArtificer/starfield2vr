@@ -503,6 +503,9 @@ void StereoViewModule::OnFrameStart()
         StartCensus();
         vr->request_backbuffer_dump(Framework::get_persistent_dir(std::format("vr_native_stereo_{}.png", variant)).wstring());
     }
+    if (gameplay && m_stereo_frames == kFramesUntilSnapshot + 30) {
+        AdvanceExperiment();
+    }
 }
 
 void StereoViewModule::LogRenderSizes() const
@@ -689,7 +692,7 @@ uintptr_t StereoViewModule::onSetMultiCameraViewData(void* column, uint32_t grap
         ViewIdArray left{};
         left.size     = 1;
         left.capacity = static_cast<int32_t>(0x80000004u);
-        left.local[0] = instance->m_left_view_id;
+        left.local[0] = instance->m_exp_swap_graphs ? instance->m_right_view_id : instance->m_left_view_id;
         static bool logged{ false };
         if (!logged) {
             logged = true;
@@ -1144,7 +1147,7 @@ void StereoViewModule::PrepareRightGraph()
     ViewIdArray views{};
     views.size     = 1;
     views.capacity = static_cast<int32_t>(0x80000004u);
-    views.local[0] = m_right_view_id;
+    views.local[0] = m_exp_swap_graphs ? m_left_view_id : m_right_view_id;
     m_set_multi_view_hook->get_original<decltype(onSetMultiCameraViewData)>()(StorageColumn(storage, kMultiCameraViewColumn), id & 0xFFFFFF, &views);
     m_appended.store(true);
 }
@@ -1161,7 +1164,7 @@ uintptr_t StereoViewModule::onSubmitRenderGraph(void* frame_list, void* record)
         record == reinterpret_cast<uint8_t*>(root) + kRootMainGraphRecord &&
         At<uint32_t>(root, kRootMainView) != kInvalidId) {
         instance->PrepareRightGraph();
-        if (GameFlow::gStore.internalSettings.nativeLeftGraphFirst) {
+        if (GameFlow::gStore.internalSettings.nativeLeftGraphFirst || instance->m_exp_left_first) {
             const auto result = original(frame_list, record);
             original(frame_list, instance->m_right_graph_record);
             return result;
@@ -1177,8 +1180,9 @@ uintptr_t StereoViewModule::onSubmitRenderGraph(void* frame_list, void* record)
 
 std::string StereoViewModule::Variant() const
 {
-    return std::format("{}_{}_camera{}", m_double_width ? "double" : "window", GameFlow::gStore.internalSettings.nativeLeftGraphFirst ? "leftfirst" : "rightfirst",
-                       m_right_camera_generation);
+    const bool left_first = GameFlow::gStore.internalSettings.nativeLeftGraphFirst || m_exp_left_first;
+    return std::format("{}_{}_{}_camera{}", m_double_width ? "double" : "window", left_first ? "leftfirst" : "rightfirst",
+                       m_exp_swap_graphs ? "swapped" : "maingraphleft", m_right_camera_generation);
 }
 
 bool StereoViewModule::RenewRightCamera()
@@ -1258,4 +1262,26 @@ void StereoViewModule::ApplyNativeShadowSettings(bool native)
     spdlog::info("[Stereo] Shadow settings {}: dynamic shadow fade {}s ({}), main view LOD {} ({})", native ? "for native stereo" : "restored",
                  settings->get_setting(kFade, Type::kINISetting, -1.0f), fade ? "set" : "not found", settings->get_setting(kLod, Type::kINISetting, false),
                  lod ? "set" : "not found");
+}
+
+void StereoViewModule::AdvanceExperiment()
+{
+    // Which eye looks wrong in each capture tells apart graph order, graph identity and camera registration.
+    switch (m_experiment_stage++) {
+    case 0:
+        m_exp_left_first = true;
+        break;
+    case 1:
+        m_exp_left_first  = false;
+        m_exp_swap_graphs = true;
+        break;
+    case 2:
+        m_exp_swap_graphs = false;
+        RenewRightCamera();
+        break;
+    default:
+        return;
+    }
+    spdlog::info("[Stereo] Diagnostic stage {}: left graph first {}, graphs swapped {}, right camera generation {}", m_experiment_stage, m_exp_left_first,
+                 m_exp_swap_graphs, m_right_camera_generation);
 }
