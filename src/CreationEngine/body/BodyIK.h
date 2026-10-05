@@ -14,7 +14,8 @@ namespace body
     // Called for each object as it updates its world transform; toggles the body at its 3P root.
     void OnUpdateWorld(RE::NiAVObject* obj, int engine_frame);
     // The first-person rig's root has updated, its children have not: poses the rig's arms and weapon on the body.
-    bool OnFirstPersonRootUpdated(RE::NiAVObject* root, RE::NiUpdateData* data);
+    // Runs once per engine frame (from the root, or its first child if the root is not seen).
+    bool OnFirstPersonRootUpdated(RE::NiAVObject* root, RE::NiUpdateData* data, int engine_frame);
     // The first-person rig is posed on the body this frame (its meshes must not follow the head).
     bool FirstPersonArmsActive();
     // Muzzle of the weapon held by the shown body, or null when the body is not driving the weapon.

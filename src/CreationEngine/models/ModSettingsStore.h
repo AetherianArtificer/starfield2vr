@@ -32,7 +32,7 @@ namespace GameFlow
             bool fingerPoses{true};
             bool walkingLegs{true};
             bool bodyTracking{true};
-            bool firstPersonArms{false};
+            bool firstPersonArms{true};
             bool holsters{false};
             bool manualReload{false};
             bool raiseToAim{false};

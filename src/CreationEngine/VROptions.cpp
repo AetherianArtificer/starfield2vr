@@ -116,7 +116,7 @@ VROptions::VROptions()
     add(kRaiseToAim, kCategoryControls, Kind::Toggle, "RaiseToAim", "Raise to Aim",
         "Aim down sights by bringing the weapon's sight up to your eye.", on_off, 0);
     add(kFirstPersonArms, kCategoryControls, Kind::Toggle, "FirstPersonArms", "First-Person Arms",
-        "Show the game's first-person arms and weapon on the body, holding the weapon exactly as animated.", on_off, 0);
+        "Show the game's first-person arms and weapon on the body, holding the weapon exactly as animated.", on_off, 1);
     add(kBodyTracking, kCategoryControls, Kind::Toggle, "BodyTracking", "Body Tracking",
         "Use the headset's body tracking for your torso, elbows and legs when available.", on_off, 1);
     add(kHandTracking, kCategoryControls, Kind::Toggle, "HandTracking", "Tracked Fingers",

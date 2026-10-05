@@ -2271,8 +2271,11 @@ namespace body
 
         bool g_first_person_handled{ false };
 
+        std::atomic<int> g_fp_root_hits{ 0 };
+
         bool HandleFirstPersonRoot(RE::NiAVObject* root, RE::NiUpdateData* data)
         {
+            ++g_fp_root_hits;
             g_first_person_handled = false;
             if (!g_state.active || !GameFlow::gStore.internalSettings.firstPersonArms || !root) {
                 return false;
@@ -2627,7 +2630,8 @@ namespace body
                         g_track_diag.supported, g_track_diag.active, g_track_diag.valid, g_track_diag.torso, g_track_diag.elbow[0], g_track_diag.elbow[1],
                         g_track_diag.legs, g_track_diag.fingers[0], g_track_diag.hand_source[0], g_track_diag.index_bend[0], g_track_diag.fingers[1],
                         g_track_diag.hand_source[1], g_track_diag.index_bend[1], g_finger_diag[1].trigger);
-                    spdlog::info("[BodyIK] first-person arms: active {} live {} origin ({:.1f},{:.1f},{:.1f}) root ({:.2f},{:.2f},{:.2f}) attach move {:.2f} m error {:.3f} m | weapon {} support {}",
+                    spdlog::info("[BodyIK] first-person arms: setting {} root hits {} body active {} shoulders {} | active {} live {} origin ({:.1f},{:.1f},{:.1f}) root ({:.2f},{:.2f},{:.2f}) attach move {:.2f} m error {:.3f} m | weapon {} support {}",
+                        GameFlow::gStore.internalSettings.firstPersonArms, g_fp_root_hits.exchange(0), g_state.active, g_body_shoulders.valid,
                         g_fp_diag.active, FirstPersonArmsLive(), g_fp_diag.origin.x, g_fp_diag.origin.y, g_fp_diag.origin.z, g_fp_diag.root_translate.x,
                         g_fp_diag.root_translate.y, g_fp_diag.root_translate.z, g_fp_diag.attach_offset, g_fp_diag.attach_error, g_fp_diag.weapon,
                         g_fp_diag.support);
@@ -2689,8 +2693,13 @@ namespace body
 
 namespace body
 {
-    bool OnFirstPersonRootUpdated(RE::NiAVObject* root, RE::NiUpdateData* data)
+    bool OnFirstPersonRootUpdated(RE::NiAVObject* root, RE::NiUpdateData* data, int engine_frame)
     {
+        static int last_frame{ -1 };
+        if (engine_frame == last_frame) {
+            return g_first_person_handled;
+        }
+        last_frame = engine_frame;
         return HandleFirstPersonRoot(root, data);
     }
 
