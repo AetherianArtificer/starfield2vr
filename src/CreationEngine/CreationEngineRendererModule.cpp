@@ -212,6 +212,9 @@ uintptr_t CreationEngineRendererModule::setReflexMarkerInternal(uintptr_t rcx, u
         vr->on_wait_rendering(oldFrameIndex);
         PerfStats::AddCpu(PerfStats::CpuSpan::kVrWait, since(start));
         vr->m_engine_frame_count = oldFrameIndex;
+        // One menu decision per frame: the render thread updates its flag while the game thread runs ahead.
+        ModSettings::g_internalSettings.showQuadDisplayFrame = ModSettings::g_internalSettings.showQuadDisplay;
+        vr->set_frame_flat(ModSettings::showFlatScreenDisplay());
         start = clock::now();
         vr->on_begin_rendering(oldFrameIndex);
         vr->update_hmd_state(oldFrameIndex);

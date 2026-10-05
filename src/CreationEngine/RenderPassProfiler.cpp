@@ -30,6 +30,7 @@ namespace RenderPassProfiler
         struct PassClass
         {
             std::string name;
+            bool        subgraph{ false };  // runs other passes inside it, so its CPU time includes theirs
         };
         std::vector<PassClass>                g_classes;
         std::unordered_map<uintptr_t, int>    g_class_of_vtable;
@@ -68,6 +69,9 @@ namespace RenderPassProfiler
 
         // Per class and eye (left, right, other): GPU ms summed over the reporting window.
         std::vector<std::array<double, 3>> g_sums;
+        // CPU time recording each pass, in performance counter ticks, per class and eye.
+        std::vector<std::array<std::atomic<uint64_t>, 3>> g_cpu_ticks;
+        double                                            g_tick_ms{ 0.0 };
         int                                g_frames_summed{ 0 };
         auto                               g_last_report = std::chrono::steady_clock::now();
 
@@ -151,7 +155,12 @@ namespace RenderPassProfiler
                 return reinterpret_cast<func_t*>(g_originals[hook])(pass, render_graph_data, pass_data, a4);
             }
             static auto vr = VR::get();
+            LARGE_INTEGER start, stop;
+            QueryPerformanceCounter(&start);
             const auto result = reinterpret_cast<func_t*>(g_originals[hook])(pass, render_graph_data, pass_data, a4);
+            QueryPerformanceCounter(&stop);
+            const int eye = StereoViewModule::Get()->EyeOfGraphPublic(render_graph_data);
+            g_cpu_ticks[cls][eye == 0 ? 0 : eye == 1 ? 1 : 2].fetch_add((uint64_t)(stop.QuadPart - start.QuadPart), std::memory_order_relaxed);
             Mark(cls, render_graph_data);
             return result;
         }
@@ -267,6 +276,30 @@ namespace RenderPassProfiler
                 }
                 spdlog::info("[Passes] {:5.2f} ms  left {:5.2f}  right {:5.2f}  other {:5.2f}  {}", total(s) / n, s[0] / n, s[1] / n, s[2] / n, g_classes[order[i]].name);
             }
+            // CPU: summed over the same frames; passes on job threads overlap, so this is work, not wall time.
+            std::vector<std::array<double, 3>> cpu(g_classes.size());
+            std::array<double, 3>              cpu_all{};
+            for (size_t c = 0; c < g_classes.size(); ++c) {
+                for (int e = 0; e < 3; ++e) {
+                    cpu[c][e] = g_cpu_ticks[c][e].exchange(0) * g_tick_ms / n;
+                    if (!g_classes[c].subgraph) {
+                        cpu_all[e] += cpu[c][e];
+                    }
+                }
+            }
+            std::sort(order.begin(), order.end(), [&](int a, int b) { return total(cpu[a]) > total(cpu[b]); });
+            spdlog::info("[Passes] CPU per frame recording passes: left eye {:.2f} ms, right eye {:.2f} ms, other {:.2f} ms", cpu_all[0], cpu_all[1], cpu_all[2]);
+            for (int i = 0, shown = 0; i < (int)order.size() && shown < 20; ++i) {
+                const auto& c = cpu[order[i]];
+                if (g_classes[order[i]].subgraph) {
+                    continue;
+                }
+                if (total(c) < 0.05) {
+                    break;
+                }
+                spdlog::info("[Passes] CPU {:5.2f} ms  left {:5.2f}  right {:5.2f}  other {:5.2f}  {}", total(c), c[0], c[1], c[2], g_classes[order[i]].name);
+                ++shown;
+            }
             for (auto& s : g_sums) {
                 s = {};
             }
@@ -320,10 +353,15 @@ namespace RenderPassProfiler
                 break;
             }
             PassClass info{ name };
+            info.subgraph = name.find("ubGraph") != std::string::npos || name.find("ubgraph") != std::string::npos;
             g_class_of_vtable[vtable] = (int)g_classes.size();
             g_classes.push_back(info);
         }
         g_sums.assign(g_classes.size(), {});
+        g_cpu_ticks = std::vector<std::array<std::atomic<uint64_t>, 3>>(g_classes.size());
+        LARGE_INTEGER frequency;
+        QueryPerformanceFrequency(&frequency);
+        g_tick_ms = 1000.0 / (double)frequency.QuadPart;
         g_ready.store(true, std::memory_order_release);
 
         // Execute functions the game also calls or jumps to directly are shared code, left alone.
