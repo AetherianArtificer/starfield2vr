@@ -2894,6 +2894,7 @@ namespace body
             return;
         }
         g_model_update_hook = safetyhook::create_inline(reinterpret_cast<void*>(address), reinterpret_cast<void*>(&ModelNodeUpdateTransforms));
+        third_person_mode::Install();
         spdlog::info("[BodyIK] model node hook: {}", static_cast<bool>(g_model_update_hook));
     }
 
