@@ -420,7 +420,6 @@ void StereoViewModule::OnFrameStart()
         profiler_installed = true;
         RenderPassProfiler::Install();
     }
-    RenderPassProfiler::SetShareShadows(GameFlow::gStore.internalSettings.shareShadows);
 
     // Native presentation runs whenever the headset is active; until both eye views exist both eyes show the frame.
     const bool active = vr->is_hmd_active();

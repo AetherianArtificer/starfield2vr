@@ -75,8 +75,8 @@ VROptions::VROptions()
     add(kRenderResolution, kCategoryDisplay, Kind::Choice, "RenderResolution", "Render Resolution",
         "Resolution rendered for the headset. Lower it if the frame rate drops.",
         { "70%", "80%", "90%", "100%", "110%", "120%", "130%", "150%" }, 3);
-    add(kShareShadows, kCategoryDisplay, Kind::Toggle, "ShareShadows", "Share Shadows Between Eyes",
-        "Render shadow maps once for both eyes instead of once per eye. Turn off if shadows look wrong in the left eye.", on_off, 1);
+    add(kPipelinedFrames, kCategoryDisplay, Kind::Toggle, "PipelinedFrames", "Overlap Frames",
+        "Let the game prepare the next frame while the current one is still being drawn. Raises the frame rate; turn off if motion looks uneven.", on_off, 1);
     add(kWorldScale, kCategoryDisplay, Kind::Choice, "WorldScale", "World Scale", "Make the world feel larger or smaller around you.",
         { "90%", "95%", "100%", "105%", "110%" }, 2);
     add(kMatchBodyHeight, kCategoryDisplay, Kind::Toggle, "MatchBodyHeight", "Match Body Height",
@@ -214,7 +214,8 @@ void VROptions::apply() const
     s.bodyTracking         = get(kBodyTracking) != 0;
     s.handTracking         = get(kHandTracking) != 0;
     s.hudPanel             = get(kHudPlacement) == 0;
-    s.shareShadows         = get(kShareShadows) != 0;
+    s.pipelinedFrames      = get(kPipelinedFrames) != 0;
+    VR::get()->set_pipelined_frames(s.pipelinedFrames);
 
     auto& hud       = GameFlow::gStore.hudSettings;
     hud.hudScale    = Pick(kHudSizes, get(kHudSize));

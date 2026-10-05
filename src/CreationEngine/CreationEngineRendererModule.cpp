@@ -230,6 +230,7 @@ uintptr_t CreationEngineRendererModule::setReflexMarkerInternal(uintptr_t rcx, u
 
     if (marker == 2) {
         vr->m_render_frame_count = oldFrameIndex;
+        vr->on_render_start(oldFrameIndex);
     }
 
     if (marker == 4) {

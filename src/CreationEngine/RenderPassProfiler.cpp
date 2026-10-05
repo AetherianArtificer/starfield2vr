@@ -30,29 +30,12 @@ namespace RenderPassProfiler
         struct PassClass
         {
             std::string name;
-            bool        shadow_map{ false };  // shadow map rendering the left eye can take from the right eye
-            std::shared_ptr<std::atomic<bool>> logged{ std::make_shared<std::atomic<bool>>(false) };
-            std::atomic<bool>& logged_skip_flag() const { return *logged; }
         };
         std::vector<PassClass>                g_classes;
         std::unordered_map<uintptr_t, int>    g_class_of_vtable;
         std::array<uintptr_t, kMaxHooks>      g_originals{};
         int                                   g_hook_count{ 0 };
-        std::atomic<bool>                     g_share_shadows{ false };
-        std::atomic<uint32_t>                 g_skipped{ 0 };
         std::atomic<bool>                     g_ready{ false };
-
-        // Shadow map work whose only output is the shadow maps on the GPU: the clears, the shadow draws and the depth
-        // pyramids built from the maps. Culling and draw preparation keep running, as later passes read their data on the CPU.
-        constexpr const char* kShadowMapPasses[]{
-            "ClearShadowMapsRenderPass",
-            "ClearShadowMapGroupRenderPass",
-            "ShadowMapInstanceRenderPass",
-            "GroupedDynamicShadowMapRenderPass",
-            "DynamicShadowDepthPyramidRenderPass",
-            "GenerateShadowDepthPyramidRenderPass",
-            "GenerateShadowDepthPyramidWithMaskRenderPass",
-        };
 
         // Timestamps per frame slot.
         constexpr int kSlots        = 4;
@@ -168,14 +151,6 @@ namespace RenderPassProfiler
                 return reinterpret_cast<func_t*>(g_originals[hook])(pass, render_graph_data, pass_data, a4);
             }
             static auto vr = VR::get();
-            if (cls >= 0 && g_classes[cls].shadow_map && g_share_shadows.load(std::memory_order_relaxed) && vr->is_native_stereo() &&
-                StereoViewModule::Get()->EyeOfGraphPublic(render_graph_data) == 0) {
-                g_skipped.fetch_add(1, std::memory_order_relaxed);
-                if (!g_classes[cls].logged_skip_flag().exchange(true)) {
-                    spdlog::info("[Passes] Left eye skips {}", g_classes[cls].name);
-                }
-                return 0;
-            }
             const auto result = reinterpret_cast<func_t*>(g_originals[hook])(pass, render_graph_data, pass_data, a4);
             Mark(cls, render_graph_data);
             return result;
@@ -284,8 +259,7 @@ namespace RenderPassProfiler
                     all[i] += s[i];
                 }
             }
-            spdlog::info("[Passes] GPU per frame in timed passes: left eye {:.2f} ms, right eye {:.2f} ms, other {:.2f} ms; shadow passes reused by the left eye: {:.0f} per frame",
-                         all[0] / n, all[1] / n, all[2] / n, g_skipped.exchange(0) / n);
+            spdlog::info("[Passes] GPU per frame in timed passes: left eye {:.2f} ms, right eye {:.2f} ms, other {:.2f} ms", all[0] / n, all[1] / n, all[2] / n);
             for (int i = 0; i < 30 && i < (int)order.size(); ++i) {
                 const auto& s = g_sums[order[i]];
                 if (total(s) / n < 0.05) {
@@ -346,7 +320,6 @@ namespace RenderPassProfiler
                 break;
             }
             PassClass info{ name };
-            info.shadow_map = std::any_of(std::begin(kShadowMapPasses), std::end(kShadowMapPasses), [&](const char* s) { return name == s; });
             g_class_of_vtable[vtable] = (int)g_classes.size();
             g_classes.push_back(info);
         }
@@ -406,21 +379,13 @@ namespace RenderPassProfiler
             MH_QueueEnableHook(reinterpret_cast<void*>(target));
         }
         const auto applied = MH_ApplyQueued();
-        const auto shadow = std::count_if(g_classes.begin(), g_classes.end(), [](const PassClass& c) { return c.shadow_map; });
-        spdlog::info("[Passes] {} render pass classes, {} execute functions hooked ({}), {} left alone; {} shadow map pass classes", g_classes.size(), g_hook_count,
-                     MH_StatusToString(applied), skipped_functions, shadow);
+        spdlog::info("[Passes] {} render pass classes, {} execute functions hooked ({}), {} left alone", g_classes.size(), g_hook_count,
+                     MH_StatusToString(applied), skipped_functions);
     }
 
     void MarkPass(void* pass, void* render_graph_data)
     {
         Mark(ClassOf(pass), render_graph_data);
-    }
-
-    void SetShareShadows(bool share)
-    {
-        if (g_share_shadows.exchange(share) != share) {
-            spdlog::info("[Passes] The left eye {} the right eye's shadow maps", share ? "reuses" : "renders its own");
-        }
     }
 
     void OnPresent()

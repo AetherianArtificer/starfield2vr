@@ -56,7 +56,7 @@ public:
         kMatchBodyHeight,
         kHudPlacement,
         kEyeScreenshots,
-        kShareShadows,
+        kPipelinedFrames,
 
         kFirstId = 8600,
         kLastId  = 8699,
