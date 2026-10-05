@@ -61,6 +61,25 @@ namespace
     constexpr size_t kCameraScissors      = 0x1F4;
     constexpr size_t kPassCameraView      = 0x24;
 
+    // A pass's command list for timing; null when the pass has none, instead of faulting.
+    uintptr_t CommandListContextGuarded(void* render_graph_data)
+    {
+        __try {
+            return static_cast<RE::CreationRendererPrivate::RenderGraphData*>(render_graph_data)->getCommandList();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return 0;
+        }
+    }
+
+    ID3D12GraphicsCommandList* TimingCommandList(void* render_graph_data)
+    {
+        if (render_graph_data == nullptr) {
+            return nullptr;
+        }
+        auto context = reinterpret_cast<RE::RenderGraphDataD3D12Context*>(CommandListContextGuarded(render_graph_data));
+        return context ? context->pID3D12CommandList : nullptr;
+    }
+
     template <class T>
     T& At(void* base, size_t offset)
     {
@@ -327,7 +346,6 @@ void StereoViewModule::InstallHooks()
     m_submit_graph_hook->create();
     InstallUpscalerHooks();
     InstallLatePassHooks();
-    InstallTimingHooks();
     if (auto vtable = reinterpret_cast<uintptr_t*>(
             MemoryScan::VTable("ScaleformCompositeRenderPass", ".?AVScaleformCompositeRenderPass@CreationRendererPrivate@@", 0))) {
         m_scaleform_composite_hook = std::make_unique<FunctionHook>(vtable[7], reinterpret_cast<uintptr_t>(&onScaleformComposite));
@@ -604,10 +622,7 @@ uintptr_t StereoViewModule::RunUpscalerPass(int pass_kind, void* pass, void* ren
     // DLSS keeps the right eye's history in a viewport of its own.
     const auto right_view = m_right_view_id & 0xFFFFFF;
     const bool right      = (At<uint32_t>(pass, kPassCameraView) & 0xFFFFFF) == right_view || (SceneOf(render_graph_data) & 0xFFFFFF) == right_view;
-    auto context = render_graph_data ? reinterpret_cast<RE::RenderGraphDataD3D12Context*>(
-                                           static_cast<RE::CreationRendererPrivate::RenderGraphData*>(render_graph_data)->getCommandList())
-                                     : nullptr;
-    auto list    = context ? context->pID3D12CommandList : nullptr;
+    auto list = TimingCommandList(render_graph_data);
     if (pass_kind == kDLSSInputs) {
         PerfStats::MarkGpu(list, PerfStats::GpuPoint::kEyeUpscaleStart, right ? 1 : 0);
     }
@@ -970,9 +985,7 @@ uintptr_t StereoViewModule::RunLatePass(int pass_kind, void* pass, void* render_
     if (eye >= 0) {
         CaptureEyeImage((uint32_t)eye, pass_kind, render_graph_data, pass_data);
         // The last post effect of the eye's chain overwrites this point, so it ends up marking the chain's end.
-        if (auto context = reinterpret_cast<RE::RenderGraphDataD3D12Context*>(static_cast<RE::CreationRendererPrivate::RenderGraphData*>(render_graph_data)->getCommandList())) {
-            PerfStats::MarkGpu(context->pID3D12CommandList, PerfStats::GpuPoint::kEyePostEnd, eye);
-        }
+        PerfStats::MarkGpu(TimingCommandList(render_graph_data), PerfStats::GpuPoint::kEyePostEnd, eye);
     }
     return result;
 }
@@ -992,62 +1005,3 @@ int StereoViewModule::EyeOfGraph(void* render_graph_data) const
     return -1;
 }
 
-namespace
-{
-    struct TimingPassInfo
-    {
-        const char* label;
-        const char* rtti;
-    };
-
-    constexpr TimingPassInfo kTimingPasses[]{
-        { "FrameInitRenderPass", ".?AVFrameInitRenderPass@CreationRendererPrivate@@" },
-        { "PrepareEndFrameRenderPass", ".?AVPrepareEndFrameRenderPass@CreationRendererPrivate@@" },
-        { "SceneSetupRenderPass", ".?AVSceneSetupRenderPass@CreationRendererPrivate@@" },
-    };
-
-    template <int... Pass>
-    constexpr std::array<uintptr_t, sizeof...(Pass)> TimingDetours(std::integer_sequence<int, Pass...>)
-    {
-        return { reinterpret_cast<uintptr_t>(&StereoViewModule::onTimingPass<Pass>)... };
-    }
-} // namespace
-
-void StereoViewModule::InstallTimingHooks()
-{
-    static_assert(std::size(kTimingPasses) == kTimingPassCount);
-    static const auto detours = TimingDetours(std::make_integer_sequence<int, kTimingPassCount>{});
-    for (int i = 0; i < kTimingPassCount; ++i) {
-        auto vtable = reinterpret_cast<uintptr_t*>(MemoryScan::VTable(kTimingPasses[i].label, kTimingPasses[i].rtti, 0));
-        if (vtable == nullptr) {
-            spdlog::warn("[Perf] {} not found; its GPU time is not measured", kTimingPasses[i].label);
-            continue;
-        }
-        m_timing_hooks[i] = std::make_unique<FunctionHook>(vtable[7], detours[i]);
-        m_timing_hooks[i]->create();
-    }
-}
-
-uintptr_t StereoViewModule::RunTimingPass(int pass_kind, void* pass, void* render_graph_data, void* pass_data)
-{
-    using func_t  = uintptr_t(void*, void*, void*);
-    auto original = m_timing_hooks[pass_kind]->get_original<func_t>();
-    auto context  = render_graph_data ? reinterpret_cast<RE::RenderGraphDataD3D12Context*>(
-                                           static_cast<RE::CreationRendererPrivate::RenderGraphData*>(render_graph_data)->getCommandList())
-                                      : nullptr;
-    auto list     = context ? context->pID3D12CommandList : nullptr;
-
-    // Frame start and each eye's scene start are marked before the pass runs; the frame end after.
-    if (pass_kind == 0) {
-        PerfStats::MarkGpu(list, PerfStats::GpuPoint::kFrameStart, 0);
-    } else if (pass_kind == 2) {
-        if (const int eye = EyeOfGraph(render_graph_data); eye >= 0) {
-            PerfStats::MarkGpu(list, PerfStats::GpuPoint::kEyeSceneStart, eye);
-        }
-    }
-    const auto result = original(pass, render_graph_data, pass_data);
-    if (pass_kind == 1) {
-        PerfStats::MarkGpu(list, PerfStats::GpuPoint::kFrameEnd, 0);
-    }
-    return result;
-}

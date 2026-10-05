@@ -12,16 +12,13 @@ namespace PerfStats
     // 5 present end) for an engine frame.
     void OnReflexMarker(uint32_t marker, uint32_t frame);
 
-    // Points in a frame's GPU work, each recorded inside a render pass whose command list is recording.
+    // Points in each eye's GPU work, recorded inside the DLSS and post effect passes, whose command lists are recording.
+    // The right eye's graph is submitted first, so its DLSS inputs open each frame.
     enum class GpuPoint
     {
-        kFrameStart,      // FrameInit, before it runs
-        kFrameEnd,        // PrepareEndFrame, after it runs
-        kEyeSceneStart,   // the eye's SceneSetup, before it runs
         kEyeUpscaleStart, // the eye's DLSS inputs, before they run
         kEyeUpscaleEnd,   // the eye's DLSS upscale, after it runs
         kEyePostEnd,      // the eye's last post effect, after it runs
     };
-    // eye is 0 or 1 for the eye points and ignored otherwise.
     void MarkGpu(void* command_list, GpuPoint point, int eye);
 }
