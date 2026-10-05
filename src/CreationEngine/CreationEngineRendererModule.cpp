@@ -90,7 +90,10 @@ void CreationEngineRendererModule::RenderGraphStart(RE::CreationRendererPrivate:
     }
     if (m_startFramePass == pGraph && before) {
         GameFlow::resetGameState();
-        ModSettings::g_internalSettings.showQuadDisplay = GameFlow::isShowingMenu();
+        // Menus are not drawn on every render frame, so one counts as shown until it has been gone for a few frames.
+        static int frames_without_menu = 0;
+        frames_without_menu = GameFlow::isShowingMenu() ? 0 : frames_without_menu + 1;
+        ModSettings::g_internalSettings.showQuadDisplay = frames_without_menu < 10;
     }
 }
 

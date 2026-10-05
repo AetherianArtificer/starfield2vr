@@ -33,8 +33,6 @@ namespace GameFlow
         bool         have_position_before_loading{false};
         constexpr float kLoadingMoveToRecenter = 10.0f;
 
-        std::vector<std::string> last_menus;
-
         bool PlayerPosition(RE::NiPoint3& out)
         {
             auto player = CreationEngineSingletonManager::GetPlayerRef();
@@ -78,24 +76,6 @@ namespace GameFlow
 
     void resetGameState() {
         update_loading_recenter();
-        {
-            std::vector<std::string> menus;
-            for (auto part : gStore.debugData.ui_parts) {
-                std::string name{ part };
-                if (std::find(menus.begin(), menus.end(), name) == menus.end()) {
-                    menus.push_back(name);
-                }
-            }
-            std::sort(menus.begin(), menus.end());
-            if (menus != last_menus) {
-                std::string list;
-                for (const auto& m : menus) {
-                    list += (list.empty() ? "" : ", ") + m;
-                }
-                spdlog::info("[GameFlow] Menus drawn: {}", list.empty() ? "none" : list);
-                last_menus = std::move(menus);
-            }
-        }
         ship_hud_last_frame.store(ship_hud_seen_this_frame);
         ship_hud_seen_this_frame = false;
         gStore.debugData.ui_parts.clear();
