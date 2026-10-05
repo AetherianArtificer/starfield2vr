@@ -134,6 +134,114 @@ namespace body
                 glm::normalize(*room * tracking::ToHavokVector(rot * glm::vec3{ 0.0f, 1.0f, 0.0f })) };
         }
 
+        // Headset body and hand tracking for this frame, mapped into the game through the same tracking space as
+        // the head and controllers.
+        VR::BodyTrackingState g_tracked_body;
+        VR::HandTrackingState g_tracked_hands[2];
+
+        namespace joint
+        {
+            constexpr int kHips = 1, kNeck = 6;
+            constexpr int kArmUpper[2] = { 10, 15 }, kArmLower[2] = { 11, 16 }, kWrist[2] = { 19, 45 };
+            constexpr int kUpperLeg[2] = { 70, 77 }, kLowerLeg[2] = { 71, 78 }, kAnkle[2] = { 73, 80 };
+        }
+
+        struct TrackingDiag
+        {
+            bool supported{ false };
+            bool active{ false };
+            int  valid{ 0 };
+            bool torso{ false };
+            bool elbow[2]{};
+            bool legs{ false };
+            bool fingers[2]{};
+            int  hand_source[2]{};
+        };
+        TrackingDiag g_track_diag;
+
+        void SnapshotTracking()
+        {
+            static auto vr = VR::get();
+            g_tracked_body = {};
+            vr->get_body_tracking(g_tracked_body);
+            for (int side = 0; side < 2; ++side) {
+                g_tracked_hands[side] = {};
+                vr->get_hand_tracking(side == 0, g_tracked_hands[side]);
+            }
+            g_track_diag           = {};
+            g_track_diag.supported = g_tracked_body.supported;
+            g_track_diag.active    = g_tracked_body.active;
+            for (std::uint32_t i = 0; i < g_tracked_body.joint_count && i < g_tracked_body.joints.size(); ++i) {
+                g_track_diag.valid += g_tracked_body.joints[i].position_valid ? 1 : 0;
+            }
+            for (int side = 0; side < 2; ++side) {
+                g_track_diag.hand_source[side] = g_tracked_hands[side].active ? g_tracked_hands[side].data_source : -1;
+            }
+        }
+
+        bool BodyTrackingOn()
+        {
+            return GameFlow::gStore.internalSettings.bodyTracking && g_tracked_body.active;
+        }
+
+        std::optional<glm::vec3> TrackedJoint(int index)
+        {
+            if (!BodyTrackingOn() || index < 0 || index >= static_cast<int>(g_tracked_body.joint_count) ||
+                !g_tracked_body.joints[index].position_valid) {
+                return std::nullopt;
+            }
+            return glm::vec3{ g_tracked_body.joints[index].position };
+        }
+
+        // A stage-space direction in game world space.
+        std::optional<glm::vec3> StageDirection(const glm::vec3& d)
+        {
+            const auto room = tracking::RoomRotation();
+            if (!room || glm::length(d) < 1e-5f) {
+                return std::nullopt;
+            }
+            return glm::normalize(*room * tracking::ToHavokVector(d));
+        }
+
+        // Direction between two tracked joints, in game world space.
+        std::optional<glm::vec3> TrackedDirection(int from, int to)
+        {
+            const auto a = TrackedJoint(from);
+            const auto b = TrackedJoint(to);
+            if (!a || !b) {
+                return std::nullopt;
+            }
+            return StageDirection(*b - *a);
+        }
+
+        // Side the limb bends toward at its middle joint (elbow or knee), in game world space.
+        std::optional<glm::vec3> TrackedBend(int root, int middle, int end)
+        {
+            const auto a = TrackedJoint(root);
+            const auto b = TrackedJoint(middle);
+            const auto c = TrackedJoint(end);
+            if (!a || !b || !c) {
+                return std::nullopt;
+            }
+            const auto axis = *c - *a;
+            if (glm::length(axis) < 1e-3f) {
+                return std::nullopt;
+            }
+            const auto n    = glm::normalize(axis);
+            auto       bend = (*b - *a) - glm::dot(*b - *a, n) * n;
+            if (glm::length(bend) < 5e-3f) {
+                return std::nullopt;  // limb nearly straight; the bend side is not observable
+            }
+            return StageDirection(bend);
+        }
+
+        bool PlayerSeated()
+        {
+            static auto vr     = VR::get();
+            const float height = vr->get_floor_eye_height();
+            return height >= 0.0f && height < 1.3f;
+        }
+
         // BSModelNode pose storage (see local RE notes): locals feed the batched world computation.
         // Animation does not rewrite every local each frame; bones we wrote are restored to their animated
         // value first so the IK never builds on its own output.
@@ -428,7 +536,7 @@ namespace body
         // and ceiling, wrist-driven elbow direction, twist split, exact hand. FO4 distances are in units of 1/70 m.
         constexpr float kUnit = 1.0f / 70.0f;
 
-        float SolveArm(const Pose& pose, Arm& arm, bool is_left, const Xf& hand_target)
+        float SolveArm(const Pose& pose, Arm& arm, bool is_left, const Xf& hand_target, const std::optional<glm::vec3>& tracked_bend = std::nullopt)
         {
             const float neg_left = is_left ? -1.0f : 1.0f;
             const auto  up_axis  = glm::vec3{ 0.0f, 0.0f, 1.0f };
@@ -535,8 +643,9 @@ namespace body
             const float behind_head  = std::clamp(hand_behind / (15.0f * kUnit), 0.0f, 1.0f) * std::clamp(up_limit * 1.2f, 0.0f, 1.0f);
             const float twist_fwd    = std::max(across * glm::radians(90.0f), behind_head * glm::radians(120.0f));
             const float yaw          = -neg_left * (glm::radians(150.0f) - arm_twist * glm::radians(25.0f) - twist_fwd);
-            const auto  elbow_dir    = glm::vec3{ bend_down.x * std::cos(yaw) - bend_down.y * std::sin(yaw),
-                bend_down.x * std::sin(yaw) + bend_down.y * std::cos(yaw), bend_down.z };
+            const auto  elbow_dir    = tracked_bend ? *tracked_bend
+                                                    : glm::vec3{ bend_down.x * std::cos(yaw) - bend_down.y * std::sin(yaw),
+                                                          bend_down.x * std::sin(yaw) + bend_down.y * std::cos(yaw), bend_down.z };
 
             const auto x_dir = glm::normalize(hand_to_shoulder);
             auto       y_dir = elbow_dir - x_dir * glm::dot(elbow_dir, x_dir);
@@ -833,15 +942,40 @@ namespace body
             UpdateWalk(pose.root.t, left_anim.t, right_anim.t);
             auto left  = left_anim;
             auto right = right_anim;
-            if (GameFlow::gStore.internalSettings.walkingLegs && g_walk.state == 1) {
-                left.t  = g_walk.l_pos;
-                right.t = g_walk.r_pos;
-            }
             auto forward = pose.root.r[1];
             forward.z    = 0.0f;
             forward      = glm::length(forward) > 1e-3f ? glm::normalize(forward) : glm::vec3{ 0.0f, 1.0f, 0.0f };
-            SolveLeg(pose, l, left, forward);
-            SolveLeg(pose, r, right, forward);
+            glm::vec3 knee_dir[2] = { forward, forward };
+            if (GameFlow::gStore.internalSettings.walkingLegs && g_walk.state == 1) {
+                left.t  = g_walk.l_pos;
+                right.t = g_walk.r_pos;
+            } else if (g_tracked_body.full_body && !PlayerSeated() && g_bones.pelvis >= 0) {
+                // Standing in place: feet placed where the tracked ankles are relative to the tracked hips, on the
+                // animated ground height; knees bend toward the tracked knees.
+                const auto hips = TrackedJoint(joint::kHips);
+                const auto pelvis = pose.GameWorld(g_bones.pelvis).t;
+                Xf* feet[2] = { &left, &right };
+                bool placed = false;
+                for (int side = 0; side < 2; ++side) {
+                    const auto ankle = TrackedJoint(joint::kAnkle[side]);
+                    if (!hips || !ankle) {
+                        continue;
+                    }
+                    if (const auto offset = StageDirection(*ankle - *hips)) {
+                        const float distance = glm::length(*ankle - *hips) * tracking::TrackingScale();
+                        auto        target   = pelvis + *offset * distance;
+                        target.z             = feet[side]->t.z;
+                        feet[side]->t        = target;
+                        placed               = true;
+                    }
+                    if (const auto bend = TrackedBend(joint::kUpperLeg[side], joint::kLowerLeg[side], joint::kAnkle[side])) {
+                        knee_dir[side] = *bend;
+                    }
+                }
+                g_track_diag.legs = placed;
+            }
+            SolveLeg(pose, l, left, knee_dir[0]);
+            SolveLeg(pose, r, right, knee_dir[1]);
         }
 
         // Body yaw toward the hands, after FRIK's getNeckYaw: the torso turns 0.7 of the angle between the head's
@@ -884,6 +1018,30 @@ namespace body
         };
         Support g_support;
 
+        // Body yaw from the tracked hips: their forward (from the hip line, or the shoulder line without legs).
+        std::optional<float> TrackedFacingYaw(const Pose& pose)
+        {
+            auto side = g_tracked_body.full_body ? TrackedDirection(joint::kUpperLeg[0], joint::kUpperLeg[1]) : std::nullopt;
+            if (!side) {
+                side = TrackedDirection(joint::kArmUpper[0], joint::kArmUpper[1]);
+            }
+            auto forward = pose.root.r[1];
+            forward.z    = 0.0f;
+            if (!side || glm::length(forward) < 1e-3f) {
+                return std::nullopt;
+            }
+            auto tracked = glm::cross(glm::vec3{ 0.0f, 0.0f, 1.0f }, *side);
+            tracked.z    = 0.0f;
+            if (glm::length(tracked) < 1e-3f) {
+                return std::nullopt;
+            }
+            forward             = glm::normalize(forward);
+            tracked             = glm::normalize(tracked);
+            const float target  = std::atan2(forward.x * tracked.y - forward.y * tracked.x, glm::dot(forward, tracked));
+            g_facing_yaw += (target - g_facing_yaw) * 0.25f;
+            return g_facing_yaw;
+        }
+
         // Horizontal offset of the head from the neck that the spine absorbs this frame (the rest moves the body).
         glm::vec3 g_lean{ 0.0f };
         float     g_lean_applied{ 0.0f };
@@ -909,6 +1067,33 @@ namespace body
                 pose.SetGameWorld(bone, bent);
             }
             g_lean_applied = glm::length(g_lean);
+        }
+
+        // Torso from body tracking: the spine bones share the rotation that turns the body's hips-to-neck axis and
+        // shoulder line onto the tracked ones.
+        bool ApplyTrackedTorso(const Pose& pose)
+        {
+            if (g_bones.spine.empty() || g_bones.neck < 0 || g_bones.pelvis < 0 || g_bones.right.biceps < 0 || g_bones.left.biceps < 0) {
+                return false;
+            }
+            const auto up_t   = TrackedDirection(joint::kHips, joint::kNeck);
+            const auto side_t = TrackedDirection(joint::kArmUpper[0], joint::kArmUpper[1]);
+            if (!up_t || !side_t) {
+                return false;
+            }
+            const auto up_g   = glm::normalize(pose.GameWorld(g_bones.neck).t - pose.GameWorld(g_bones.pelvis).t);
+            const auto side_g = glm::normalize(pose.GameWorld(g_bones.right.biceps).t - pose.GameWorld(g_bones.left.biceps).t);
+            auto frame = [](const glm::vec3& up, const glm::vec3& side) { return FrameOf(glm::cross(up, side), up); };
+            const auto turn  = glm::quat_cast(frame(*up_t, *side_t) * glm::transpose(frame(up_g, side_g)));
+            const auto count = static_cast<int>(g_bones.spine.size());
+            const auto share = glm::mat3_cast(glm::slerp(glm::quat{ 1.0f, 0.0f, 0.0f, 0.0f }, turn, 1.0f / static_cast<float>(count)));
+            for (const int bone : g_bones.spine) {
+                auto bent = pose.GameWorld(bone);
+                bent.r    = share * bent.r;
+                pose.SetGameWorld(bone, bent);
+            }
+            g_track_diag.torso = true;
+            return true;
         }
 
         // Finger poses. The side the fingers curl toward (the palm) is measured from the animated hand.
@@ -1237,6 +1422,8 @@ namespace body
         // Fingers from the controller: index from the trigger (extended off the trigger), the other three from the
         // grip, the thumb from touch. A hand holding the weapon keeps the first-person grip's finger pose and only
         // the index finger follows the trigger.
+        bool ApplyTrackedFingers(const Pose& pose, int side, int wrist);
+
         void ApplyFingers(const Pose& pose, int side, int wrist, RE::NiAVObject* first_wrist)
         {
             if (!GameFlow::gStore.internalSettings.fingerPoses || wrist < 0) {
@@ -1246,6 +1433,10 @@ namespace body
             const auto  input = vr->get_finger_state(side == 0);
             auto&       diag  = g_finger_diag[side];
             diag              = { input.trigger, input.grip, input.thumb_touch, 0 };
+
+            if (ApplyTrackedFingers(pose, side, wrist)) {
+                return;
+            }
 
             // Each finger follows its input through a fast spring and an ease-in/out curve.
             auto&       state = g_finger_springs[side];
@@ -1318,6 +1509,65 @@ namespace body
             }
         }
 
+        // Fingers from hand tracking: each finger joint points where the tracked joint does, through the hands'
+        // anatomical frames (tracked: wrist to middle knuckle forward, thumb side up).
+        bool ApplyTrackedFingers(const Pose& pose, int side, int wrist)
+        {
+            const auto& hand = g_tracked_hands[side];
+            const auto& body = side == 0 ? g_bones.left.shape : g_bones.right.shape;
+            if (!GameFlow::gStore.internalSettings.handTracking || !hand.active || !body.valid) {
+                return false;
+            }
+            auto at = [&](int i) { return glm::vec3{ hand.joints[i].position }; };
+            for (const int i : { 1, 3, 12 }) {
+                if (!hand.joints[i].position_valid) {
+                    return false;
+                }
+            }
+            const auto fwd = at(12) - at(1);
+            auto       up  = at(3) - at(1);
+            if (glm::length(fwd) < 1e-3f) {
+                return false;
+            }
+            up -= glm::dot(up, glm::normalize(fwd)) * glm::normalize(fwd);
+            if (glm::length(up) < 1e-4f) {
+                return false;
+            }
+            const auto room = tracking::RoomRotation();
+            if (!room) {
+                return false;
+            }
+            // Tracked frame in game axes, then onto the body's hand frame.
+            const auto tracked_frame = FrameOf(*room * tracking::ToHavokVector(fwd), *room * tracking::ToHavokVector(up));
+            const auto body_frame    = pose.GameWorld(wrist).r * FrameOf(body.forward, body.up);
+            const auto to_body       = body_frame * glm::transpose(tracked_frame);
+
+            // XrHandJointEXT: thumb metacarpal 2..tip 5; fingers proximal..tip at 7, 12, 17, 22 (+0..3).
+            static constexpr int kTracked[5][3] = { { 2, 3, 4 }, { 7, 8, 9 }, { 12, 13, 14 }, { 17, 18, 19 }, { 22, 23, 24 } };
+            const auto& chains = g_bones.fingers[side];
+            for (int f = 0; f < 5; ++f) {
+                for (int j = 0; j < 2; ++j) {
+                    const int bone  = chains[f][j];
+                    const int child = chains[f][j + 1];
+                    const int a = kTracked[f][j], b = kTracked[f][j + 1];
+                    if (bone < 0 || child < 0 || !hand.joints[a].position_valid || !hand.joints[b].position_valid) {
+                        continue;
+                    }
+                    const auto wanted = to_body * (*room * tracking::ToHavokVector(at(b) - at(a)));
+                    const auto joint  = pose.GameWorld(bone);
+                    const auto dir    = pose.GameWorld(child).t - joint.t;
+                    if (glm::length(wanted) < 1e-5f || glm::length(dir) < 1e-5f) {
+                        continue;
+                    }
+                    auto posed = joint;
+                    posed.r    = RotationBetween(dir, wanted) * joint.r;
+                    pose.SetGameWorld(bone, posed);
+                }
+            }
+            g_track_diag.fingers[side] = true;
+            return true;
+        }
+
         void RestoreAnimated(const Pose& pose)
         {
             for (auto it = g_written.begin(); it != g_written.end();) {
@@ -1343,7 +1593,9 @@ namespace body
                 feet = std::make_pair(pose.GameWorld(g_bones.left_leg.foot), pose.GameWorld(g_bones.right_leg.foot));
             }
             ApplyCrouch(pose);
-            ApplyLean(pose);
+            if (!ApplyTrackedTorso(pose)) {
+                ApplyLean(pose);
+            }
             if (feet) {
                 ApplyLegs(pose, feet->first, feet->second);
             }
@@ -1466,7 +1718,9 @@ namespace body
                     } else {
                         g_body_muzzle = nullptr;
                     }
-                    g_diag.right_gap = SolveArm(pose, r, false, wrist_target);
+                    const auto bend = TrackedBend(joint::kArmUpper[1], joint::kArmLower[1], joint::kWrist[1]);
+                    g_track_diag.elbow[1] = bend.has_value();
+                    g_diag.right_gap      = SolveArm(pose, r, false, wrist_target, bend);
                     ApplyFingers(pose, 1, r.wrist, held_weapon ? first_right_wrist : nullptr);
                 }
             }
@@ -1482,7 +1736,9 @@ namespace body
                         target = g_support.target;
                     }
                     g_diag.support_held = on_grip;
-                    g_diag.left_gap     = SolveArm(pose, l, true, target);
+                    const auto bend       = TrackedBend(joint::kArmUpper[0], joint::kArmLower[0], joint::kWrist[0]);
+                    g_track_diag.elbow[0] = bend.has_value();
+                    g_diag.left_gap       = SolveArm(pose, l, true, target, bend);
                     ApplyFingers(pose, 0, l.wrist, on_grip ? first_left_wrist : nullptr);
                 }
             }
@@ -1593,11 +1849,12 @@ namespace body
                     shifted_root                    = *root_local;
                     g_lean                          = glm::vec3{ 0.0f };
                     auto world_camera               = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
+                    SnapshotTracking();
                     if (world_camera && g_bones.neck >= 0) {
                         const auto eye = ToVec(world_camera->world.translate);
                         // Torso partly toward the hands (FRIK: 0.7 of the hands' yaw, within 50 degrees).
                         if (GameFlow::gStore.internalSettings.bodyFacing) {
-                            const auto yaw = FacingYaw(pose, eye);
+                            const auto yaw = TrackedFacingYaw(pose).value_or(FacingYaw(pose, eye));
                             Xf         root = FromNi(shifted_root);
                             const auto turn = glm::mat3_cast(glm::angleAxis(yaw, glm::vec3{ 0.0f, 0.0f, 1.0f }));
                             const auto pivot = glm::vec3{ eye.x, eye.y, root.t.z };
@@ -1745,6 +2002,9 @@ namespace body
                         g_walk.state, g_walk.speed, g_lean_applied, glm::degrees(g_facing_yaw), g_diag.support_held, g_diag.support_distance, g_finger_diag[1].trigger,
                         g_finger_diag[1].grip, g_finger_diag[1].thumb, g_finger_diag[1].copied, g_finger_diag[0].trigger, g_finger_diag[0].grip,
                         g_finger_diag[0].thumb, g_finger_diag[0].copied);
+                    spdlog::info("[BodyIK] tracking: body supported {} active {} valid {} | torso {} elbows L {} R {} legs {} | fingers L {} (src {}) R {} (src {})",
+                        g_track_diag.supported, g_track_diag.active, g_track_diag.valid, g_track_diag.torso, g_track_diag.elbow[0], g_track_diag.elbow[1],
+                        g_track_diag.legs, g_track_diag.fingers[0], g_track_diag.hand_source[0], g_track_diag.fingers[1], g_track_diag.hand_source[1]);
                 }
             }
             return result;

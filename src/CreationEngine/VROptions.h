@@ -51,6 +51,8 @@ public:
         kSupportHand,
         kFingerPoses,
         kWalkingLegs,
+        kBodyTracking,
+        kHandTracking,
         kMatchBodyHeight,
         kHudPlacement,
         kEyeScreenshots,

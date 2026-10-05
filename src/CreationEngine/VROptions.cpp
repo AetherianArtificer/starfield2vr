@@ -109,6 +109,10 @@ VROptions::VROptions()
         "Your left hand holds the weapon's foregrip when you bring it close.", on_off, 1);
     add(kFingerPoses, kCategoryControls, Kind::Toggle, "FingerPoses", "Finger Tracking",
         "Fingers follow the controller's trigger, grip and thumb touch.", on_off, 1);
+    add(kBodyTracking, kCategoryControls, Kind::Toggle, "BodyTracking", "Body Tracking",
+        "Use the headset's body tracking for your torso, elbows and legs when available.", on_off, 1);
+    add(kHandTracking, kCategoryControls, Kind::Toggle, "HandTracking", "Tracked Fingers",
+        "Use the headset's hand tracking for finger poses when available.", on_off, 1);
     add(kWalkingLegs, kCategoryControls, Kind::Toggle, "WalkingLegs", "Walking Legs",
         "The body's legs step whenever you move.", on_off, 1);
     add(kWeaponFollowsHand, kCategoryControls, Kind::Toggle, "WeaponFollowsHand", "Full Body (Experimental)",
@@ -205,6 +209,8 @@ void VROptions::apply() const
     s.supportHand          = get(kSupportHand) != 0;
     s.fingerPoses          = get(kFingerPoses) != 0;
     s.walkingLegs          = get(kWalkingLegs) != 0;
+    s.bodyTracking         = get(kBodyTracking) != 0;
+    s.handTracking         = get(kHandTracking) != 0;
     s.hudPanel             = get(kHudPlacement) == 0;
 
     auto& hud       = GameFlow::gStore.hudSettings;

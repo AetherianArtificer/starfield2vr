@@ -31,6 +31,8 @@ namespace GameFlow
             bool supportHand{true};
             bool fingerPoses{true};
             bool walkingLegs{true};
+            bool bodyTracking{true};
+            bool handTracking{true};
             bool hudPanel{true};
             float hudPanelWidth{1.86f};
             float hudPanelDistance{2.0f};
