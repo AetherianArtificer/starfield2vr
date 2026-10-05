@@ -1287,8 +1287,7 @@ void StereoViewModule::ApplyNativeShadowSettings(bool native)
 {
     // Every eye view runs the dynamic shadow selection, but the per-light fade state is shared: each eye resets the fades of
     // lights only the other eye sees, so those shadows keep restarting their tiled fade. The main view whose LOD the
-    // dynamic shadow maps borrow is not rendered in native stereo, so each shadow map picks its own. Shadow caster occlusion
-    // culling tests against a depth pyramid that only one eye builds, so the other eye loses casters; culling is turned off.
+    // dynamic shadow maps borrow is not rendered in native stereo, so each shadow map picks its own.
     if (native == m_shadow_settings_applied) {
         return;
     }
@@ -1297,18 +1296,10 @@ void StereoViewModule::ApplyNativeShadowSettings(bool native)
     using Type    = CreationEngineSettings::SettingType;
     constexpr auto kFade = "fDynamicShadowFadeSeconds:Shadows";
     constexpr auto kLod  = "bDynamicShadowmapsUseMainViewLOD:Shadows";
-    constexpr auto kVolumeCulling = "bEnableShadowVolumeCulling:Shadows";
-    constexpr auto kCsmCulling    = "bCSMEnableOcclusionCulling:Shadows";
     if (native) {
         m_saved_shadow_fade_seconds  = settings->get_setting(kFade, Type::kINISetting, 0.75f);
         m_saved_shadow_main_view_lod = settings->get_setting(kLod, Type::kINISetting, true);
-        m_saved_shadow_volume_culling = settings->get_setting(kVolumeCulling, Type::kINISetting, true);
-        m_saved_csm_occlusion_culling = settings->get_setting(kCsmCulling, Type::kINISetting, true);
     }
-    const bool volume = settings->set_setting(kVolumeCulling, Type::kINISetting, native ? false : m_saved_shadow_volume_culling);
-    const bool csm    = settings->set_setting(kCsmCulling, Type::kINISetting, native ? false : m_saved_csm_occlusion_culling);
-    spdlog::info("[Stereo] Shadow caster occlusion culling {}: volume ({}), cascades ({})", native ? "off" : "restored", volume ? "set" : "not found",
-                 csm ? "set" : "not found");
     const bool fade = settings->set_setting(kFade, Type::kINISetting, native ? 0.0f : m_saved_shadow_fade_seconds);
     const bool lod  = settings->set_setting(kLod, Type::kINISetting, native ? false : m_saved_shadow_main_view_lod);
     spdlog::info("[Stereo] Shadow settings {}: dynamic shadow fade {}s ({}), main view LOD {} ({})", native ? "for native stereo" : "restored",
