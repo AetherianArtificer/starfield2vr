@@ -4,5 +4,4 @@
 namespace PerfStats
 {
     void OnPresent();
-    void OnFrameResync();
 }

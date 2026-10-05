@@ -17,7 +17,6 @@ namespace PerfStats
         clock::time_point  g_last_present{};
         clock::time_point  g_window_start{};
         std::vector<float> g_frame_ms;
-        int                g_resyncs{ 0 };
 
         void Report(float seconds)
         {
@@ -33,20 +32,18 @@ namespace PerfStats
             const float fps = count / seconds;
             const float p99 = g_frame_ms[std::min(count - 1, count * 99 / 100)];
 
-            // Each eye gets every other frame, so the game must deliver two frames per display refresh.
+            // Every frame carries both eyes, so the game must deliver one frame per display refresh.
             const double period    = VR::get()->get_display_period();
-            const float  budget_ms = period > 0.0 ? (float)(period * 1000.0 / 2.0) : 0.0f;
+            const float  budget_ms = period > 0.0 ? (float)(period * 1000.0) : 0.0f;
             std::size_t  over      = 0;
             if (budget_ms > 0.0f) {
                 over = count - (std::upper_bound(g_frame_ms.begin(), g_frame_ms.end(), budget_ms * 1.1f) - g_frame_ms.begin());
             }
 
-            spdlog::info("[Perf] {:.1f} fps ({:.1f} per eye) | frame avg {:.1f} ms, p99 {:.1f} ms, max {:.1f} ms | budget {:.1f} ms ({:.0f} Hz), {:.0f}% over | resyncs {}",
-                fps, fps / 2.0f, sum / count, p99, g_frame_ms.back(), budget_ms, period > 0.0 ? 1.0 / period : 0.0,
-                100.0f * over / count, g_resyncs);
+            spdlog::info("[Perf] {:.1f} fps | frame avg {:.1f} ms, p99 {:.1f} ms, max {:.1f} ms | budget {:.1f} ms ({:.0f} Hz), {:.0f}% over", fps, sum / count, p99,
+                g_frame_ms.back(), budget_ms, period > 0.0 ? 1.0 / period : 0.0, 100.0f * over / count);
 
             g_frame_ms.clear();
-            g_resyncs = 0;
         }
     }
 
@@ -67,10 +64,5 @@ namespace PerfStats
             Report(std::chrono::duration<float>(now - g_window_start).count());
             g_window_start = now;
         }
-    }
-
-    void OnFrameResync()
-    {
-        ++g_resyncs;
     }
 }

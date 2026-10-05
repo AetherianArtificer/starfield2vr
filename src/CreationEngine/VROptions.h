@@ -43,7 +43,6 @@ public:
         kHudDepth,
         kMenuDistance,
         kMenuSize,
-        kDominantEye,
         kRecenterView,
         kTurnFade,
         kWeaponFollowsHand,
@@ -53,6 +52,8 @@ public:
         kFingerPoses,
         kWalkingLegs,
         kMatchBodyHeight,
+        kHudPlacement,
+        kEyeScreenshots,
 
         kFirstId = 8600,
         kLastId  = 8699,

@@ -21,7 +21,6 @@ namespace GameFlow
         struct InternalSettings {
             int headAimingAbsolute{1};
             float flatScreenDistance{1.5f};
-            bool nvidiaAndTAAfix{true};
             bool preventZoom{false};
             bool alternativeJoyLayout{false};
             int  controllerLayout{0}; // 0 = matching letters (Quest/Touch), 1 = legacy
@@ -32,6 +31,9 @@ namespace GameFlow
             bool supportHand{true};
             bool fingerPoses{true};
             bool walkingLegs{true};
+            bool hudPanel{true};
+            float hudPanelWidth{1.86f};
+            float hudPanelDistance{2.0f};
             int   turnMode{0}; // 0 = snap, 1 = smooth (game's own stick look)
             float snapTurnDegrees{45.0f};
             bool  turnFade{false};

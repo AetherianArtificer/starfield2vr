@@ -21,8 +21,7 @@ private:
     const ModSlider::Ptr m_head_tracking_multiplier{ ModSlider::create(generate_name("HeadTrackingSensitivity"), 0.5, 2.0, 1.0) };
     const ModToggle::Ptr m_decoupled_pitch{ ModToggle::create(generate_name("DecoupledPitch"), false) };
     const ModToggle::Ptr m_pawn_control_rotation{ ModToggle::create(generate_name("PawnControlRotation"), true) };
-    const ModToggle::Ptr m_taa_anf_nvidia_fix{ ModToggle::create(generate_name("NvidiaDlssAndTaaFix"), true) };
     const ModToggle::Ptr m_alternative_joy_layout{ ModToggle::create(generate_name("JoyAlternativeLayout"), false) };
 
-    ValueList m_options{*m_head_tracking_multiplier, *m_taa_anf_nvidia_fix, *m_alternative_joy_layout, *m_decoupled_pitch, *m_pawn_control_rotation };
+    ValueList m_options{*m_head_tracking_multiplier, *m_alternative_joy_layout, *m_decoupled_pitch, *m_pawn_control_rotation };
 };

@@ -1,6 +1,7 @@
 #include "VROptions.h"
 
 #include "CreationEngineConstants.h"
+#include "StereoViewModule.h"
 #include "Framework.hpp"
 #include <CreationEngine/models/ModSettingsStore.h>
 #include <mods/VR.hpp>
@@ -78,16 +79,19 @@ VROptions::VROptions()
         { "90%", "95%", "100%", "105%", "110%" }, 2);
     add(kMatchBodyHeight, kCategoryDisplay, Kind::Toggle, "MatchBodyHeight", "Match Body Height",
         "Scale your movement so your eyes and reach match your character's body. Measured when the view recenters.", on_off, 1);
+    add(kHudPlacement, kCategoryDisplay, Kind::Choice, "HudPlacement", "HUD Placement",
+        "Floating Panel shows the HUD on a panel in front of you that recentres when you turn away. Head Locked keeps it fixed in your view.",
+        { "Floating Panel", "Head Locked" }, 0);
     add(kHudSize, kCategoryDisplay, Kind::Choice, "HudSize", "HUD Size", "Size of the in-game HUD.", { "Small", "Medium", "Large" }, 1);
     add(kHudDepth, kCategoryDisplay, Kind::Choice, "HudDepth", "HUD Depth", "How far away the in-game HUD appears.", { "Near", "Medium", "Far" }, 1);
     add(kMenuDistance, kCategoryDisplay, Kind::Choice, "MenuDistance", "Menu Distance", "How far away full-screen menus appear.",
         { "Near", "Medium", "Far" }, 1);
     add(kMenuSize, kCategoryDisplay, Kind::Choice, "MenuSize", "Menu Size", "Size of full-screen menus.", { "Small", "Medium", "Large" }, 1);
-    add(kDominantEye, kCategoryDisplay, Kind::Choice, "DominantEye", "Dominant Eye", "The eye the HUD and crosshair line up with.",
-        { "Right", "Left" }, 0);
     add(kRecenterAfterLoading, kCategoryDisplay, Kind::Toggle, "RecenterAfterLoading", "Recenter After Loading Screens",
         "Reset your view height and direction when a loading screen ends.", on_off, 1);
     add(kRecenterView, kCategoryDisplay, Kind::Action, "", "Recenter View", "Reset your view height and direction now.", {}, 0);
+    add(kEyeScreenshots, kCategoryDisplay, Kind::Action, "", "Save Eye Screenshots",
+        "Save the image each eye of the headset receives, as PNG files in the game folder. Useful when reporting a display problem.", {}, 0);
 
     // VR Controls
     add(kControllerLayout, kCategoryControls, Kind::Choice, "ControllerLayout", "Controller Layout",
@@ -162,6 +166,10 @@ void VROptions::set(std::uint32_t id, int value)
         VR::get()->recenter_view();
         return;
     }
+    if (id == kEyeScreenshots) {
+        StereoViewModule::Get()->RequestEyeScreenshots();
+        return;
+    }
     if (id == kComfortPreset) {
         if (value >= 0 && value < kCustomPreset) {
             apply_preset(value);
@@ -197,12 +205,17 @@ void VROptions::apply() const
     s.supportHand          = get(kSupportHand) != 0;
     s.fingerPoses          = get(kFingerPoses) != 0;
     s.walkingLegs          = get(kWalkingLegs) != 0;
+    s.hudPanel             = get(kHudPlacement) == 0;
 
     auto& hud       = GameFlow::gStore.hudSettings;
     hud.hudScale    = Pick(kHudSizes, get(kHudSize));
     hud.perspective = Pick(kHudDepths, get(kHudDepth));
+    // The floating panel spans 40, 50 or 60 degrees at 1.2, 2 or 3 metres.
+    constexpr std::array<float, 3> kHudPanelAngles{ 40.0f, 50.0f, 60.0f };
+    constexpr std::array<float, 3> kHudPanelDistances{ 1.2f, 2.0f, 3.0f };
+    s.hudPanelDistance = Pick(kHudPanelDistances, get(kHudDepth));
+    s.hudPanelWidth    = 2.0f * s.hudPanelDistance * std::tan(glm::radians(Pick(kHudPanelAngles, get(kHudSize))) * 0.5f);
 
-    ModConstants::dominantEye      = get(kDominantEye);
     ModConstants::headTrackingType = get(kAimWith);
 
     auto vr = VR::get();

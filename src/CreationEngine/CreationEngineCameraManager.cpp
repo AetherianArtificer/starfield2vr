@@ -26,6 +26,7 @@
 #include <mods/VR.hpp>
 
 #include "ModSettings.h"
+#include "StereoViewModule.h"
 #include "body/BodyIK.h"
 #include "vr/TrackingSpace.h"
 
@@ -58,9 +59,7 @@ void onScaleformMovieSetProjectionMatrix3DDetour(uintptr_t* thisMovie, Matrix4x4
 */
 
 bool isValidCamera(RE::NiCamera *pCamera) {
-    static auto sceneGraphRoot = CreationEngineSingletonManager::GetSceneGraphRoot();
-    return pCamera == sceneGraphRoot->worldCamera || pCamera == sceneGraphRoot->starfieldScene.pStarFieldCamera ||
-           sceneGraphRoot->starfieldScene.pGalaxyCamera == pCamera;
+    return StereoViewModule::Get()->EyeOf(pCamera) >= 0;
 }
 
 void CreationEngineCameraManager::InstallHooks() {
@@ -69,6 +68,7 @@ void CreationEngineCameraManager::InstallHooks() {
     m_onNiAVObjectUpdateWorldHook = std::make_unique<FunctionHook>(onNiAVObjectUpdateWorldAddr.address(),
                                                                    reinterpret_cast<uintptr_t>(&onNiAVObjectUpdateWorld));
     m_onNiAVObjectUpdateWorldHook->create();
+
 
     REL::Relocation<uintptr_t> onGetCameraRotationAddr{ GameStore::MemoryOffsets::FirstPersonState::GetRotationQuatV() };
     m_onGetCameraRotationHook = std::make_unique<FunctionHook>(onGetCameraRotationAddr.address(), reinterpret_cast<uintptr_t>(&onFPSGetCameraRotation));
@@ -181,34 +181,21 @@ CreationEngineCameraManager::onScaleformSetViewPortInternal(uintptr_t *thisMovie
     auto viewport_buffer_width = viewport->bufferWidth;
     auto viewport_buffer_height = viewport->bufferHeight;
 
-    int offset_left = 0;
-    int offset_top = 0;
-
     auto settings = GameFlow::getMenuSettings(file_url);
 
-    if (ModSettings::showFlatScreenDisplay() || !vr->is_hmd_active()) {
+    // Fullscreen menus keep the whole UI layer; they are shown on the flat screen.
+    if (!vr->is_hmd_active() || ModSettings::showFlatScreenDisplay()) {
         return;
     }
 
-    auto width_multiplier = settings.hud_scale;
-    auto height_multiplier = settings.hud_scale;
-
-    // Implement offset based on dominant eye and menu-specific offset_value
-    auto current_eye = vr->get_current_render_eye();
-    if (ModConstants::dominantEye == 1) {
-        // Dominant eye is right
-        offset_left = (current_eye == VRRuntime::Eye::RIGHT) ? -settings.perspective : 0;
-    } else {
-        // Dominant eye is left
-        offset_left = (current_eye == VRRuntime::Eye::LEFT) ? settings.perspective : 0;
-    }
-
-    auto visible_width = std::min((int) ((float) backbuffer_size[0] * width_multiplier), viewport_buffer_width);
-    auto visible_height = std::min((int) ((float) backbuffer_size[1] * height_multiplier), viewport_buffer_height);
+    // One UI layer serves both eyes. The floating HUD panel gets all of it; its size in the world is set on the panel.
+    const float scale = vr->is_native_hud_panel() ? 1.0f : settings.hud_scale;
+    auto visible_width = std::min((int) ((float) backbuffer_size[0] * scale), viewport_buffer_width);
+    auto visible_height = std::min((int) ((float) backbuffer_size[1] * scale), viewport_buffer_height);
     viewport->width = visible_width;
     viewport->height = visible_height;
-    viewport->left = (int) (viewport_buffer_width - visible_width) / 2 + offset_left;
-    viewport->top = (int) (viewport_buffer_height - visible_height) / 2 + offset_top;
+    viewport->left = (int) (viewport_buffer_width - visible_width) / 2;
+    viewport->top = (int) (viewport_buffer_height - visible_height) / 2;
 }
 
 void CreationEngineCameraManager::onSetNimFrustum(RE::NiCamera *pCamera, RE::NiFrustum *pFrustum) {
@@ -233,7 +220,7 @@ void CreationEngineCameraManager::onSetNiFrustumInternal(RE::NiCamera *pCamera, 
     if (!vr->is_hmd_active()) {
         return;
     }
-    auto eye = vr->get_current_render_eye() == VRRuntime::Eye::LEFT ? 0 : 1;
+    auto eye = StereoViewModule::Get()->EyeOf(pCamera);
     auto runtime = vr->get_runtime();
     Vector4f frustum = runtime->frustums[eye];
     aiming_adjustments(frustum, get_fov_adjustment());
@@ -255,6 +242,10 @@ void CreationEngineCameraManager::onCalcNiFrustum(RE::NiCamera *pCamera, float f
     if (vr->is_hmd_active() && CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera == pCamera) {
         //        fov = fov + Constants::lodAdjustFov;
         m_fov_adjust = fov - playerCamera->fov;
+        // The first-person near plane (0.6) would cull the body and anything within reach before the eyes draw it.
+        if (vr->is_native_stereo()) {
+            nearz = std::min(nearz, 0.05f);
+        }
         vr->m_nearz = nearz;
         vr->m_farz = farz;
     }
@@ -292,32 +283,43 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
         return;
     }
 
-    if(!GameFlow::isImmovable() && !GameFlow::isControlledByAI() && GameFlow::isInFirstPerson()) {
-        auto hmd_transform = vr->get_transform(0);
-        hmd_transform[3] -= glm::vec4{ tracking::StandingOriginPosition(), 0.0f };
-        const float tracking_scale = tracking::TrackingScale();
-        hmd_transform[3]           = glm::vec4{ glm::vec3{ hmd_transform[3] } * tracking_scale, 1.0f };
-        auto eye = vr->get_current_eye_transform();
-        eye[3]   = glm::vec4{ glm::vec3{ eye[3] } * tracking_scale, 1.0f };
-        // The camera's parent carries the aim rotation; keep the view on the head.
-        hmd_transform      = glm::inverse(tracking::CameraParentAimRotation(vr->m_engine_frame_count)) * hmd_transform * eye;
-        hmd_transform = tracking::ToHavokSpace(hmd_transform);
-        worldCamera->local.rotate = originalRotation * *(RE::NiMatrix3*) & hmd_transform;
-        worldCamera->local.translate.x = hmd_transform[3][0];
-        worldCamera->local.translate.y = hmd_transform[3][1];
-        worldCamera->local.translate.z = hmd_transform[3][2];
+    // The world camera is the left eye and the right eye camera shares its parent.
+    auto right_camera = vr->is_native_stereo() ? StereoViewModule::Get()->RightCamera() : nullptr;
+    auto place = [&](RE::NiCamera* camera, const glm::mat4& eye_transform) {
+        glm::mat4 local;
+        if (!GameFlow::isImmovable() && !GameFlow::isControlledByAI() && GameFlow::isInFirstPerson()) {
+            auto hmd_transform = vr->get_transform(0);
+            hmd_transform[3] -= glm::vec4{ tracking::StandingOriginPosition(), 0.0f };
+            const float tracking_scale = tracking::TrackingScale();
+            hmd_transform[3]           = glm::vec4{ glm::vec3{ hmd_transform[3] } * tracking_scale, 1.0f };
+            auto eye = eye_transform;
+            eye[3]   = glm::vec4{ glm::vec3{ eye[3] } * tracking_scale, 1.0f };
+            // The camera's parent carries the aim rotation; keep the view on the head.
+            local = glm::inverse(tracking::CameraParentAimRotation(vr->m_engine_frame_count)) * hmd_transform * eye;
+        } else {
+            auto head_rotation = vr->get_transform(0);
+            head_rotation[3] -= glm::vec4{ tracking::StandingOriginPosition(), 0.0f };
+            local = head_rotation * eye_transform;
+        }
+        local = tracking::ToHavokSpace(local);
+        camera->local.rotate = originalRotation * *(RE::NiMatrix3*) &local;
+        camera->local.translate.x = local[3][0];
+        camera->local.translate.y = local[3][1];
+        camera->local.translate.z = local[3][2];
+    };
+
+    if (right_camera) {
+        place(worldCamera, vr->get_eye_transform(VRRuntime::Eye::LEFT));
+        place(right_camera, vr->get_eye_transform(VRRuntime::Eye::RIGHT));
+        if (auto left_camera = StereoViewModule::Get()->LeftCamera()) {
+            left_camera->local = worldCamera->local;
+        }
     } else {
-        auto head_rotation = vr->get_transform(0);
-        head_rotation[3] -= glm::vec4{ tracking::StandingOriginPosition(), 0.0f };
-        auto eye = vr->get_current_eye_transform();
-        head_rotation = head_rotation * eye;
-        head_rotation = tracking::ToHavokSpace(head_rotation);
-        worldCamera->local.rotate = originalRotation * *(RE::NiMatrix3 *) &head_rotation;
-        worldCamera->local.translate.x = head_rotation[3][0];
-        worldCamera->local.translate.y = head_rotation[3][1];
-        worldCamera->local.translate.z = head_rotation[3][2];
+        // Before the eye views exist both eyes show the world camera's view.
+        place(worldCamera, vr->get_eye_transform(VRRuntime::Eye::LEFT));
     }
 }
+
 
 
 void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *fps, RE::NiQuaternion *quat_out) {
@@ -333,8 +335,7 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
         // order of extraction Pitch->Yaw->Roll (Havok X->Z->Y)
         auto p_player = CreationEngineSingletonManager::GetPlayerRef();
 
-        // Applied on the right-eye frame so the turn lands at the start of an eye pair.
-        if (p_player && vr->get_current_render_eye() == VRRuntime::Eye::RIGHT) {
+        if (p_player) {
             if (const float snap = GameFlow::pendingSnapYaw.exchange(0.0f); snap != 0.0f) {
                 const float two_pi = 2.0f * glm::pi<float>();
                 p_player->data.angle.z = std::fmod(p_player->data.angle.z + snap + two_pi, two_pi);
