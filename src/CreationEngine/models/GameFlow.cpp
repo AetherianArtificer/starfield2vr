@@ -1,4 +1,8 @@
 #include "GameFlow.h"
+#include <vector>
+#include <string>
+#include <cmath>
+#include <algorithm>
 #include "ModSettingsStore.h"
 #include "RE/P/PlayerCamera.h"
 #include <CreationEngine/CreationEngineSingletonManager.h>
@@ -24,6 +28,22 @@ namespace GameFlow
         bool loading_seen_this_frame{false};
         bool loading_pending{false};
         int  frames_since_loading{0};
+        // Where the player stood when the loading screen appeared: only a move to somewhere else recenters.
+        RE::NiPoint3 position_before_loading{};
+        bool         have_position_before_loading{false};
+        constexpr float kLoadingMoveToRecenter = 10.0f;
+
+        std::vector<std::string> last_menus;
+
+        bool PlayerPosition(RE::NiPoint3& out)
+        {
+            auto player = CreationEngineSingletonManager::GetPlayerRef();
+            if (player == nullptr) {
+                return false;
+            }
+            out = player->data.location;
+            return true;
+        }
 
         // The ship HUD is only drawn while piloting.
         bool ship_hud_seen_this_frame{false};
@@ -32,12 +52,23 @@ namespace GameFlow
         void update_loading_recenter()
         {
             if (loading_seen_this_frame) {
+                if (!loading_pending) {
+                    have_position_before_loading = PlayerPosition(position_before_loading);
+                }
                 loading_pending      = true;
                 frames_since_loading = 0;
             } else if (loading_pending && ++frames_since_loading >= kFramesAfterLoadingToRecenter) {
                 loading_pending = false;
-                if (gStore.internalSettings.recenterAfterLoading) {
-                    spdlog::info("[GameFlow] Loading screen ended, requesting recenter");
+                RE::NiPoint3 now{};
+                const bool   known = have_position_before_loading && PlayerPosition(now);
+                const float  moved = known ? std::sqrt((now.x - position_before_loading.x) * (now.x - position_before_loading.x) +
+                                                       (now.y - position_before_loading.y) * (now.y - position_before_loading.y) +
+                                                       (now.z - position_before_loading.z) * (now.z - position_before_loading.z))
+                                           : -1.0f;
+                if (known && moved < kLoadingMoveToRecenter) {
+                    spdlog::info("[GameFlow] Loading screen ended where it began ({:.1f} m), view kept", moved);
+                } else if (gStore.internalSettings.recenterAfterLoading) {
+                    spdlog::info("[GameFlow] Loading screen ended {:.0f} m away, requesting recenter", moved);
                     vr->get_runtime()->wants_reset_origin = true;
                 }
             }
@@ -47,6 +78,24 @@ namespace GameFlow
 
     void resetGameState() {
         update_loading_recenter();
+        {
+            std::vector<std::string> menus;
+            for (auto part : gStore.debugData.ui_parts) {
+                std::string name{ part };
+                if (std::find(menus.begin(), menus.end(), name) == menus.end()) {
+                    menus.push_back(name);
+                }
+            }
+            std::sort(menus.begin(), menus.end());
+            if (menus != last_menus) {
+                std::string list;
+                for (const auto& m : menus) {
+                    list += (list.empty() ? "" : ", ") + m;
+                }
+                spdlog::info("[GameFlow] Menus drawn: {}", list.empty() ? "none" : list);
+                last_menus = std::move(menus);
+            }
+        }
         ship_hud_last_frame.store(ship_hud_seen_this_frame);
         ship_hud_seen_this_frame = false;
         gStore.debugData.ui_parts.clear();
