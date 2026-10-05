@@ -108,7 +108,7 @@ VROptions::VROptions()
     add(kSupportHand, kCategoryControls, Kind::Toggle, "SupportHand", "Two-Handed Grip",
         "Your left hand holds the weapon's foregrip when you bring it close.", on_off, 1);
     add(kFingerPoses, kCategoryControls, Kind::Toggle, "FingerPoses", "Finger Tracking",
-        "Fingers follow the controller's trigger, grip and thumb touch.", on_off, 1);
+        "Fingers follow the controller's trigger, grip and thumb touch, or your real fingers when the headset tracks your hands.", on_off, 1);
     add(kHolsters, kCategoryControls, Kind::Toggle, "Holsters", "Holsters",
         "Draw by gripping at your hip, chest or shoulder; rest the weapon there to holster it.", on_off, 0);
     add(kManualReload, kCategoryControls, Kind::Toggle, "ManualReload", "Manual Reload",
@@ -121,8 +121,6 @@ VROptions::VROptions()
         "Show the game's first-person arms and weapon on the body, holding the weapon exactly as animated.", on_off, 0);
     add(kBodyTracking, kCategoryControls, Kind::Toggle, "BodyTracking", "Body Tracking",
         "Use the headset's body tracking for your torso, elbows and legs when available.", on_off, 1);
-    add(kHandTracking, kCategoryControls, Kind::Toggle, "HandTracking", "Tracked Fingers",
-        "Use the headset's hand tracking for finger poses when available.", on_off, 1);
     add(kWalkingLegs, kCategoryControls, Kind::Toggle, "WalkingLegs", "Walking Legs",
         "The body's legs step whenever you move.", on_off, 1);
     add(kWeaponFollowsHand, kCategoryControls, Kind::Toggle, "WeaponFollowsHand", "Full Body (Experimental)",
@@ -225,7 +223,7 @@ void VROptions::apply() const
     s.holsters             = get(kHolsters) != 0;
     s.manualReload         = get(kManualReload) != 0;
     s.raiseToAim           = get(kRaiseToAim) != 0;
-    s.handTracking         = get(kHandTracking) != 0;
+    s.handTracking         = s.fingerPoses;
     s.hudPanel             = get(kHudPlacement) == 0;
 
     auto& hud       = GameFlow::gStore.hudSettings;
