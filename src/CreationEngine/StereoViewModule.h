@@ -103,6 +103,7 @@ public:
 
     static uintptr_t onExecuteChildPass(void* graph, void* render_graph_data, void* container);
     static uintptr_t onScaleformComposite(void* pass, void* render_graph_data, void* pass_data);
+    static uintptr_t onCopyToRenderGraphOutput(void* pass, void* render_graph_data, void* pass_data);
     static bool      onIsPrimarySceneView(void* view);
     static uintptr_t onSubmitRenderGraph(void* frame_list, void* record);
     bool             RegisterRightGraph();
@@ -115,6 +116,7 @@ private:
     std::unique_ptr<FunctionHook> m_set_multi_view_hook{};
     std::unique_ptr<FunctionHook> m_execute_child_hook{};
     std::unique_ptr<FunctionHook> m_scaleform_composite_hook{};
+    std::unique_ptr<FunctionHook> m_copy_to_output_hook{};
     std::unique_ptr<FunctionHook> m_primary_view_hook{};
     // The right eye renders in its own render graph, so it never shares the left eye's working buffers.
     std::unique_ptr<FunctionHook> m_submit_graph_hook{};

@@ -353,6 +353,13 @@ void StereoViewModule::InstallHooks()
         m_scaleform_composite_hook = std::make_unique<FunctionHook>(vtable[7], reinterpret_cast<uintptr_t>(&onScaleformComposite));
         m_scaleform_composite_hook->create();
     }
+    if (auto vtable = reinterpret_cast<uintptr_t*>(
+            MemoryScan::VTable("CopyToRenderGraphOutputRenderPass", ".?AVCopyToRenderGraphOutputRenderPass@CreationRendererPrivate@@", 0))) {
+        m_copy_to_output_hook = std::make_unique<FunctionHook>(vtable[7], reinterpret_cast<uintptr_t>(&onCopyToRenderGraphOutput));
+        m_copy_to_output_hook->create();
+    } else {
+        spdlog::error("[Stereo] CopyToRenderGraphOutputRenderPass not found; eye images cannot be placed");
+    }
     spdlog::info("[Stereo] Native stereo hooks installed (stereo module built " __DATE__ " " __TIME__ ")");
 }
 
@@ -1293,4 +1300,34 @@ void StereoViewModule::AdvanceExperiment()
     }
     spdlog::info("[Stereo] Diagnostic stage {}: left graph first {}, graphs swapped {}, right camera generation {}", m_experiment_stage, m_exp_left_first,
                  m_exp_swap_graphs, m_right_camera_generation);
+}
+
+uintptr_t StereoViewModule::onCopyToRenderGraphOutput(void* pass, void* render_graph_data, void* pass_data)
+{
+    static auto instance = Get();
+    using func_t         = uintptr_t(void*, void*, void*);
+    static auto original = instance->m_copy_to_output_hook->get_original<func_t>();
+    static auto vr       = VR::get();
+
+    // The output copy writes into the view's scissor rect. Eye scissors stay full for culling, so for this pass the
+    // scissor is narrowed to the eye's viewport and each eye lands in its own half.
+    const auto viewport_id = render_graph_data ? At<uint32_t>(render_graph_data, 0x140) : 8u;
+    if (!vr->is_native_stereo() || viewport_id >= 8) {
+        return original(pass, render_graph_data, pass_data);
+    }
+    auto rect = At<float*>(render_graph_data, 0x108 + 8 * (size_t)viewport_id);
+    if (rect == nullptr || std::abs(rect[1] - rect[0]) > 0.99f) {
+        return original(pass, render_graph_data, pass_data);
+    }
+    float scissors[4];
+    std::memcpy(scissors, rect + 4, sizeof(scissors));
+    std::memcpy(rect + 4, rect, sizeof(scissors));
+    static std::atomic<int> logged{ 0 };
+    if (logged.fetch_add(1) < 4) {
+        spdlog::info("[Stereo] Output copy for view {:x}: viewport ({}, {}, {}, {}), scissors ({}, {}, {}, {}) narrowed to the viewport", At<uint32_t>(rect, 0x24), rect[0],
+                     rect[1], rect[2], rect[3], scissors[0], scissors[1], scissors[2], scissors[3]);
+    }
+    const auto result = original(pass, render_graph_data, pass_data);
+    std::memcpy(rect + 4, scissors, sizeof(scissors));
+    return result;
 }
