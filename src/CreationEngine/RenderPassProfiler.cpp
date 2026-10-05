@@ -10,6 +10,7 @@
 #include <d3d12.h>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <MinHook.h>
 #include <vector>
 #include <wrl/client.h>
@@ -30,6 +31,8 @@ namespace RenderPassProfiler
         {
             std::string name;
             bool        shadow_map{ false };  // shadow map rendering the left eye can take from the right eye
+            std::shared_ptr<std::atomic<bool>> logged{ std::make_shared<std::atomic<bool>>(false) };
+            std::atomic<bool>& logged_skip_flag() const { return *logged; }
         };
         std::vector<PassClass>                g_classes;
         std::unordered_map<uintptr_t, int>    g_class_of_vtable;
@@ -125,12 +128,27 @@ namespace RenderPassProfiler
             }
         }
 
+        uintptr_t VtableOf(void* object)
+        {
+            __try {
+                return *reinterpret_cast<uintptr_t*>(object);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return 0;
+            }
+        }
+
+        // The pass class of an object, or -1 when it is not a render pass: the linker folds identical functions, so a
+        // hooked execute function can also be called from elsewhere with other arguments.
         int ClassOf(void* pass)
         {
             if (pass == nullptr || !g_ready.load(std::memory_order_acquire)) {
                 return -1;
             }
-            const auto it = g_class_of_vtable.find(*reinterpret_cast<uintptr_t*>(pass));
+            const auto vtable = VtableOf(pass);
+            if (vtable == 0) {
+                return -1;
+            }
+            const auto it = g_class_of_vtable.find(vtable);
             return it == g_class_of_vtable.end() ? -1 : it->second;
         }
 
@@ -159,25 +177,31 @@ namespace RenderPassProfiler
             t_mark = { list, query, slot };
         }
 
-        uintptr_t RunPass(int hook, void* pass, void* render_graph_data, void* pass_data)
+        uintptr_t RunPass(int hook, void* pass, void* render_graph_data, void* pass_data, void* a4)
         {
-            using func_t   = uintptr_t(void*, void*, void*);
+            using func_t   = uintptr_t(void*, void*, void*, void*);
             const int cls  = ClassOf(pass);
+            if (cls < 0) {
+                return reinterpret_cast<func_t*>(g_originals[hook])(pass, render_graph_data, pass_data, a4);
+            }
             static auto vr = VR::get();
             if (cls >= 0 && g_classes[cls].shadow_map && g_share_shadows.load(std::memory_order_relaxed) && vr->is_native_stereo() &&
                 StereoViewModule::Get()->EyeOfGraphPublic(render_graph_data) == 0) {
                 g_skipped.fetch_add(1, std::memory_order_relaxed);
+                if (!g_classes[cls].logged_skip_flag().exchange(true)) {
+                    spdlog::info("[Passes] Left eye skips {}", g_classes[cls].name);
+                }
                 return 0;
             }
-            const auto result = reinterpret_cast<func_t*>(g_originals[hook])(pass, render_graph_data, pass_data);
+            const auto result = reinterpret_cast<func_t*>(g_originals[hook])(pass, render_graph_data, pass_data, a4);
             Mark(cls, render_graph_data);
             return result;
         }
 
         template <int Index>
-        uintptr_t Detour(void* pass, void* render_graph_data, void* pass_data)
+        uintptr_t Detour(void* pass, void* render_graph_data, void* pass_data, void* a4)
         {
-            return RunPass(Index, pass, render_graph_data, pass_data);
+            return RunPass(Index, pass, render_graph_data, pass_data, a4);
         }
 
         template <int... Index>
@@ -346,6 +370,32 @@ namespace RenderPassProfiler
         g_sums.assign(g_classes.size(), {});
         g_ready.store(true, std::memory_order_release);
 
+        // Execute functions the game also calls or jumps to directly are shared code, left alone.
+        std::unordered_set<uintptr_t> executes, called;
+        for (const auto& [vtable, cls] : g_class_of_vtable) {
+            executes.insert(reinterpret_cast<const uintptr_t*>(vtable)[kExecuteSlot]);
+        }
+        {
+            const auto base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+            const auto nt   = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
+            auto       sec  = IMAGE_FIRST_SECTION(nt);
+            for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+                if ((sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) {
+                    continue;
+                }
+                const auto start = base + sec->VirtualAddress;
+                for (size_t o = 0; o + 5 <= sec->Misc.VirtualSize; ++o) {
+                    if (start[o] != 0xE8 && start[o] != 0xE9) {
+                        continue;
+                    }
+                    const auto target = reinterpret_cast<uintptr_t>(start + o + 5) + *reinterpret_cast<const int32_t*>(start + o + 1);
+                    if (executes.contains(target)) {
+                        called.insert(target);
+                    }
+                }
+            }
+        }
+
         // All hooks are created first, with their originals stored, then enabled together.
         static const auto detours = Detours(std::make_integer_sequence<int, kMaxHooks>{});
         std::unordered_map<uintptr_t, int> hook_of_function;
@@ -359,7 +409,7 @@ namespace RenderPassProfiler
             // Import thunks and functions another hook already patched are left alone.
             const auto first = *reinterpret_cast<const uint8_t*>(execute);
             void*      original = nullptr;
-            if (first == 0xE9 || first == 0xFF || g_hook_count >= kMaxHooks ||
+            if (first == 0xE9 || first == 0xFF || called.contains(execute) || g_hook_count >= kMaxHooks ||
                 MH_CreateHook(reinterpret_cast<void*>(execute), reinterpret_cast<void*>(detours[g_hook_count]), &original) != MH_OK) {
                 hook_of_function[execute] = -1;
                 ++skipped_functions;
