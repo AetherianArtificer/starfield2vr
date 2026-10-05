@@ -11,6 +11,7 @@
 #include "CreationEngine/CreationEngineEntry.h"
 #include "CreationEngine/VROptions.h"
 #include "CreationEngine/input/InputRequests.h"
+#include "CreationEngine/StereoViewModule.h"
 #include "CreationEngine/GameSettingsComponent.h"
 #include "CreationEngine/models/ModSettingsStore.h"
 #include "CreationEngine/models/GameFlow.h"
@@ -255,7 +256,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         if (is_action_active_any_joystick(m_action_b_button_left))  buttons |= XINPUT_GAMEPAD_Y;
 
         if (is_left_joystick_click_down)  buttons |= XINPUT_GAMEPAD_LEFT_THUMB;
-        if (is_right_joystick_click_down) buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+        if (is_right_joystick_click_down && !is_action_active_any_joystick(m_action_system_button)) buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
 
         const auto left_trigger_down  = is_action_active(m_action_trigger, left_joystick);
         const auto right_trigger_down = is_action_active(m_action_trigger, right_joystick);
@@ -268,7 +269,8 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
 
         // The grips are the hands' own (grabbing); they send nothing to the game. The menu button is the modifier:
         // tap = Start (pause), hold alone = View/Back (data menus); held with the left stick = D-pad, with the
-        // left trigger = LB, with the right trigger = RB, with the left stick click = flat-screen view.
+        // left trigger = LB, with the right trigger = RB, with the left stick click = flat-screen view, with the
+        // right stick click = eye screenshots.
         static bool              menu_was_down{false};
         static bool              menu_used_as_modifier{false};
         static clock::time_point menu_down_since{};
@@ -281,7 +283,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
                 menu_down_since = now;
             }
             if (std::abs(left_axis.x) >= kStickDeflection || std::abs(left_axis.y) >= kStickDeflection || is_left_joystick_click_down ||
-                left_trigger_down || right_trigger_down) {
+                is_right_joystick_click_down || left_trigger_down || right_trigger_down) {
                 menu_used_as_modifier = true;
             }
             if (left_axis.y >= kStickDeflection)  buttons |= XINPUT_GAMEPAD_DPAD_UP;
@@ -295,6 +297,14 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             if (right_trigger_down) {
                 buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
                 pXinputGamepad->bRightTrigger = 0;
+            }
+            if (is_right_joystick_click_down) {
+                menu_used_as_modifier = true;
+                static clock::time_point last_screenshot{};
+                if (now - last_screenshot > kMenuHold) {
+                    last_screenshot = now;
+                    StereoViewModule::Get()->RequestEyeScreenshots();
+                }
             }
             if (is_left_joystick_click_down) {
                 buttons &= ~XINPUT_GAMEPAD_LEFT_THUMB;
@@ -370,7 +380,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             pXinputGamepad->wButtons |= XINPUT_GAMEPAD_LEFT_THUMB;
         }
 
-        if (is_right_joystick_click_down) {
+        if (is_right_joystick_click_down && !is_action_active_any_joystick(m_action_system_button)) {
             pXinputGamepad->wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB;
         }
     }
