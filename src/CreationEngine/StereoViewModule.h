@@ -141,4 +141,5 @@ private:
     bool  m_frame_generation_looked_up{ false };
 
     std::atomic<bool> m_screenshot_requested{ false };
+    int               m_screenshot_frames{ 0 };
 };

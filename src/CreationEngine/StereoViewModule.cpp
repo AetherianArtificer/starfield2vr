@@ -425,10 +425,6 @@ void StereoViewModule::OnFrameStart()
     const auto& settings = GameFlow::gStore.internalSettings;
     vr->set_native_hud_panel(stereo && settings.hudPanel, settings.hudPanelWidth, settings.hudPanelDistance);
 
-    if (m_screenshot_requested.exchange(false)) {
-        const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-        vr->request_backbuffer_dump(Framework::get_persistent_dir(std::format("vr_eyes_{}.png", stamp)).wstring());
-    }
 
     if (!stereo) {
         m_missed_appends = 0;
@@ -449,11 +445,32 @@ void StereoViewModule::OnFrameStart()
         const auto  hmd_r = vr->get_eye_transform(VRRuntime::Eye::RIGHT)[3];
         const float hmd = glm::length(glm::vec3{ hmd_r } - glm::vec3{ hmd_l });
         spdlog::info("[Stereo] Eye cameras {:.4f} apart in the game world; headset eyes {:.4f} m apart", game, hmd);
+        // Frustum tangents (left, right, top, bottom) each eye renders with, against the headset's.
+        const auto runtime = vr->get_runtime();
+        for (int eye = 0; eye < 2; ++eye) {
+            const auto& f = (eye == 0 ? m_left_camera : m_right_camera)->viewFrustum;
+            const auto& h = runtime->frustums[eye];
+            spdlog::info("[Stereo] {} eye frustum ({:.3f}, {:.3f}, {:.3f}, {:.3f}); headset ({:.3f}, {:.3f}, {:.3f}, {:.3f})", eye == 0 ? "Left" : "Right", f.left, f.right,
+                         f.top, f.bottom, h[0], h[1], h[2], h[3]);
+        }
     }
 
     // Without a fresh right eye graph this frame (a loading screen, a fullscreen menu) both eyes show the same image.
     m_missed_appends = m_appended.exchange(false) ? 0 : m_missed_appends + 1;
     vr->set_native_mono_frame(m_menu_fallback.load() || m_missed_appends > 1);
+
+    // Requested screenshots are taken after a second of gameplay with both eyes, so a menu is never captured.
+    if (m_screenshot_requested.load()) {
+        const bool gameplay = !m_menu_fallback.load() && m_missed_appends == 0;
+        m_screenshot_frames  = gameplay ? m_screenshot_frames + 1 : 0;
+        if (m_screenshot_frames >= 90) {
+            m_screenshot_requested = false;
+            m_screenshot_frames    = 0;
+            const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            vr->request_backbuffer_dump(Framework::get_persistent_dir(std::format("vr_eyes_{}.png", stamp)).wstring());
+            spdlog::info("[Stereo] Eye screenshots saved");
+        }
+    }
 }
 
 void StereoViewModule::KeepEyeViewportsFull()
@@ -642,7 +659,9 @@ uintptr_t StereoViewModule::RunUpscalerPass(int pass_kind, void* pass, void* ren
         PerfStats::MarkGpu(list, PerfStats::GpuPoint::kEyeUpscaleEvalStart, right ? 1 : 0);
     }
     UpscalerAfrNvidiaModule::set_secondary_view(right);
+    UpscalerAfrNvidiaModule::set_in_upscaler_pass(true);
     auto result = original(pass, render_graph_data, pass_data);
+    UpscalerAfrNvidiaModule::set_in_upscaler_pass(false);
     UpscalerAfrNvidiaModule::set_secondary_view(false);
     if (pass_kind == kDLSSUpscale) {
         PerfStats::MarkGpu(list, PerfStats::GpuPoint::kEyeUpscaleEnd, right ? 1 : 0);

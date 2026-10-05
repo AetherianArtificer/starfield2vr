@@ -91,7 +91,7 @@ VROptions::VROptions()
         "Reset your view height and direction when a loading screen ends.", on_off, 1);
     add(kRecenterView, kCategoryDisplay, Kind::Action, "", "Recenter View", "Reset your view height and direction now.", {}, 0);
     add(kEyeScreenshots, kCategoryDisplay, Kind::Action, "", "Save Eye Screenshots",
-        "Save the image each eye of the headset receives, as PNG files in the game folder. Useful when reporting a display problem.", {}, 0);
+        "Save the image each eye of the headset receives, as PNG files in the game folder, a second after you are back in the game. Useful when reporting a display problem.", {}, 0);
 
     // VR Controls
     add(kControllerLayout, kCategoryControls, Kind::Choice, "ControllerLayout", "Controller Layout",
