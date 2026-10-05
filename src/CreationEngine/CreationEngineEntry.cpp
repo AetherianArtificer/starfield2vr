@@ -45,10 +45,6 @@ void CreationEngineEntry::on_draw_ui()
     {
         ModConstants::headTrackingMultiplier = m_head_tracking_multiplier->value();
     }
-    if(m_taa_anf_nvidia_fix->draw("Nvidia DLSS and TAA Fix"))
-    {
-        GameFlow::gStore.internalSettings.nvidiaAndTAAfix = m_taa_anf_nvidia_fix->value();
-    }
 
     for(auto& ui_part : GameFlow::gStore.debugData.ui_parts)
     {
@@ -180,7 +176,6 @@ void CreationEngineEntry::on_config_load(const utility::Config& cfg, bool set_de
         option.config_load(cfg, set_defaults);
     }
     ModConstants::headTrackingMultiplier = m_head_tracking_multiplier->value();
-    GameFlow::gStore.internalSettings.nvidiaAndTAAfix = m_taa_anf_nvidia_fix->value();
     GameFlow::gStore.internalSettings.pawnControl = m_pawn_control_rotation->value();
     GameFlow::gStore.internalSettings.alternativeJoyLayout = m_alternative_joy_layout->value();
     GameFlow::gStore.internalSettings.decoupledPitch = m_decoupled_pitch->value();

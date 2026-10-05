@@ -2,30 +2,23 @@
 
 #include "CreationEngineRendererModule.h"
 #include "CreationEngineSettings.h"
-#include <_deps/directxtk12-src/Src/d3dx12.h>
-#include <intrin.h>
-#include <safetyhook/easy.hpp>
 #include "CreationEngineSingletonManager.h"
-#include "VROptions.h"
+#include "ModSettings.h"
 #include <CreationEngine/memory/offsets.h>
 #include <CreationEngine/memory/stereo_offsets.h>
 #include <CreationEngine/models/GameFlow.h>
-#include <RE/C/CreationRendererPrivate.h>
-#include <set>
 #include <CreationEngine/models/ModSettingsStore.h>
 #include <Framework.hpp>
+#include <RE/C/CreationRendererPrivate.h>
 #include <RE/M/Main.h>
 #include <RE/N/NiCamera.h>
-#include <array>
-#include <filesystem>
+#include <_deps/directxtk12-src/Src/d3dx12.h>
+#include <chrono>
 #include <format>
-#include <string>
-#include <utility>
-#include <fstream>
+#include <intrin.h>
 #include <mods/VR.hpp>
 #include <nvidia/UpscalerAfrNvidiaModule.h>
-
-#include "ModSettings.h"
+#include <utility>
 
 namespace
 {
@@ -39,24 +32,23 @@ namespace
     constexpr size_t kFeatureSetupColumn      = 0x108;
     constexpr size_t kImageSpaceColumn        = 0x110;
     constexpr size_t kCameraViewDataColumn    = 0x120;
-    // Render graph table column holding each graph's MultiCameraViewData.
+    // Render graph table columns.
     constexpr size_t kMultiCameraViewColumn = 0x120;
     constexpr size_t kGraphOptionsColumn    = 0xE8;
     constexpr size_t kGraphFrameFlagColumn  = 0x108;
     constexpr size_t kGraphKeyColumn        = 0x128;
 
-    constexpr size_t kCameraViewDataSize     = 0x1C;
-    constexpr size_t kFeatureSetupSize       = 0x210;
-    constexpr size_t kDirectionalShadowSize  = 0x3C;
-    constexpr size_t kHighlightSize          = 0x14;
-    constexpr size_t kCameraViewIdOffset     = 0x4;  // CameraViewData::cameraHandleId
-    constexpr size_t kCameraViewNearOffset   = 0x10; // CameraViewData::near
+    constexpr size_t kCameraViewDataSize    = 0x1C;
+    constexpr size_t kFeatureSetupSize      = 0x210;
+    constexpr size_t kDirectionalShadowSize = 0x3C;
+    constexpr size_t kHighlightSize         = 0x14;
+    constexpr size_t kCameraViewIdOffset    = 0x4;  // CameraViewData::cameraHandleId
+    constexpr size_t kCameraViewNearOffset  = 0x10; // CameraViewData::near
     // The game's first-person near plane (0.6) cuts off the player's body and anything within arm's reach in a headset.
-    constexpr float kEyeNearPlane = 0.05f;
+    constexpr float  kEyeNearPlane           = 0.05f;
     constexpr size_t kAttachChildVtableIndex = 0x2A0 / 8;
 
     constexpr size_t kRootWorldCameraRoot = 0x78;
-    constexpr size_t kRootStarfieldCamera = 0xA8;
     constexpr size_t kRootMainView        = 0x3D0;
     constexpr size_t kRootMainRenderGraph = 0x3D8;
     constexpr size_t kRootMainGraphRecord = 0x3E0;
@@ -67,9 +59,6 @@ namespace
     constexpr size_t kCameraViewport      = 0x1E4;
     constexpr size_t kCameraScissors      = 0x1F4;
     constexpr size_t kPassCameraView      = 0x24;
-
-    constexpr int kFramesUntilStable   = 600;
-    constexpr int kFramesUntilSnapshot = 400;
 
     template <class T>
     T& At(void* base, size_t offset)
@@ -267,10 +256,6 @@ namespace
         }
     }
 
-    std::filesystem::path CrashGuardPath()
-    {
-        return Framework::get_persistent_dir("vr_native_stereo.guard");
-    }
 } // namespace
 
 struct StereoViewModule::ViewIdArray
@@ -327,7 +312,7 @@ void StereoViewModule::InstallHooks()
     m_signatures_ok = true;
     for (auto& [name, address] : required) {
         if (address == 0) {
-            spdlog::error("[Stereo] Signature not found: {}; native stereo is unavailable", name);
+            spdlog::error("[Stereo] Signature not found: {}; both eyes will show the same image", name);
             m_signatures_ok = false;
         }
     }
@@ -340,31 +325,12 @@ void StereoViewModule::InstallHooks()
     m_submit_graph_hook = std::make_unique<FunctionHook>(offsets::SubmitRenderGraph(), reinterpret_cast<uintptr_t>(&onSubmitRenderGraph));
     m_submit_graph_hook->create();
     InstallUpscalerHooks();
-
-    m_probe_builder = offsets::BuildReflectionProbeSubGraph();
-    if (auto primary = offsets::IsPrimarySceneView(); primary && m_probe_builder) {
-        m_primary_view_hook = std::make_unique<FunctionHook>(primary, reinterpret_cast<uintptr_t>(&onIsPrimarySceneView));
-        m_primary_view_hook->create();
-    }
-
-    if (auto child = offsets::RenderGraphExecuteChild()) {
-        m_execute_child_hook = std::make_unique<FunctionHook>(child, reinterpret_cast<uintptr_t>(&onExecuteChildPass));
-        m_execute_child_hook->create();
-    }
+    InstallLatePassHooks();
     if (auto vtable = reinterpret_cast<uintptr_t*>(
             MemoryScan::VTable("ScaleformCompositeRenderPass", ".?AVScaleformCompositeRenderPass@CreationRendererPrivate@@", 0))) {
         m_scaleform_composite_hook = std::make_unique<FunctionHook>(vtable[7], reinterpret_cast<uintptr_t>(&onScaleformComposite));
         m_scaleform_composite_hook->create();
     }
-    InstallLatePassHooks();
-    if (auto vtable = reinterpret_cast<uintptr_t*>(
-            MemoryScan::VTable("CopyToRenderGraphOutputRenderPass", ".?AVCopyToRenderGraphOutputRenderPass@CreationRendererPrivate@@", 0))) {
-        m_copy_to_output_hook = std::make_unique<FunctionHook>(vtable[7], reinterpret_cast<uintptr_t>(&onCopyToRenderGraphOutput));
-        m_copy_to_output_hook->create();
-    } else {
-        spdlog::error("[Stereo] CopyToRenderGraphOutputRenderPass not found; eye images cannot be placed");
-    }
-    spdlog::info("[Stereo] Native stereo hooks installed (stereo module built " __DATE__ " " __TIME__ ")");
 }
 
 int StereoViewModule::EyeOf(const RE::NiCamera* camera) const
@@ -393,226 +359,79 @@ bool StereoViewModule::TryRegister()
         return false;
     }
 
-    {
-        std::ofstream guard{ CrashGuardPath() };
-        guard << "native stereo starting\n";
-    }
-
-    RegisterContext ctx{ root, root->worldCamera, nullptr, kInvalidId, 0, "VR Right Eye Camera" };
+    RegisterContext right_ctx{ root, root->worldCamera, nullptr, kInvalidId, 0, "VR Right Eye Camera" };
     RegisterContext left_ctx{ root, root->worldCamera, nullptr, kInvalidId, 0, "VR Left Eye Camera" };
-    if (!RegisterEngineObjectsGuarded(&ctx) || !RegisterEngineObjectsGuarded(&left_ctx)) {
-        spdlog::error("[Stereo] Registering the eye views failed at step {}/{}; using alternate eye rendering", ctx.step, left_ctx.step);
+    if (!RegisterEngineObjectsGuarded(&right_ctx) || !RegisterEngineObjectsGuarded(&left_ctx)) {
+        spdlog::error("[Stereo] Registering the eye views failed at step {}/{}; both eyes will show the same image", right_ctx.step, left_ctx.step);
         m_failed = true;
-        ClearCrashGuard();
         return false;
     }
-    m_left_camera   = left_ctx.camera;
-    m_left_view_id  = left_ctx.view_id;
-    m_left_mirrored = {};
-
-    m_right_camera  = ctx.camera;
-    m_right_view_id = ctx.view_id;
-    m_registered    = true;
-    m_mirrored      = {};
+    m_left_camera    = left_ctx.camera;
+    m_left_view_id   = left_ctx.view_id;
+    m_right_camera   = right_ctx.camera;
+    m_right_view_id  = right_ctx.view_id;
+    m_left_mirrored  = {};
+    m_right_mirrored = {};
     if (!RegisterRightGraph()) {
-        spdlog::error("[Stereo] Registering the right eye's render graph failed; using alternate eye rendering");
-        m_failed     = true;
-        m_registered = false;
-        ClearCrashGuard();
+        spdlog::error("[Stereo] Registering the right eye's render graph failed; both eyes will show the same image");
+        m_failed = true;
         return false;
     }
-    spdlog::info("[Stereo] Left eye view {:x} (camera {:x}) registered", m_left_view_id, m_left_camera->cameraHandleID);
-    spdlog::info("[Stereo] Right eye view registered: camera handle {:x}, view {:x}; main view {:x}, render graph {:x}", m_right_camera->cameraHandleID, m_right_view_id,
-                 At<uint32_t>(root, kRootMainView), At<uint32_t>(root, kRootMainRenderGraph));
+    m_registered = true;
+    spdlog::info("[Stereo] Eye views registered: left {:x} (camera {:x}), right {:x} (camera {:x}); main view {:x}", m_left_view_id, m_left_camera->cameraHandleID,
+                 m_right_view_id, m_right_camera->cameraHandleID, At<uint32_t>(root, kRootMainView));
     return true;
-}
-
-void StereoViewModule::ClearCrashGuard()
-{
-    std::error_code ec;
-    std::filesystem::remove(CrashGuardPath(), ec);
 }
 
 void StereoViewModule::OnFrameStart()
 {
     static auto vr = VR::get();
 
-    // Runs after the config has loaded, so the fallback choice is saved.
-    static bool guard_checked{ false };
-    if (!guard_checked && m_signatures_ok) {
-        guard_checked = true;
-        std::error_code ec;
-        if (std::filesystem::exists(CrashGuardPath(), ec)) {
-            spdlog::error("[Stereo] The previous session ended while native stereo was starting; switching to alternate eye rendering");
-            std::filesystem::remove(CrashGuardPath(), ec);
-            VROptions::Get()->set(VROptions::kStereoRendering, 1);
-        }
-    }
-
-    UpdateWorldFreeze();
-
-    const bool requested = m_signatures_ok && !m_failed && vr->is_hmd_active() && vr->get_runtime()->is_openxr() &&
-                           GameFlow::gStore.internalSettings.nativeStereo;
-
-    if (requested && !m_registered && vr->m_engine_frame_count - m_register_attempt_frame > 60) {
+    // Native presentation runs whenever the headset is active; until both eye views exist both eyes show the frame.
+    const bool active = vr->is_hmd_active();
+    vr->request_native_stereo(active);
+    if (active && m_signatures_ok && !m_registered && !m_failed && vr->m_engine_frame_count - m_register_attempt_frame > 60) {
         m_register_attempt_frame = vr->m_engine_frame_count;
         TryRegister();
     }
 
-    const bool double_width = GameFlow::gStore.internalSettings.stereoDoubleWidth;
-    if (double_width != m_double_width) {
-        m_double_width   = double_width;
-        m_native_frames  = 0;
-        m_stereo_frames  = 0;
-    }
-    m_wants_side_by_side = requested && m_registered && double_width;
-
-    // A double-width layout starts only once the back buffer holds both eyes.
-    const auto backbuffer = vr->get_backbuffer_size();
-    const auto eye_width  = (uint32_t)vr->get_hmd_width();
-    const bool buffer_ready = double_width ? eye_width > 0 && backbuffer[0] + 8 >= eye_width * 2 : backbuffer[0] > 0;
-    vr->set_native_full_frame(!double_width);
-    vr->request_native_stereo(requested && m_registered && buffer_ready);
-
-    const bool native = vr->is_native_stereo();
-    UpdateMenuFallback(native);
-    ApplyViewports(native && m_double_width);
-    ApplyNativeShadowSettings(native);
-    if (native) {
+    const bool stereo = vr->is_native_stereo() && m_registered;
+    UpdateMenuFallback(stereo);
+    KeepEyeViewportsFull();
+    ApplyNativeShadowSettings(stereo);
+    if (stereo) {
         DisableFrameGeneration();
     }
     const auto& settings = GameFlow::gStore.internalSettings;
-    vr->set_native_hud_panel(native && !m_double_width && settings.hudPanel, settings.hudPanelWidth, settings.hudPanelDistance);
-    if (!native) {
+    vr->set_native_hud_panel(stereo && settings.hudPanel, settings.hudPanelWidth, settings.hudPanelDistance);
+
+    if (m_screenshot_requested.exchange(false)) {
+        const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        vr->request_backbuffer_dump(Framework::get_persistent_dir(std::format("vr_eyes_{}.png", stamp)).wstring());
+    }
+
+    if (!stereo) {
         m_missed_appends = 0;
-        vr->set_native_mono_frame(false);
+        vr->set_native_mono_frame(true);
         return;
     }
 
     MirrorMainView();
-    UpdateRightFrustum();
-    ReportUpscalers();
-    if (m_census_frames.load() > 0 && m_census_frames.fetch_sub(1) == 1) {
-        FinishCensus();
-    }
+    UpdateEyeFrustums();
 
+    // Without a fresh right eye graph this frame (a loading screen, a fullscreen menu) both eyes show the same image.
     m_missed_appends = m_appended.exchange(false) ? 0 : m_missed_appends + 1;
     vr->set_native_mono_frame(m_menu_fallback.load() || m_missed_appends > 1);
-
-    if (++m_native_frames == kFramesUntilStable) {
-        ClearCrashGuard();
-        spdlog::info("[Stereo] Native stereo stable for {} frames", kFramesUntilStable);
-    }
-    if (m_renew_right_camera.exchange(false)) {
-        RenewRightCamera();
-    }
-
-    // Snapshot once both views have been rendering in first-person gameplay for a while, again after any test switch.
-    const auto variant = Variant();
-    if (variant != m_last_variant) {
-        m_last_variant  = variant;
-        m_stereo_frames = 0;
-        spdlog::info("[Stereo] Test variant: {}", variant);
-    }
-    const bool gameplay = m_missed_appends == 0 && !GameFlow::isShowingMenu() && GameFlow::isInFirstPerson();
-    if (gameplay && ++m_stereo_frames == kFramesUntilSnapshot) {
-        LogRenderSizes();
-        StartCensus();
-        vr->request_backbuffer_dump(Framework::get_persistent_dir(std::format("vr_native_stereo_{}.png", variant)).wstring());
-    }
 }
 
-void StereoViewModule::LogRenderSizes() const
+void StereoViewModule::KeepEyeViewportsFull()
 {
-    static auto vr       = VR::get();
-    auto        settings = CreationEngineRendererModule::Get()->GetCreationEngineSettings();
-    const auto  backbuffer = vr->get_backbuffer_size();
-    if (settings == nullptr) {
-        return;
-    }
-    const auto& display = settings->displayGameSettings;
-    spdlog::info("[Stereo] Sizes: back buffer {}x{}, eye {}x{}, window {}x{}, texture {}x{}, window rect ({}, {}, {}, {}), display rect ({}, {}, {}, {}), flags {:x}",
-                 backbuffer[0], backbuffer[1], vr->get_hmd_width(), vr->get_hmd_height(), settings->windowWidth, settings->windowHeight, settings->textureWidth,
-                 settings->textureHeight, display.windowRect.x, display.windowRect.y, display.windowRect.cx, display.windowRect.cy, display.displayRect.x,
-                 display.displayRect.y, display.displayRect.cx, display.displayRect.cy, display.flags);
-}
-
-void StereoViewModule::ApplyViewports(bool side_by_side)
-{
-    auto root = CreationEngineSingletonManager::GetSceneGraphRoot();
-    if (root == nullptr || root->worldCamera == nullptr) {
-        return;
-    }
-    auto world_camera     = root->worldCamera;
-    auto starfield_camera = At<RE::NiCamera*>(root, kRootStarfieldCamera);
-
-    if (side_by_side) {
-        if (!m_viewports_split) {
-            std::memcpy(m_saved_viewport, &At<float>(world_camera, kCameraViewport), sizeof(m_saved_viewport));
-            std::memcpy(m_saved_scissors, &At<float>(world_camera, kCameraScissors), sizeof(m_saved_scissors));
-            if (starfield_camera) {
-                std::memcpy(m_saved_starfield_viewport, &At<float>(starfield_camera, kCameraViewport), sizeof(m_saved_starfield_viewport));
-                std::memcpy(m_saved_starfield_scissors, &At<float>(starfield_camera, kCameraScissors), sizeof(m_saved_starfield_scissors));
-            }
-            const float full[4]{ 0.0f, 1.0f, 1.0f, 0.0f };
-            if (std::abs(m_saved_viewport[1] - m_saved_viewport[0]) < 0.01f) {
-                std::memcpy(m_saved_viewport, full, sizeof(full));
-            }
-            if (std::abs(m_saved_scissors[1] - m_saved_scissors[0]) < 0.99f) {
-                std::memcpy(m_saved_scissors, full, sizeof(full));
-            }
-            if (std::abs(m_saved_starfield_scissors[1] - m_saved_starfield_scissors[0]) < 0.99f) {
-                std::memcpy(m_saved_starfield_scissors, full, sizeof(full));
-            }
-            spdlog::info("[Stereo] Splitting views; world camera viewport was ({}, {}, {}, {}) scissors ({}, {}, {}, {})", m_saved_viewport[0], m_saved_viewport[1],
-                         m_saved_viewport[2], m_saved_viewport[3], m_saved_scissors[0], m_saved_scissors[1], m_saved_scissors[2], m_saved_scissors[3]);
-            m_viewports_split = true;
-        }
-        // Halves of the camera's own full-frame rect (left, right, top, bottom).
-        const float middle = (m_saved_viewport[0] + m_saved_viewport[1]) * 0.5f;
-        const float left_half[4]{ m_saved_viewport[0], middle, m_saved_viewport[2], m_saved_viewport[3] };
-        const float right_half[4]{ middle, m_saved_viewport[1], m_saved_viewport[2], m_saved_viewport[3] };
-
-        // The engine may reset a camera's viewport, so it is reapplied whenever it differs. Scissors stay full: culling
-        // tests each eye's own screen space against them, so a half-width scissor culls half of every eye's view.
-        const bool world_draws = m_left_camera == nullptr || m_menu_fallback.load();
-        for (auto camera : { m_left_camera, world_draws ? world_camera : nullptr, starfield_camera }) {
-            if (camera && !SameRect(camera, kCameraViewport, left_half)) {
-                SetCameraRect(camera, offsets::NiCameraSetViewport(), left_half);
-            }
-            const float* full_scissors = camera == starfield_camera ? m_saved_starfield_scissors : m_saved_scissors;
-            if (camera && !SameRect(camera, kCameraScissors, full_scissors)) {
-                SetCameraRect(camera, offsets::NiCameraSetScissors(), full_scissors);
-            }
-        }
-        if (!world_draws && !SameRect(world_camera, kCameraViewport, m_saved_viewport)) {
-            SetCameraRect(world_camera, offsets::NiCameraSetViewport(), m_saved_viewport);
-            SetCameraRect(world_camera, offsets::NiCameraSetScissors(), m_saved_scissors);
-        }
-        if (m_right_camera && !SameRect(m_right_camera, kCameraViewport, right_half)) {
-            SetCameraRect(m_right_camera, offsets::NiCameraSetViewport(), right_half);
-        }
-        if (m_right_camera && !SameRect(m_right_camera, kCameraScissors, m_saved_scissors)) {
-            SetCameraRect(m_right_camera, offsets::NiCameraSetScissors(), m_saved_scissors);
-        }
-    } else if (m_viewports_split) {
-        SetCameraRect(world_camera, offsets::NiCameraSetViewport(), m_saved_viewport);
-        SetCameraRect(world_camera, offsets::NiCameraSetScissors(), m_saved_scissors);
-        if (starfield_camera) {
-            SetCameraRect(starfield_camera, offsets::NiCameraSetViewport(), m_saved_starfield_viewport);
-            SetCameraRect(starfield_camera, offsets::NiCameraSetScissors(), m_saved_starfield_scissors);
-        }
-        m_viewports_split = false;
-        m_native_frames   = 0;
-        spdlog::info("[Stereo] Views restored to full width");
-    }
-    if (!side_by_side) {
-        const float full[4]{ 0.0f, 1.0f, 1.0f, 0.0f };
-        for (auto camera : { m_left_camera, m_right_camera }) {
-            if (camera && (!SameRect(camera, kCameraViewport, full) || !SameRect(camera, kCameraScissors, full))) {
-                SetCameraRect(camera, offsets::NiCameraSetViewport(), full);
-                SetCameraRect(camera, offsets::NiCameraSetScissors(), full);
-            }
+    // Each eye renders the whole frame; the engine may reset a camera's rects, so they are reapplied when they differ.
+    const float full[4]{ 0.0f, 1.0f, 1.0f, 0.0f };
+    for (auto camera : { m_left_camera, m_right_camera }) {
+        if (camera && (!SameRect(camera, kCameraViewport, full) || !SameRect(camera, kCameraScissors, full))) {
+            SetCameraRect(camera, offsets::NiCameraSetViewport(), full);
+            SetCameraRect(camera, offsets::NiCameraSetScissors(), full);
         }
     }
 }
@@ -627,10 +446,8 @@ void StereoViewModule::MirrorMainView()
     if (main_view == kInvalidId) {
         return;
     }
-    MirrorInto(main_view, m_right_view_id, m_right_camera, m_mirrored);
-    if (m_left_camera) {
-        MirrorInto(main_view, m_left_view_id, m_left_camera, m_left_mirrored);
-    }
+    MirrorInto(main_view, m_right_view_id, m_right_camera, m_right_mirrored);
+    MirrorInto(main_view, m_left_view_id, m_left_camera, m_left_mirrored);
 }
 
 void StereoViewModule::MirrorInto(uint32_t main_view, uint32_t view_id, RE::NiCamera* camera, MirroredRows& mirrored)
@@ -683,10 +500,10 @@ void StereoViewModule::MirrorInto(uint32_t main_view, uint32_t view_id, RE::NiCa
     mirrored      = current;
 }
 
-void StereoViewModule::UpdateRightFrustum()
+void StereoViewModule::UpdateEyeFrustums()
 {
     auto root = CreationEngineSingletonManager::GetSceneGraphRoot();
-    if (!m_right_camera || root == nullptr || root->worldCamera == nullptr) {
+    if (!m_registered || root == nullptr || root->worldCamera == nullptr) {
         return;
     }
     auto world_camera = root->worldCamera;
@@ -697,33 +514,23 @@ void StereoViewModule::UpdateRightFrustum()
         m_eye_near = near_plane;
         m_eye_far  = far_plane;
         for (auto camera : { m_right_camera, m_left_camera }) {
-            if (camera) {
-                Fn<void (*)(void*, float, float)>(offsets::NiCameraSetNearFar())(camera, near_plane, far_plane);
-            }
+            Fn<void (*)(void*, float, float)>(offsets::NiCameraSetNearFar())(camera, near_plane, far_plane);
         }
-        spdlog::info("[Stereo] Eye cameras near {} far {}", near_plane, far_plane);
-    }
-    At<float>(m_right_camera, kCameraMinNear) = At<float>(world_camera, kCameraMinNear);
-    At<float>(m_right_camera, kCameraAspect)  = At<float>(world_camera, kCameraAspect);
-    if (At<uint8_t>(m_right_camera, kCameraClipspaceType) != At<uint8_t>(world_camera, kCameraClipspaceType)) {
-        Fn<void (*)(void*, uint8_t)>(offsets::NiCameraSetClipspaceType())(m_right_camera, At<uint8_t>(world_camera, kCameraClipspaceType));
     }
 
     // Through the hooked setter, which fills in each camera's eye frustum.
     using set_frustum_t = void (*)(RE::NiCamera*, RE::NiFrustum*);
     static auto set_frustum = Fn<set_frustum_t>(GameStore::MemoryOffsets::NiCamera::SetFrustumVfunc());
-    auto        left        = world_camera->viewFrustum;
-    auto        right       = world_camera->viewFrustum;
-    set_frustum(world_camera, &left);
-    set_frustum(m_right_camera, &right);
-    if (m_left_camera) {
-        At<float>(m_left_camera, kCameraMinNear) = At<float>(world_camera, kCameraMinNear);
-        At<float>(m_left_camera, kCameraAspect)  = At<float>(world_camera, kCameraAspect);
-        if (At<uint8_t>(m_left_camera, kCameraClipspaceType) != At<uint8_t>(world_camera, kCameraClipspaceType)) {
-            Fn<void (*)(void*, uint8_t)>(offsets::NiCameraSetClipspaceType())(m_left_camera, At<uint8_t>(world_camera, kCameraClipspaceType));
+    auto        world_frustum = world_camera->viewFrustum;
+    set_frustum(world_camera, &world_frustum);
+    for (auto camera : { m_left_camera, m_right_camera }) {
+        At<float>(camera, kCameraMinNear) = At<float>(world_camera, kCameraMinNear);
+        At<float>(camera, kCameraAspect)  = At<float>(world_camera, kCameraAspect);
+        if (At<uint8_t>(camera, kCameraClipspaceType) != At<uint8_t>(world_camera, kCameraClipspaceType)) {
+            Fn<void (*)(void*, uint8_t)>(offsets::NiCameraSetClipspaceType())(camera, At<uint8_t>(world_camera, kCameraClipspaceType));
         }
-        auto left_clone = world_camera->viewFrustum;
-        set_frustum(m_left_camera, &left_clone);
+        auto frustum = world_camera->viewFrustum;
+        set_frustum(camera, &frustum);
     }
 }
 
@@ -734,50 +541,18 @@ uintptr_t StereoViewModule::onSetMultiCameraViewData(void* column, uint32_t grap
     static auto original = instance->m_set_multi_view_hook->get_original<func_t>();
     static auto vr       = VR::get();
 
+    // The main render graph draws the left eye's view instead of the world camera's.
     auto root = CreationEngineSingletonManager::GetSceneGraphRoot();
-    if (instance->m_right_graph_ready && instance->m_left_camera && vr->is_native_stereo() && !instance->m_menu_fallback.load() && views && root && views->size == 1 &&
+    if (instance->m_registered && vr->is_native_stereo() && !instance->m_menu_fallback.load() && views && root && views->size == 1 &&
         column == StorageColumn(offsets::RenderGraphStorage(), kMultiCameraViewColumn) && graph_index == (At<uint32_t>(root, kRootMainRenderGraph) & 0xFFFFFF) &&
         (views->data()[0] & 0xFFFFFF) == (At<uint32_t>(root, kRootMainView) & 0xFFFFFF)) {
         ViewIdArray left{};
         left.size     = 1;
         left.capacity = static_cast<int32_t>(0x80000004u);
-        left.local[0] = instance->m_exp_swap_graphs ? instance->m_right_view_id : instance->m_left_view_id;
-        static bool logged{ false };
-        if (!logged) {
-            logged = true;
-            spdlog::info("[Stereo] Main render graph renders the left eye view {:x} instead of the world camera's view", instance->m_left_view_id);
-        }
+        left.local[0] = instance->m_left_view_id;
         return original(column, graph_index, &left);
     }
-    if (instance->m_right_graph_ready || !vr->is_native_stereo() || !instance->m_registered || views == nullptr || root == nullptr || views->size != 1 ||
-        column != StorageColumn(offsets::RenderGraphStorage(), kMultiCameraViewColumn) || graph_index != (At<uint32_t>(root, kRootMainRenderGraph) & 0xFFFFFF)) {
-        return original(column, graph_index, views);
-    }
-
-    const auto first = views->data()[0];
-    if ((first & 0xFFFFFF) != (At<uint32_t>(root, kRootMainView) & 0xFFFFFF)) {
-        static uint32_t logged_view{ kInvalidId };
-        if (logged_view != first) {
-            logged_view = first;
-            spdlog::info("[Stereo] Main render graph shows view {:x}, which has no right eye; showing it in both eyes", first);
-        }
-        return original(column, graph_index, views);
-    }
-
-    // A copy with both eyes; the caller's array is left untouched.
-    ViewIdArray both{};
-    both.size     = 2;
-    both.capacity = static_cast<int32_t>(0x80000004u);
-    both.local[0] = first;
-    both.local[1] = instance->m_right_view_id;
-    instance->m_appended.store(true);
-
-    static bool logged{ false };
-    if (!logged) {
-        logged = true;
-        spdlog::info("[Stereo] Main render graph {:x} now renders views {:x} and {:x}", graph_index, first, instance->m_right_view_id);
-    }
-    return original(column, graph_index, &both);
+    return original(column, graph_index, views);
 }
 
 namespace
@@ -786,18 +561,11 @@ namespace
     {
         const char* label;
         const char* rtti;
-        bool        dlss;
-        bool        shares_history;
     };
 
     constexpr UpscalerPassInfo kUpscalerPasses[]{
-        { "DLSS inputs", ".?AVDLSSProduceInputsRenderPass@CreationRendererPrivate@@", true, false },
-        { "DLSS", ".?AVDLSSUpscaleRenderPass@CreationRendererPrivate@@", true, false },
-        { "XeSS inputs", ".?AVXeSSProduceInputsRenderPass@CreationRendererPrivate@@", false, true },
-        { "XeSS", ".?AVXeSSUpscaleRenderPass@CreationRendererPrivate@@", false, true },
-        { "FSR2 inputs", ".?AVFSR2ProduceInputsRenderPass@CreationRendererPrivate@@", false, true },
-        { "FSR2", ".?AVFSR2UpscaleRenderPass@CreationRendererPrivate@@", false, true },
-        { "FSR3", ".?AVFSR3UpscaleRenderPass@CreationRendererPrivate@@", false, true },
+        { "DLSS inputs", ".?AVDLSSProduceInputsRenderPass@CreationRendererPrivate@@" },
+        { "DLSS", ".?AVDLSSUpscaleRenderPass@CreationRendererPrivate@@" },
     };
 
     template <int... Pass>
@@ -824,72 +592,20 @@ void StereoViewModule::InstallUpscalerHooks()
 
 uintptr_t StereoViewModule::RunUpscalerPass(int pass_kind, void* pass, void* render_graph_data, void* pass_data)
 {
-    using func_t  = uintptr_t(void*, void*, void*);
-    auto original = m_upscaler_hooks[pass_kind]->get_original<func_t>();
+    using func_t   = uintptr_t(void*, void*, void*);
+    auto original  = m_upscaler_hooks[pass_kind]->get_original<func_t>();
     static auto vr = VR::get();
-
     if (!vr->is_native_stereo() || pass == nullptr) {
         return original(pass, render_graph_data, pass_data);
     }
 
-    const auto view        = At<uint32_t>(pass, kPassCameraView);
-    const auto viewport_id = render_graph_data ? At<uint32_t>(render_graph_data, 0x140) : 0u;
-    uint32_t   scene_id    = kInvalidId;
-    if (render_graph_data && viewport_id < 8) {
-        auto base = At<uint8_t*>(render_graph_data, 0x108 + 8 * (size_t)viewport_id);
-        if (base) {
-            scene_id = At<uint32_t>(base, 0x24);
-        }
-    }
-    const auto right_view   = m_right_view_id & 0xFFFFFF;
-    const auto right_camera = m_right_camera ? m_right_camera->cameraHandleID & 0xFFFFFF : kInvalidId;
-    const bool right        = (view & 0xFFFFFF) == right_view || (scene_id & 0xFFFFFF) == right_view || (scene_id & 0xFFFFFF) == right_camera;
-
-    static std::atomic<int> logged{ 0 };
-    if (logged.fetch_add(1) < 16) {
-        spdlog::info("[Stereo] {} pass: pass view {:x}, graph viewport {}, scene {:x} -> right eye {} (right view {:x}, right camera {:x})", kUpscalerPasses[pass_kind].label,
-                     view, viewport_id, scene_id, right, m_right_view_id, right_camera);
-    }
-    m_upscaler_runs[pass_kind].fetch_add(1);
-    if (right) {
-        m_upscaler_right_runs[pass_kind].fetch_add(1);
-    }
-
-    if (!kUpscalerPasses[pass_kind].dlss) {
-        return original(pass, render_graph_data, pass_data);
-    }
+    // DLSS keeps the right eye's history in a viewport of its own.
+    const auto right_view = m_right_view_id & 0xFFFFFF;
+    const bool right      = (At<uint32_t>(pass, kPassCameraView) & 0xFFFFFF) == right_view || (SceneOf(render_graph_data) & 0xFFFFFF) == right_view;
     UpscalerAfrNvidiaModule::set_secondary_view(right);
     auto result = original(pass, render_graph_data, pass_data);
     UpscalerAfrNvidiaModule::set_secondary_view(false);
     return result;
-}
-
-void StereoViewModule::ReportUpscalers()
-{
-    constexpr int kReportInterval = 300;
-    if (m_native_frames % kReportInterval != 0 || m_native_frames == 0) {
-        return;
-    }
-
-    std::string summary;
-    bool        shared_history = false;
-    for (int i = 0; i < kUpscalerPassCount; ++i) {
-        const auto runs  = m_upscaler_runs[i].exchange(0);
-        const auto right = m_upscaler_right_runs[i].exchange(0);
-        if (runs == 0) {
-            continue;
-        }
-        summary += std::format("{}{} {} ({} right eye)", summary.empty() ? "" : ", ", kUpscalerPasses[i].label, runs, right);
-        shared_history = shared_history || kUpscalerPasses[i].shares_history;
-    }
-    if (m_upscaler_reports < 20) {
-        ++m_upscaler_reports;
-        spdlog::info("[Stereo] Upscaler passes over the last {} frames: {}", kReportInterval, summary.empty() ? std::string{ "none (native TAA)" } : summary);
-    }
-    if (shared_history && !m_warned_shared_upscaler) {
-        m_warned_shared_upscaler = true;
-        spdlog::warn("[Stereo] XeSS and FSR keep one history for both eyes, which smears each eye with the other; use DLSS or TAA with Native stereo");
-    }
 }
 
 uint32_t StereoViewModule::SceneOf(void* render_graph_data) const
@@ -905,242 +621,16 @@ uint32_t StereoViewModule::SceneOf(void* render_graph_data) const
     return base ? At<uint32_t>(base, 0x24) : kInvalidId;
 }
 
-void StereoViewModule::StartCensus()
-{
-    std::scoped_lock _{ m_census_mutex };
-    m_census.clear();
-    m_census_order.clear();
-    m_census_frames = 3;
-}
-
-void StereoViewModule::FinishCensus()
-{
-    std::scoped_lock _{ m_census_mutex };
-    auto root = CreationEngineSingletonManager::GetSceneGraphRoot();
-    const auto left  = m_left_camera ? m_left_view_id & 0xFFFFFF : root ? At<uint32_t>(root, kRootMainView) & 0xFFFFFF : kInvalidId;
-    const auto right = m_right_view_id & 0xFFFFFF;
-
-    for (auto& [scene, passes] : m_census) {
-        spdlog::info("[Stereo] Census: scene {:x} ran {} distinct passes", scene, passes.size());
-    }
-    auto find = [&](uint32_t id) -> const std::map<std::string, int>* {
-        for (auto& [scene, passes] : m_census) {
-            if ((scene & 0xFFFFFF) == id) {
-                return &passes;
-            }
-        }
-        return nullptr;
-    };
-    auto l = find(left);
-    auto r = find(right);
-    if (l == nullptr || r == nullptr) {
-        spdlog::warn("[Stereo] Census: no passes recorded for the {} eye", l ? "right" : "left");
-        return;
-    }
-    for (auto& [name, count] : *l) {
-        auto it = r->find(name);
-        if (it == r->end()) {
-            spdlog::info("[Stereo] Census: left eye only: {} x{}", name, count);
-        } else if (it->second != count) {
-            spdlog::info("[Stereo] Census: {} runs {}x left, {}x right", name, count, it->second);
-        }
-    }
-    for (auto& [name, count] : *r) {
-        if (l->find(name) == l->end()) {
-            spdlog::info("[Stereo] Census: right eye only: {} x{}", name, count);
-        }
-    }
-    std::string shared;
-    for (auto& [scene, passes] : m_census) {
-        if ((scene & 0xFFFFFF) == left || (scene & 0xFFFFFF) == right) {
-            continue;
-        }
-        for (auto& [name, count] : passes) {
-            shared += std::format("{}{} x{}", shared.empty() ? "" : ", ", name, count);
-        }
-        spdlog::info("[Stereo] Census: passes outside both eye views (scene {:x}): {}", scene, shared);
-        shared.clear();
-    }
-    // Execution order of the effect, translucency, sky and scene setup passes, tagged by eye.
-    std::string order;
-    for (auto& entry : m_census_order) {
-        order += entry;
-        if (order.size() > 1500) {
-            spdlog::info("[Stereo] Order: {}", order);
-            order.clear();
-        }
-    }
-    if (!order.empty()) {
-        spdlog::info("[Stereo] Order: {}", order);
-    }
-}
-
-uintptr_t StereoViewModule::onExecuteChildPass(void* graph, void* render_graph_data, void* container)
-{
-    static auto instance = Get();
-    using func_t         = uintptr_t(void*, void*, void*);
-    static auto original = instance->m_execute_child_hook->get_original<func_t>();
-
-    if (instance->m_census_frames.load() > 0 && container != nullptr) {
-        auto pass = At<void*>(container, 0x20);
-        auto name = pass ? At<const char*>(pass, 0x8) : nullptr;
-        if (name != nullptr) {
-            const auto scene = instance->SceneOf(render_graph_data);
-            std::scoped_lock _{ instance->m_census_mutex };
-            ++instance->m_census[scene][name];
-            const std::string_view n{ name };
-            const bool tracked = n.find("Particle") != n.npos || n.find("Forward") != n.npos || n.find("OIT") != n.npos || n.find("Sky") != n.npos ||
-                                 n.find("SceneSetup") != n.npos || n.find("FrameSetup") != n.npos || n.find("Cloud") != n.npos || n.find("Effect") != n.npos ||
-                                 n.find("Emissive") != n.npos || n.find("Translucen") != n.npos;
-            if (tracked && instance->m_census_order.size() < 600) {
-                const auto s   = scene & 0xFFFFFF;
-                const char* eye = s == (instance->m_left_view_id & 0xFFFFFF) ? "L" : s == (instance->m_right_view_id & 0xFFFFFF) ? "R" : "-";
-                instance->m_census_order.push_back(std::format("{}:{} ", eye, n));
-            }
-        }
-    }
-    return original(graph, render_graph_data, container);
-}
-
 uintptr_t StereoViewModule::onScaleformComposite(void* pass, void* render_graph_data, void* pass_data)
 {
     static auto instance = Get();
     using func_t         = uintptr_t(void*, void*, void*);
     static auto original = instance->m_scaleform_composite_hook->get_original<func_t>();
     static auto vr       = VR::get();
-
-    if (vr->is_native_stereo() && instance->m_double_width && pass_data != nullptr && GameFlow::gStore.internalSettings.stereoHudBothEyes) {
-        instance->MirrorHudToRightEye(render_graph_data, pass_data);
-    }
-    if (vr->is_native_stereo() && !instance->m_double_width && pass_data != nullptr) {
+    if (vr->is_native_stereo() && pass_data != nullptr) {
         instance->CaptureUiLayer(render_graph_data, pass_data);
     }
-    if (vr->is_native_stereo() && pass_data != nullptr && instance->m_composite_logs.fetch_add(1) < 4) {
-        auto data  = static_cast<RE::CreationRendererPrivate::RenderPassData*>(pass_data);
-        auto items = data->renderPassItems;
-        const uint32_t count = items ? (uint32_t)items->_size : 0;
-        spdlog::info("[Stereo] HUD composite for scene {:x} with {} resources", instance->SceneOf(render_graph_data), count);
-        for (uint32_t i = 0; i < count && i < 8; ++i) {
-            auto resource = data->getNativeResourceByIndex(i);
-            if (resource) {
-                const auto desc = resource->GetDesc();
-                spdlog::info("[Stereo]   resource {}: {:p} {}x{} format {}", i, (void*)resource, desc.Width, desc.Height, (uint32_t)desc.Format);
-            } else {
-                spdlog::info("[Stereo]   resource {}: none", i);
-            }
-        }
-    }
     return original(pass, render_graph_data, pass_data);
-}
-
-bool StereoViewModule::onIsPrimarySceneView(void* view)
-{
-    static auto instance = Get();
-    using func_t         = bool(void*);
-    static auto original = instance->m_primary_view_hook->get_original<func_t>();
-    static auto vr       = VR::get();
-
-    const bool primary = original(view);
-    if (primary || view == nullptr || !vr->is_native_stereo() || !instance->m_registered) {
-        return primary;
-    }
-    if ((At<uint32_t>(view, 0x24) & 0xFFFFFF) != (instance->m_right_view_id & 0xFFFFFF)) {
-        return primary;
-    }
-
-    // The right eye builds its own reflection probe blend; the scene-level probe and GI updates stay shared.
-    constexpr uintptr_t kProbeBuilderSize = 0x2760;
-    const auto          caller            = reinterpret_cast<uintptr_t>(_ReturnAddress());
-    if (caller < instance->m_probe_builder || caller >= instance->m_probe_builder + kProbeBuilderSize) {
-        return primary;
-    }
-    static bool logged{ false };
-    if (!logged) {
-        logged = true;
-        spdlog::info("[Stereo] Right eye view gets its own reflection probe blend");
-    }
-    return true;
-}
-
-void StereoViewModule::MirrorHudToRightEye(void* render_graph_data, void* pass_data)
-{
-    auto data  = static_cast<RE::CreationRendererPrivate::RenderPassData*>(pass_data);
-    auto graph = static_cast<RE::CreationRendererPrivate::RenderGraphData*>(render_graph_data);
-    if (data == nullptr || graph == nullptr || data->renderPassItems == nullptr) {
-        return;
-    }
-    auto context = reinterpret_cast<RE::RenderGraphDataD3D12Context*>(graph->getCommandList());
-    if (context == nullptr || context->pID3D12CommandList == nullptr) {
-        return;
-    }
-    auto command_list = context->pID3D12CommandList;
-    auto device       = g_framework->get_d3d12_hook()->get_device();
-
-    // The UI movies sit in the left half (the left eye); copy that half over the right half before compositing.
-    const uint32_t count = (uint32_t)data->renderPassItems->_size;
-    for (uint32_t i = 0; i < count && i < 4; ++i) {
-        auto item     = data->getRenderPassItemByIndex(i);
-        auto resource = data->getNativeResourceByIndex(i);
-        if (item == nullptr || resource == nullptr) {
-            continue;
-        }
-        const auto desc  = resource->GetDesc();
-        const auto state = (D3D12_RESOURCE_STATES)RE::CreationRendererPrivate::RenderPassItem::getDXGIState(item->stateOrFlags);
-        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 || desc.Width < 64) {
-            continue;
-        }
-        if (m_hud_scratch == nullptr || m_hud_scratch->GetDesc().Width != desc.Width || m_hud_scratch->GetDesc().Height != desc.Height ||
-            m_hud_scratch->GetDesc().Format != desc.Format) {
-            m_hud_scratch.Reset();
-            auto scratch_desc  = desc;
-            scratch_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-            const CD3DX12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
-            if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &scratch_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&m_hud_scratch)))) {
-                spdlog::error("[Stereo] Failed to create the HUD scratch texture");
-                return;
-            }
-        }
-
-        const UINT half = (UINT)(desc.Width / 2);
-        D3D12_BOX  left_half{ 0, 0, 0, half, desc.Height, 1 };
-
-        D3D12_RESOURCE_BARRIER to_copy[]{
-            CD3DX12_RESOURCE_BARRIER::Transition(resource, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            CD3DX12_RESOURCE_BARRIER::Transition(m_hud_scratch.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
-        };
-        command_list->ResourceBarrier(2, to_copy);
-        CD3DX12_TEXTURE_COPY_LOCATION scratch_location{ m_hud_scratch.Get(), 0 };
-        CD3DX12_TEXTURE_COPY_LOCATION ui_location{ resource, 0 };
-        command_list->CopyTextureRegion(&scratch_location, 0, 0, 0, &ui_location, &left_half);
-
-        D3D12_RESOURCE_BARRIER to_paste[]{
-            CD3DX12_RESOURCE_BARRIER::Transition(resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
-            CD3DX12_RESOURCE_BARRIER::Transition(m_hud_scratch.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        };
-        command_list->ResourceBarrier(2, to_paste);
-        command_list->CopyTextureRegion(&ui_location, half, 0, 0, &scratch_location, &left_half);
-
-        D3D12_RESOURCE_BARRIER restore[]{
-            CD3DX12_RESOURCE_BARRIER::Transition(resource, D3D12_RESOURCE_STATE_COPY_DEST, state),
-            CD3DX12_RESOURCE_BARRIER::Transition(m_hud_scratch.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
-        };
-        command_list->ResourceBarrier(2, restore);
-
-        if (m_hud_mirror_logs.fetch_add(1) < 2) {
-            spdlog::info("[Stereo] HUD mirrored to the right eye: resource {} {}x{} format {} state {:x}", i, desc.Width, desc.Height, (uint32_t)desc.Format, (uint32_t)state);
-        }
-        // The first texture is the UI layer.
-        return;
-    }
-}
-
-void StereoViewModule::UpdateWorldFreeze()
-{
-    static auto vr = VR::get();
-    // Alternate eye resubmits the older eye every frame, as before native stereo existed.
-    if (GameFlow::gStore.internalSettings.stereoMode == 2 && !vr->is_using_async_aer()) {
-        vr->set_async_aer(true);
-    }
 }
 
 bool StereoViewModule::RegisterRightGraph()
@@ -1160,7 +650,6 @@ bool StereoViewModule::RegisterRightGraph()
         spdlog::error("[Stereo] Right eye render graph setup stopped at step {}", ctx.step);
         return false;
     }
-    m_right_graph_ready = true;
     std::memset(m_right_graph_options, 0, sizeof(m_right_graph_options));
     m_right_graph_frame_flag = 0xFF;
     spdlog::info("[Stereo] Right eye render graph {:x} registered with {} job(s); main graph {:x}", m_right_graph_id, At<uint32_t>(main_record, 0x0),
@@ -1199,7 +688,7 @@ void StereoViewModule::PrepareRightGraph()
     ViewIdArray views{};
     views.size     = 1;
     views.capacity = static_cast<int32_t>(0x80000004u);
-    views.local[0] = m_exp_swap_graphs ? m_left_view_id : m_right_view_id;
+    views.local[0] = m_right_view_id;
     m_set_multi_view_hook->get_original<decltype(onSetMultiCameraViewData)>()(StorageColumn(storage, kMultiCameraViewColumn), id & 0xFFFFFF, &views);
     m_appended.store(true);
 }
@@ -1211,158 +700,48 @@ uintptr_t StereoViewModule::onSubmitRenderGraph(void* frame_list, void* record)
     static auto original = instance->m_submit_graph_hook->get_original<func_t>();
     static auto vr       = VR::get();
 
+    // The right eye's graph goes in just ahead of the main graph, which renders the left eye.
     auto root = CreationEngineSingletonManager::GetSceneGraphRoot();
-    if (instance->m_right_graph_ready && vr->is_native_stereo() && !instance->m_menu_fallback.load() && root &&
-        record == reinterpret_cast<uint8_t*>(root) + kRootMainGraphRecord &&
-        At<uint32_t>(root, kRootMainView) != kInvalidId) {
+    if (instance->m_registered && vr->is_native_stereo() && !instance->m_menu_fallback.load() && root &&
+        record == reinterpret_cast<uint8_t*>(root) + kRootMainGraphRecord && At<uint32_t>(root, kRootMainView) != kInvalidId) {
         instance->PrepareRightGraph();
-        if (GameFlow::gStore.internalSettings.nativeLeftGraphFirst || instance->m_exp_left_first) {
-            const auto result = original(frame_list, record);
-            original(frame_list, instance->m_right_graph_record);
-            return result;
-        }
         original(frame_list, instance->m_right_graph_record);
-        if (instance->m_right_graph_submits++ == 0) {
-            spdlog::info("[Stereo] Right eye render graph submitted ahead of the main graph");
-        }
     }
     return original(frame_list, record);
 }
 
-
-std::string StereoViewModule::Variant() const
+void StereoViewModule::UpdateMenuFallback(bool stereo)
 {
-    const bool left_first = GameFlow::gStore.internalSettings.nativeLeftGraphFirst || m_exp_left_first;
-    return std::format("{}_{}_{}_camera{}", m_double_width ? "double" : "window", left_first ? "leftfirst" : "rightfirst",
-                       m_exp_swap_graphs ? "swapped" : "maingraphleft", m_right_camera_generation);
-}
-
-bool StereoViewModule::RenewRightCamera()
-{
-    auto root = CreationEngineSingletonManager::GetSceneGraphRoot();
-    if (!m_registered || root == nullptr || root->worldCamera == nullptr) {
-        return false;
-    }
-    RegisterContext ctx{ root, root->worldCamera, nullptr, kInvalidId, 0, "VR Right Eye Camera" };
-    if (!RegisterEngineObjectsGuarded(&ctx)) {
-        spdlog::error("[Stereo] Renewing the right eye camera failed at step {}", ctx.step);
-        return false;
-    }
-    m_right_camera  = ctx.camera;
-    m_right_view_id = ctx.view_id;
-    m_mirrored      = {};
-    ++m_right_camera_generation;
-    spdlog::info("[Stereo] Right eye now uses camera {:x}, view {:x} (generation {})", m_right_camera->cameraHandleID, m_right_view_id, m_right_camera_generation);
-    return true;
-}
-
-void StereoViewModule::UpdateMenuFallback(bool native)
-{
-    static auto vr       = VR::get();
-    const bool  fallback = native && ModSettings::showFlatScreenDisplay();
+    const bool fallback = stereo && ModSettings::showFlatScreenDisplay();
     if (fallback != m_menu_fallback.load()) {
         m_menu_fallback.store(fallback);
-        m_menu_frames = 0;
-        if (fallback) {
-            ++m_menu_opens;
-        }
-        spdlog::info("[Stereo] {}", fallback ? "Fullscreen menu: the main graph renders the game's own view in the left half, shown on the flat screen"
-                                              : "Fullscreen menu closed: both eye views render again");
-    }
-    // The first few menus of a session are captured shortly after opening and once settled, with the passes they run.
-    if (!fallback || m_menu_opens > 6) {
-        return;
-    }
-    ++m_menu_frames;
-    if (m_menu_frames == 60) {
-        StartCensus();
-    }
-    if (m_menu_frames == 20 || m_menu_frames == 120 || m_menu_frames == 400) {
-        spdlog::info("[Stereo] Menu {} frame {}: {}", m_menu_opens, m_menu_frames, GameFlow::isShowingMenu() ? "menu showing" : "no menu");
-        vr->request_backbuffer_dump(Framework::get_persistent_dir(std::format("vr_native_stereo_menu{}_{}.png", m_menu_opens, m_menu_frames)).wstring());
+        spdlog::info("[Stereo] {}", fallback ? "Fullscreen menu: the game's own view is shown on the flat screen" : "Fullscreen menu closed: both eye views render again");
     }
 }
 
-void StereoViewModule::ApplyNativeShadowSettings(bool native)
+void StereoViewModule::ApplyNativeShadowSettings(bool stereo)
 {
     // Every eye view runs the dynamic shadow selection, but the per-light fade state is shared: each eye resets the fades of
     // lights only the other eye sees, so those shadows keep restarting their tiled fade. The main view whose LOD the
     // dynamic shadow maps borrow is not rendered in native stereo, so each shadow map picks its own.
-    if (native == m_shadow_settings_applied) {
+    if (stereo == m_shadow_settings_applied) {
         return;
     }
-    m_shadow_settings_applied = native;
+    m_shadow_settings_applied = stereo;
     auto settings = CreationEngineSettings::Get();
     using Type    = CreationEngineSettings::SettingType;
     constexpr auto kFade = "fDynamicShadowFadeSeconds:Shadows";
     constexpr auto kLod  = "bDynamicShadowmapsUseMainViewLOD:Shadows";
-    if (native) {
+    if (stereo) {
         m_saved_shadow_fade_seconds  = settings->get_setting(kFade, Type::kINISetting, 0.75f);
         m_saved_shadow_main_view_lod = settings->get_setting(kLod, Type::kINISetting, true);
     }
-    const bool fade = settings->set_setting(kFade, Type::kINISetting, native ? 0.0f : m_saved_shadow_fade_seconds);
-    const bool lod  = settings->set_setting(kLod, Type::kINISetting, native ? false : m_saved_shadow_main_view_lod);
-    spdlog::info("[Stereo] Shadow settings {}: dynamic shadow fade {}s ({}), main view LOD {} ({})", native ? "for native stereo" : "restored",
+    const bool fade = settings->set_setting(kFade, Type::kINISetting, stereo ? 0.0f : m_saved_shadow_fade_seconds);
+    const bool lod  = settings->set_setting(kLod, Type::kINISetting, stereo ? false : m_saved_shadow_main_view_lod);
+    spdlog::info("[Stereo] Shadow settings {}: dynamic shadow fade {}s ({}), main view LOD {} ({})", stereo ? "for native stereo" : "restored",
                  settings->get_setting(kFade, Type::kINISetting, -1.0f), fade ? "set" : "not found", settings->get_setting(kLod, Type::kINISetting, false),
                  lod ? "set" : "not found");
 }
-
-void StereoViewModule::AdvanceExperiment()
-{
-    // Which eye looks wrong in each capture tells apart graph order, graph identity and camera registration.
-    switch (m_experiment_stage++) {
-    case 0:
-        m_exp_left_first = true;
-        break;
-    case 1:
-        m_exp_left_first  = false;
-        m_exp_swap_graphs = true;
-        break;
-    case 2:
-        m_exp_swap_graphs = false;
-        RenewRightCamera();
-        break;
-    default:
-        return;
-    }
-    spdlog::info("[Stereo] Diagnostic stage {}: left graph first {}, graphs swapped {}, right camera generation {}", m_experiment_stage, m_exp_left_first,
-                 m_exp_swap_graphs, m_right_camera_generation);
-}
-
-uintptr_t StereoViewModule::onCopyToRenderGraphOutput(void* pass, void* render_graph_data, void* pass_data)
-{
-    static auto instance = Get();
-    using func_t         = uintptr_t(void*, void*, void*);
-    static auto original = instance->m_copy_to_output_hook->get_original<func_t>();
-    static auto vr       = VR::get();
-
-    // The output copy writes into the view's scissor rect. Eye scissors stay full for culling, so for this pass the
-    // scissor is narrowed to the eye's viewport and each eye lands in its own half.
-    const auto viewport_id = render_graph_data ? At<uint32_t>(render_graph_data, 0x140) : 8u;
-    static std::atomic<int> calls{ 0 };
-    if (vr->is_native_stereo() && calls.fetch_add(1) < 6) {
-        spdlog::info("[Stereo] Output copy pass: graph viewport {}, scene {:x}", viewport_id, instance->SceneOf(render_graph_data));
-    }
-    if (!vr->is_native_stereo() || !instance->m_double_width || viewport_id >= 8) {
-        return original(pass, render_graph_data, pass_data);
-    }
-    auto rect = At<float*>(render_graph_data, 0x108 + 8 * (size_t)viewport_id);
-    if (rect == nullptr || std::abs(rect[1] - rect[0]) > 0.99f) {
-        return original(pass, render_graph_data, pass_data);
-    }
-    float scissors[4];
-    std::memcpy(scissors, rect + 4, sizeof(scissors));
-    std::memcpy(rect + 4, rect, sizeof(scissors));
-    static std::atomic<int> logged{ 0 };
-    if (logged.fetch_add(1) < 4) {
-        spdlog::info("[Stereo] Output copy for view {:x}: viewport ({}, {}, {}, {}), scissors ({}, {}, {}, {}) narrowed to the viewport", At<uint32_t>(rect, 0x24), rect[0],
-                     rect[1], rect[2], rect[3], scissors[0], scissors[1], scissors[2], scissors[3]);
-    }
-    const auto result = original(pass, render_graph_data, pass_data);
-    std::memcpy(rect + 4, scissors, sizeof(scissors));
-    return result;
-}
-
 
 void StereoViewModule::CaptureEyeImage(uint32_t eye, int pass_kind, void* render_graph_data, void* pass_data)
 {
@@ -1380,7 +759,6 @@ void StereoViewModule::CaptureEyeImage(uint32_t eye, int pass_kind, void* render
 
     // The tonemap pass writes the eye image (its largest written texture); each later pass is captured again when it
     // writes a texture of that size and format, so the last post effect of the chain is what the eye shows.
-    const bool     log   = m_late_logs[pass_kind].fetch_add(1) < 4;
     const uint32_t count = (uint32_t)data->renderPassItems->_size;
     ID3D12Resource*       output{ nullptr };
     D3D12_RESOURCE_STATES output_state{};
@@ -1392,10 +770,6 @@ void StereoViewModule::CaptureEyeImage(uint32_t eye, int pass_kind, void* render
         }
         const auto desc  = resource->GetDesc();
         const auto state = (D3D12_RESOURCE_STATES)RE::CreationRendererPrivate::RenderPassItem::getDXGIState(item->stateOrFlags);
-        if (log) {
-            spdlog::info("[Stereo] Tonemap pass ({} eye) resource {}: {:p} {}x{} format {} state {:x}", eye == 0 ? "left" : "right", i, (void*)resource, desc.Width,
-                         desc.Height, (uint32_t)desc.Format, (uint32_t)state);
-        }
         const bool written = (state & (D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) != 0;
         if (!written || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 || desc.Width < 256) {
             continue;
@@ -1412,13 +786,7 @@ void StereoViewModule::CaptureEyeImage(uint32_t eye, int pass_kind, void* render
         }
     }
     if (output == nullptr) {
-        if (log) {
-            spdlog::info("[Stereo] Late pass {} ({} eye) wrote no eye image", pass_kind, eye == 0 ? "left" : "right");
-        }
         return;
-    }
-    if (log) {
-        spdlog::info("[Stereo] Late pass {} ({} eye) captured {:p}", pass_kind, eye == 0 ? "left" : "right", (void*)output);
     }
 
     const auto desc    = output->GetDesc();
@@ -1552,7 +920,6 @@ namespace
         { "VignetteRenderPass", ".?AVVignetteRenderPass@CreationRendererPrivate@@" },
         { "LensFlare_AlphaBlendRenderPass", ".?AVLensFlare_AlphaBlendRenderPass@CreationRendererPrivate@@" },
         { "LensFlareDrawRenderPass", ".?AVLensFlareDrawRenderPass@CreationRendererPrivate@@" },
-        { "CopyToRenderGraphOutputRenderPass", ".?AVCopyToRenderGraphOutputRenderPass@CreationRendererPrivate@@" },
     };
 
     template <int... Pass>
@@ -1567,10 +934,6 @@ void StereoViewModule::InstallLatePassHooks()
     static_assert(std::size(kLatePasses) == kLatePassCount);
     static const auto detours = LateDetours(std::make_integer_sequence<int, kLatePassCount>{});
     for (int i = 0; i < kLatePassCount; ++i) {
-        // The output copy pass already has its own hook.
-        if (i == kLatePassCount - 1) {
-            continue;
-        }
         auto vtable = reinterpret_cast<uintptr_t*>(MemoryScan::VTable(kLatePasses[i].label, kLatePasses[i].rtti, 0));
         if (vtable == nullptr) {
             spdlog::warn("[Stereo] {} not found", kLatePasses[i].label);
@@ -1588,7 +951,7 @@ uintptr_t StereoViewModule::RunLatePass(int pass_kind, void* pass, void* render_
     static auto vr       = VR::get();
 
     const auto result = original(pass, render_graph_data, pass_data);
-    if (!vr->is_native_stereo() || m_double_width || pass_data == nullptr) {
+    if (!vr->is_native_stereo() || pass_data == nullptr) {
         return result;
     }
     const auto scene = SceneOf(render_graph_data) & 0xFFFFFF;

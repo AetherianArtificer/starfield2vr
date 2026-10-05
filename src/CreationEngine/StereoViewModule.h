@@ -1,23 +1,20 @@
 #pragma once
+#include <array>
 #include <atomic>
-#include <safetyhook/inline_hook.hpp>
-#include <d3d12.h>
-#include <wrl/client.h>
-#include <map>
-#include <vector>
-#include <mutex>
-#include <string>
 #include <cstdint>
+#include <d3d12.h>
 #include <memory>
 #include <memory/FunctionHook.h>
+#include <vector>
+#include <wrl/client.h>
 
 namespace RE
 {
     class NiCamera;
 }
 
-// Native stereo: the right eye is a second engine camera view rendered in the same frame as the left eye, which is the
-// world camera. Both views share one back buffer side by side.
+// Native stereo: each eye is a camera view of its own, rendered over the whole frame in its own render graph in the same
+// engine frame. Each eye's finished image is copied out after the post chain and presented to its eye of the headset.
 class StereoViewModule
 {
 public:
@@ -35,66 +32,16 @@ public:
     [[nodiscard]] RE::NiCamera* RightCamera() const { return m_right_camera; }
     // Both eyes render through cloned cameras; the world camera keeps serving game logic but draws no eye.
     [[nodiscard]] RE::NiCamera* LeftCamera() const { return m_left_camera; }
-    // The back buffer should be two eyes wide (Double Width layout).
-    [[nodiscard]] bool WantsSideBySide() const { return m_wants_side_by_side; }
-    // Side by side splits one double-width frame between the eyes; otherwise each eye renders the whole frame.
-    [[nodiscard]] bool SideBySide() const { return m_double_width; }
     // Eye a camera renders in native stereo: 0 left, 1 right, -1 not an eye camera.
     [[nodiscard]] int EyeOf(const RE::NiCamera* camera) const;
 
-    // Test switch: registers a fresh camera and view for the right eye.
-    void RequestRenewRightCamera() { m_renew_right_camera.store(true); }
+    // Saves the back buffer and the image each eye of the headset receives on the next frame.
+    void RequestEyeScreenshots() { m_screenshot_requested.store(true); }
 
-private:
-    StereoViewModule() = default;
-
-    struct ViewIdArray;
-
-    bool TryRegister();
-    void ApplyViewports(bool side_by_side);
-    bool RenewRightCamera();
-    void ApplyNativeShadowSettings(bool native);
-    void DisableFrameGeneration();
-    void*        m_frame_generation_setting{ nullptr };
-    bool         m_frame_generation_looked_up{ false };
-    void UpdateMenuFallback(bool native);
-    bool  m_shadow_settings_applied{ false };
-    float m_saved_shadow_fade_seconds{ 0.75f };
-    bool  m_saved_shadow_main_view_lod{ true };
-    // Fullscreen menus run the game's own single view; they are shown on the flat screen.
-    std::atomic<bool> m_menu_fallback{ false };
-    int               m_menu_frames{ 0 };
-    int               m_menu_opens{ 0 };
-    [[nodiscard]] std::string Variant() const;
-    std::atomic<bool> m_renew_right_camera{ false };
-    int               m_right_camera_generation{ 0 };
-    float             m_eye_near{ -1.0f };
-    float             m_eye_far{ -1.0f };
-    // Diagnostic sequence: each configuration is captured once during first-person gameplay.
-    void              AdvanceExperiment();
-    int               m_experiment_stage{ 0 };
-    bool              m_exp_left_first{ false };
-    bool              m_exp_swap_graphs{ false };
-    std::string       m_last_variant{};
-    void MirrorMainView();
-    struct MirroredRows;
-    void MirrorInto(uint32_t main_view, uint32_t view_id, RE::NiCamera* camera, MirroredRows& mirrored);
-    void UpdateRightFrustum();
-    void ClearCrashGuard();
-    void LogRenderSizes() const;
-
-    static uintptr_t onSetMultiCameraViewData(void* column, uint32_t graph_index, ViewIdArray* views);
-public:
-    // Upscaler render passes, hooked to route DLSS per eye and to report which upscaler runs for each view.
     enum UpscalerPass
     {
         kDLSSInputs,
         kDLSSUpscale,
-        kXeSSInputs,
-        kXeSSUpscale,
-        kFSR2Inputs,
-        kFSR2Upscale,
-        kFSR3Upscale,
         kUpscalerPassCount
     };
     template <int Pass>
@@ -102,94 +49,19 @@ public:
     {
         return Get()->RunUpscalerPass(Pass, pass, render_graph_data, pass_data);
     }
-    uintptr_t RunUpscalerPass(int pass_kind, void* pass, void* render_graph_data, void* pass_data);
-    void      InstallUpscalerHooks();
-    void      ReportUpscalers();
 
-    static uintptr_t onExecuteChildPass(void* graph, void* render_graph_data, void* container);
-    static uintptr_t onScaleformComposite(void* pass, void* render_graph_data, void* pass_data);
-    static uintptr_t onCopyToRenderGraphOutput(void* pass, void* render_graph_data, void* pass_data);
-    static constexpr int kLatePassCount = 8;
+    // The tonemap pass and the post effects that may follow it, each re-capturing the eye image.
+    static constexpr int kLatePassCount = 7;
     template <int Pass>
     static uintptr_t onLatePass(void* pass, void* render_graph_data, void* pass_data)
     {
         return Get()->RunLatePass(Pass, pass, render_graph_data, pass_data);
     }
-    uintptr_t RunLatePass(int pass_kind, void* pass, void* render_graph_data, void* pass_data);
-    void      InstallLatePassHooks();
-    void      CaptureEyeImage(uint32_t eye, int pass_kind, void* render_graph_data, void* pass_data);
-    static bool      onIsPrimarySceneView(void* view);
-    static uintptr_t onSubmitRenderGraph(void* frame_list, void* record);
-    bool             RegisterRightGraph();
-    void             PrepareRightGraph();
-    void             UpdateWorldFreeze();
-    void             MirrorHudToRightEye(void* render_graph_data, void* pass_data);
 
 private:
+    StereoViewModule() = default;
 
-    std::unique_ptr<FunctionHook> m_set_multi_view_hook{};
-    std::unique_ptr<FunctionHook> m_execute_child_hook{};
-    std::unique_ptr<FunctionHook> m_scaleform_composite_hook{};
-    std::unique_ptr<FunctionHook> m_copy_to_output_hook{};
-    std::unique_ptr<FunctionHook> m_late_hooks[kLatePassCount]{};
-    std::array<D3D12_RESOURCE_DESC, 2> m_eye_output_desc{};
-    std::array<std::atomic<int>, kLatePassCount> m_late_logs{};
-    // Per eye, one capture texture for each output size the post chain writes.
-    std::array<std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>, 2> m_eye_capture{};
-    std::array<bool, 2>                                   m_eye_capture_ready{};
-    std::atomic<int>                                      m_capture_logs{ 0 };
-    Microsoft::WRL::ComPtr<ID3D12Resource>                m_ui_capture{};
-    void                                                  CaptureUiLayer(void* render_graph_data, void* pass_data);
-    std::unique_ptr<FunctionHook> m_primary_view_hook{};
-    // The right eye renders in its own render graph, so it never shares the left eye's working buffers.
-    std::unique_ptr<FunctionHook> m_submit_graph_hook{};
-    alignas(16) uint8_t           m_right_graph_record[0x80]{};
-    uint32_t                      m_right_graph_id{ 0xFFFFFF };
-    bool                          m_right_graph_ready{ false };
-    uint8_t                       m_right_graph_options[0x30]{};
-    uint8_t                       m_right_graph_frame_flag{ 0xFF };
-    int                           m_right_graph_submits{ 0 };
-    uintptr_t                     m_probe_builder{ 0 };
-    // Scratch copy of the UI texture, used to repeat the left eye's HUD in the right half.
-    Microsoft::WRL::ComPtr<ID3D12Resource> m_hud_scratch{};
-    std::atomic<int>              m_hud_mirror_logs{ 0 };
-    // Pass census: every pass each view runs over a few gameplay frames, to find effects one eye misses.
-    std::atomic<int>                                        m_census_frames{ 0 };
-    std::mutex                                              m_census_mutex{};
-    std::map<uint32_t, std::map<std::string, int>>          m_census{};
-    std::vector<std::string>                                m_census_order{};
-    std::atomic<int>                                        m_composite_logs{ 0 };
-    void                                                    StartCensus();
-    void                                                    FinishCensus();
-    [[nodiscard]] uint32_t                                  SceneOf(void* render_graph_data) const;
-    std::unique_ptr<FunctionHook> m_upscaler_hooks[kUpscalerPassCount]{};
-    std::atomic<int>              m_upscaler_runs[kUpscalerPassCount]{};
-    std::atomic<int>              m_upscaler_right_runs[kUpscalerPassCount]{};
-    int                           m_upscaler_reports{ 0 };
-    bool                          m_warned_shared_upscaler{ false };
-
-    RE::NiCamera*     m_right_camera{ nullptr };
-    uint32_t          m_right_view_id{ 0xFFFFFF };
-    RE::NiCamera*     m_left_camera{ nullptr };
-    uint32_t          m_left_view_id{ 0xFFFFFF };
-    bool              m_registered{ false };
-    bool              m_failed{ false };
-    bool              m_signatures_ok{ false };
-    bool              m_wants_side_by_side{ false };
-    bool              m_viewports_split{ false };
-    bool              m_double_width{ false };
-    int               m_native_frames{ 0 };
-    int               m_stereo_frames{ 0 };
-    int               m_register_attempt_frame{ -1000 };
-    int               m_missed_appends{ 0 };
-    std::atomic<bool> m_appended{ false };
-
-    float m_saved_viewport[4]{ 0.0f, 1.0f, 1.0f, 0.0f };
-    float m_saved_scissors[4]{ 0.0f, 1.0f, 1.0f, 0.0f };
-    float m_saved_starfield_viewport[4]{ 0.0f, 1.0f, 1.0f, 0.0f };
-    float m_saved_starfield_scissors[4]{ 0.0f, 1.0f, 1.0f, 0.0f };
-
-    // Main view rows last copied to the right view.
+    struct ViewIdArray;
     struct MirroredRows
     {
         bool     valid{ false };
@@ -198,6 +70,73 @@ private:
         uint8_t  feature_setup[0x210]{};
         uint8_t  directional_shadow[0x3C]{};
         uint8_t  highlight[0x14]{};
-    } m_mirrored{};
-    MirroredRows m_left_mirrored{};
+    };
+
+    bool TryRegister();
+    bool RegisterRightGraph();
+    void PrepareRightGraph();
+    void KeepEyeViewportsFull();
+    void MirrorMainView();
+    void MirrorInto(uint32_t main_view, uint32_t view_id, RE::NiCamera* camera, MirroredRows& mirrored);
+    void UpdateEyeFrustums();
+    void UpdateMenuFallback(bool stereo);
+    void ApplyNativeShadowSettings(bool stereo);
+    void DisableFrameGeneration();
+    [[nodiscard]] uint32_t SceneOf(void* render_graph_data) const;
+
+    void      InstallUpscalerHooks();
+    uintptr_t RunUpscalerPass(int pass_kind, void* pass, void* render_graph_data, void* pass_data);
+    void      InstallLatePassHooks();
+    uintptr_t RunLatePass(int pass_kind, void* pass, void* render_graph_data, void* pass_data);
+    void      CaptureEyeImage(uint32_t eye, int pass_kind, void* render_graph_data, void* pass_data);
+    void      CaptureUiLayer(void* render_graph_data, void* pass_data);
+
+    static uintptr_t onSetMultiCameraViewData(void* column, uint32_t graph_index, ViewIdArray* views);
+    static uintptr_t onSubmitRenderGraph(void* frame_list, void* record);
+    static uintptr_t onScaleformComposite(void* pass, void* render_graph_data, void* pass_data);
+
+    std::unique_ptr<FunctionHook> m_set_multi_view_hook{};
+    std::unique_ptr<FunctionHook> m_submit_graph_hook{};
+    std::unique_ptr<FunctionHook> m_scaleform_composite_hook{};
+    std::unique_ptr<FunctionHook> m_upscaler_hooks[kUpscalerPassCount]{};
+    std::unique_ptr<FunctionHook> m_late_hooks[kLatePassCount]{};
+
+    // The eye cameras and their camera views.
+    RE::NiCamera* m_right_camera{ nullptr };
+    uint32_t      m_right_view_id{ 0xFFFFFF };
+    RE::NiCamera* m_left_camera{ nullptr };
+    uint32_t      m_left_view_id{ 0xFFFFFF };
+    MirroredRows  m_right_mirrored{};
+    MirroredRows  m_left_mirrored{};
+    float         m_eye_near{ -1.0f };
+    float         m_eye_far{ -1.0f };
+
+    bool m_signatures_ok{ false };
+    bool m_registered{ false };
+    bool m_failed{ false };
+    int  m_register_attempt_frame{ -1000 };
+
+    // The right eye renders in its own render graph, so it never shares the left eye's working buffers.
+    alignas(16) uint8_t m_right_graph_record[0x80]{};
+    uint32_t            m_right_graph_id{ 0xFFFFFF };
+    uint8_t             m_right_graph_options[0x30]{};
+    uint8_t             m_right_graph_frame_flag{ 0xFF };
+    int                 m_missed_appends{ 0 };
+    std::atomic<bool>   m_appended{ false };
+
+    // Fullscreen menus run the game's own single view; they are shown on the flat screen.
+    std::atomic<bool> m_menu_fallback{ false };
+
+    // Per eye, one capture texture for each output size the post chain writes.
+    std::array<D3D12_RESOURCE_DESC, 2>                                 m_eye_output_desc{};
+    std::array<std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>, 2> m_eye_capture{};
+    Microsoft::WRL::ComPtr<ID3D12Resource>                             m_ui_capture{};
+
+    bool  m_shadow_settings_applied{ false };
+    float m_saved_shadow_fade_seconds{ 0.75f };
+    bool  m_saved_shadow_main_view_lod{ true };
+    void* m_frame_generation_setting{ nullptr };
+    bool  m_frame_generation_looked_up{ false };
+
+    std::atomic<bool> m_screenshot_requested{ false };
 };

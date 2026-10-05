@@ -181,76 +181,21 @@ CreationEngineCameraManager::onScaleformSetViewPortInternal(uintptr_t *thisMovie
     auto viewport_buffer_width = viewport->bufferWidth;
     auto viewport_buffer_height = viewport->bufferHeight;
 
-    int offset_left = 0;
-    int offset_top = 0;
-
     auto settings = GameFlow::getMenuSettings(file_url);
 
-    if (!vr->is_hmd_active()) {
-        return;
-    }
-    const bool side_by_side = vr->is_native_stereo() && StereoViewModule::Get()->SideBySide();
-    if (ModSettings::showFlatScreenDisplay()) {
-        // The flat menu screen shows the left half of a side-by-side buffer.
-        if (side_by_side) {
-            viewport->left = 0;
-            viewport->top = 0;
-            viewport->width = viewport_buffer_width / 2;
-            viewport->height = viewport_buffer_height;
-            viewport->flags &= ~(uint32_t) Scaleform::Gfx::Viewport::Flag::kStereo_AnySplit;
-        }
+    // Fullscreen menus keep the whole UI layer; they are shown on the flat screen.
+    if (!vr->is_hmd_active() || ModSettings::showFlatScreenDisplay()) {
         return;
     }
 
-    auto width_multiplier = settings.hud_scale;
-    auto height_multiplier = settings.hud_scale;
-    // The floating HUD panel gets the whole UI layer; its size in the world is set on the panel.
-    if (vr->is_native_hud_panel()) {
-        width_multiplier = 1.0f;
-        height_multiplier = 1.0f;
-    }
-
-    if (side_by_side) {
-        auto visible_height = std::min((int) ((float) backbuffer_size[1] * height_multiplier), viewport_buffer_height);
-        viewport->height = visible_height;
-        viewport->top = (int) (viewport_buffer_height - visible_height) / 2;
-        // The left eye's half of the UI layer; with Both Eyes the stereo module repeats it in the right half.
-        const auto eye_width = viewport_buffer_width / 2;
-        // Same share of the eye as the HUD takes with alternate eye rendering.
-        const float eye_share = std::min(1.0f, (float) (backbuffer_size[0] / 2) * width_multiplier / (float) viewport_buffer_width);
-        const auto visible_width = (int) ((float) eye_width * eye_share);
-        viewport->width = visible_width;
-        viewport->left = (eye_width - visible_width) / 2;
-        viewport->flags &= ~(uint32_t) Scaleform::Gfx::Viewport::Flag::kStereo_AnySplit;
-        static uint32_t logged_flags{ 0xFFFFFFFF };
-        if (logged_flags != viewport->flags) {
-            logged_flags = viewport->flags;
-            spdlog::info("[Stereo] HUD viewport {}x{} at ({}, {}) in {}x{}, flags {:x}", viewport->width, viewport->height, viewport->left, viewport->top,
-                         viewport_buffer_width, viewport_buffer_height, viewport->flags);
-        }
-        return;
-    }
-
-    // Implement offset based on dominant eye and menu-specific offset_value
-    auto current_eye = vr->get_current_render_eye();
-    if (ModConstants::dominantEye == 1) {
-        // Dominant eye is right
-        offset_left = (current_eye == VRRuntime::Eye::RIGHT) ? -settings.perspective : 0;
-    } else {
-        // Dominant eye is left
-        offset_left = (current_eye == VRRuntime::Eye::LEFT) ? settings.perspective : 0;
-    }
-    // Native stereo draws one UI layer for both eyes and separates it when presenting.
-    if (vr->is_native_stereo()) {
-        offset_left = 0;
-    }
-
-    auto visible_width = std::min((int) ((float) backbuffer_size[0] * width_multiplier), viewport_buffer_width);
-    auto visible_height = std::min((int) ((float) backbuffer_size[1] * height_multiplier), viewport_buffer_height);
+    // One UI layer serves both eyes. The floating HUD panel gets all of it; its size in the world is set on the panel.
+    const float scale = vr->is_native_hud_panel() ? 1.0f : settings.hud_scale;
+    auto visible_width = std::min((int) ((float) backbuffer_size[0] * scale), viewport_buffer_width);
+    auto visible_height = std::min((int) ((float) backbuffer_size[1] * scale), viewport_buffer_height);
     viewport->width = visible_width;
     viewport->height = visible_height;
-    viewport->left = (int) (viewport_buffer_width - visible_width) / 2 + offset_left;
-    viewport->top = (int) (viewport_buffer_height - visible_height) / 2 + offset_top;
+    viewport->left = (int) (viewport_buffer_width - visible_width) / 2;
+    viewport->top = (int) (viewport_buffer_height - visible_height) / 2;
 }
 
 void CreationEngineCameraManager::onSetNimFrustum(RE::NiCamera *pCamera, RE::NiFrustum *pFrustum) {
@@ -275,7 +220,7 @@ void CreationEngineCameraManager::onSetNiFrustumInternal(RE::NiCamera *pCamera, 
     if (!vr->is_hmd_active()) {
         return;
     }
-    auto eye = vr->is_native_stereo() ? StereoViewModule::Get()->EyeOf(pCamera) : (vr->get_current_render_eye() == VRRuntime::Eye::LEFT ? 0 : 1);
+    auto eye = StereoViewModule::Get()->EyeOf(pCamera);
     auto runtime = vr->get_runtime();
     Vector4f frustum = runtime->frustums[eye];
     aiming_adjustments(frustum, get_fov_adjustment());
@@ -338,7 +283,7 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
         return;
     }
 
-    // In native stereo the world camera is the left eye and the right eye camera shares its parent.
+    // The world camera is the left eye and the right eye camera shares its parent.
     auto right_camera = vr->is_native_stereo() ? StereoViewModule::Get()->RightCamera() : nullptr;
     auto place = [&](RE::NiCamera* camera, const glm::mat4& eye_transform) {
         glm::mat4 local;
@@ -370,7 +315,8 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
             left_camera->local = worldCamera->local;
         }
     } else {
-        place(worldCamera, vr->get_current_eye_transform());
+        // Before the eye views exist both eyes show the world camera's view.
+        place(worldCamera, vr->get_eye_transform(VRRuntime::Eye::LEFT));
     }
 }
 
@@ -389,8 +335,7 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
         // order of extraction Pitch->Yaw->Roll (Havok X->Z->Y)
         auto p_player = CreationEngineSingletonManager::GetPlayerRef();
 
-        // With alternate eye rendering it waits for the right-eye frame so the turn lands at the start of an eye pair.
-        if (p_player && (vr->is_native_stereo() || vr->get_current_render_eye() == VRRuntime::Eye::RIGHT)) {
+        if (p_player) {
             if (const float snap = GameFlow::pendingSnapYaw.exchange(0.0f); snap != 0.0f) {
                 const float two_pi = 2.0f * glm::pi<float>();
                 p_player->data.angle.z = std::fmod(p_player->data.angle.z + snap + two_pi, two_pi);

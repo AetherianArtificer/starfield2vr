@@ -142,37 +142,6 @@ namespace Steam::MemoryOffsets::Stereo
         return addr;
     }
 
-    // Runs one child pass of a render graph: setup, execute and teardown through the pass vtable.
-    inline uintptr_t RenderGraphExecuteChild()
-    {
-        static auto addr = FuncRelocation("48 89 5C 24 08 57 48 83 EC 40 49 8B 58", 0x2a59b10);
-        return addr;
-    }
-
-    // True when a view is the first view of its scene in the render graph; later views of the same scene skip
-    // the reflection probe work and reuse the first view's results.
-    inline uintptr_t IsPrimarySceneView()
-    {
-        static auto addr = FuncRelocation("48 89 5C 24 08 48 89 7C 24 10 8B 51", 0x2a61020);
-        return addr;
-    }
-
-    // Builds a view's reflection probe sub-graph (probe captures and the per-view probe blend).
-    inline uintptr_t BuildReflectionProbeSubGraph()
-    {
-        static auto addr = FuncRelocation("48 8B C4 48 89 50 10 48 89 48 08 55 53 56 57 41 54 41 55 41 56 41 57 48 8D A8 78 FD FF FF 48 81 EC 48 03 00 00 C5 F8 "
-                                          "29 70 A8 C5 F8 29 78 98 C5",
-                                          0x2b272a0);
-        return addr;
-    }
-
-    // Sets the global time multiplier (the sgtm console command); rescales the current frame's game time delta.
-    inline uintptr_t SetGlobalTimeMultiplier()
-    {
-        static auto addr = FuncRelocation("80 3D ? ? ? ? 00 C5 FA 11 0D ? ? ? ? C5", 0x22ccd40);
-        return addr;
-    }
-
     inline uintptr_t RenderGraphRegister()
     {
         static auto addr = FuncRelocation("48 89 5C 24 18 48 89 6C 24 20 56 57 41 54 41 56 41 57 48 83 EC 50 4C 8B E1 4C", 0x7ca380);

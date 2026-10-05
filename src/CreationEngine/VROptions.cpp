@@ -79,29 +79,19 @@ VROptions::VROptions()
         { "90%", "95%", "100%", "105%", "110%" }, 2);
     add(kMatchBodyHeight, kCategoryDisplay, Kind::Toggle, "MatchBodyHeight", "Match Body Height",
         "Scale your movement so your eyes and reach match your character's body. Measured when the view recenters.", on_off, 1);
-    add(kStereoRendering, kCategoryDisplay, Kind::Choice, "StereoRenderingV3", "Stereo Rendering",
-        "Native renders both eyes every frame from the same moment. Alternate Eye renders one eye per frame; use it if Native misbehaves.",
-        { "Native", "Alternate Eye" }, 0);
-    add(kStereoHud, kCategoryDisplay, Kind::Choice, "HudPlacement", "HUD Placement",
+    add(kHudPlacement, kCategoryDisplay, Kind::Choice, "HudPlacement", "HUD Placement",
         "Floating Panel shows the HUD on a panel in front of you that recentres when you turn away. Head Locked keeps it fixed in your view.",
         { "Floating Panel", "Head Locked" }, 0);
-    add(kStereoLayout, kCategoryDisplay, Kind::Choice, "NativeEyeLayoutV2", "Native Eye Layout",
-        "Full Frame renders each eye over the whole frame, one after the other. Side By Side renders both eyes into halves of a double-width frame.",
-        { "Full Frame", "Side By Side" }, 0);
-    add(kNativeGraphOrder, kCategoryDisplay, Kind::Choice, "NativeGraphOrder", "Native Eye Order (Test)",
-        "Which eye's render graph runs first with Native stereo rendering.", { "Right Eye First", "Left Eye First" }, 0);
-    add(kNativeRenewRightCamera, kCategoryDisplay, Kind::Action, "", "Renew Right Eye Camera (Test)",
-        "Give the right eye a newly registered camera.", {}, 0);
     add(kHudSize, kCategoryDisplay, Kind::Choice, "HudSize", "HUD Size", "Size of the in-game HUD.", { "Small", "Medium", "Large" }, 1);
     add(kHudDepth, kCategoryDisplay, Kind::Choice, "HudDepth", "HUD Depth", "How far away the in-game HUD appears.", { "Near", "Medium", "Far" }, 1);
     add(kMenuDistance, kCategoryDisplay, Kind::Choice, "MenuDistance", "Menu Distance", "How far away full-screen menus appear.",
         { "Near", "Medium", "Far" }, 1);
     add(kMenuSize, kCategoryDisplay, Kind::Choice, "MenuSize", "Menu Size", "Size of full-screen menus.", { "Small", "Medium", "Large" }, 1);
-    add(kDominantEye, kCategoryDisplay, Kind::Choice, "DominantEye", "Dominant Eye", "The eye the HUD and crosshair line up with.",
-        { "Right", "Left" }, 0);
     add(kRecenterAfterLoading, kCategoryDisplay, Kind::Toggle, "RecenterAfterLoading", "Recenter After Loading Screens",
         "Reset your view height and direction when a loading screen ends.", on_off, 1);
     add(kRecenterView, kCategoryDisplay, Kind::Action, "", "Recenter View", "Reset your view height and direction now.", {}, 0);
+    add(kEyeScreenshots, kCategoryDisplay, Kind::Action, "", "Save Eye Screenshots",
+        "Save the image each eye of the headset receives, as PNG files in the game folder. Useful when reporting a display problem.", {}, 0);
 
     // VR Controls
     add(kControllerLayout, kCategoryControls, Kind::Choice, "ControllerLayout", "Controller Layout",
@@ -174,8 +164,8 @@ void VROptions::set(std::uint32_t id, int value)
         VR::get()->recenter_view();
         return;
     }
-    if (id == kNativeRenewRightCamera) {
-        StereoViewModule::Get()->RequestRenewRightCamera();
+    if (id == kEyeScreenshots) {
+        StereoViewModule::Get()->RequestEyeScreenshots();
         return;
     }
     if (id == kComfortPreset) {
@@ -212,12 +202,7 @@ void VROptions::apply() const
     s.bodyFacing           = get(kBodyFacing) != 0;
     s.supportHand          = get(kSupportHand) != 0;
     s.fingerPoses          = get(kFingerPoses) != 0;
-    s.stereoMode           = get(kStereoRendering) == 0 ? 1 : 2;
-    s.nativeStereo         = s.stereoMode == 1;
-    s.stereoHudBothEyes    = true;
-    s.hudPanel             = get(kStereoHud) == 0;
-    s.stereoDoubleWidth    = get(kStereoLayout) == 1;
-    s.nativeLeftGraphFirst = get(kNativeGraphOrder) == 1;
+    s.hudPanel             = get(kHudPlacement) == 0;
 
     auto& hud       = GameFlow::gStore.hudSettings;
     hud.hudScale    = Pick(kHudSizes, get(kHudSize));
@@ -228,7 +213,6 @@ void VROptions::apply() const
     s.hudPanelDistance = Pick(kHudPanelDistances, get(kHudDepth));
     s.hudPanelWidth    = 2.0f * s.hudPanelDistance * std::tan(glm::radians(Pick(kHudPanelAngles, get(kHudSize))) * 0.5f);
 
-    ModConstants::dominantEye      = get(kDominantEye);
     ModConstants::headTrackingType = get(kAimWith);
 
     auto vr = VR::get();

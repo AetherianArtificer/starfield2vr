@@ -28,9 +28,7 @@ void GameSettingsComponent::on_device_reset()
     auto vr = VR::get();
     if(vr->get_runtime()->loaded) {
         static auto creation_engine_settings = CreationEngineSettings::Get();
-        // A side-by-side back buffer holds two eyes; the game would otherwise pillarbox to one eye's aspect.
-        const float eyes_across = StereoViewModule::Get()->WantsSideBySide() ? 2.0f : 1.0f;
-        float aspect = eyes_across * (float)vr->get_hmd_width() / (float)vr->get_hmd_height();
+        float aspect = (float)vr->get_hmd_width() / (float)vr->get_hmd_height();
         //        spdlog::info("VR Runtime is loaded {}x{} fov={}", vr->get_hmd_width(), vr->get_hmd_height(), vr->get_runtime()->diagonal_fov);
         creation_engine_settings->set_setting("fWideAspectLimit:Display", CreationEngineSettings::SettingType::kINISetting, aspect);
         creation_engine_settings->set_setting("fNarrowAspectLimit:Display", CreationEngineSettings::SettingType::kINISetting, aspect);
