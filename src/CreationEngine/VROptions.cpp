@@ -109,6 +109,14 @@ VROptions::VROptions()
         "Your left hand holds the weapon's foregrip when you bring it close.", on_off, 1);
     add(kFingerPoses, kCategoryControls, Kind::Toggle, "FingerPoses", "Finger Tracking",
         "Fingers follow the controller's trigger, grip and thumb touch.", on_off, 1);
+    add(kHolsters, kCategoryControls, Kind::Toggle, "Holsters", "Holsters",
+        "Draw by gripping at your hip, chest or shoulder; rest the weapon there to holster it.", on_off, 1);
+    add(kManualReload, kCategoryControls, Kind::Toggle, "ManualReload", "Manual Reload",
+        "Reload ejects the magazine; take a new one from your left hip and insert it.", on_off, 1);
+    add(kRaiseToAim, kCategoryControls, Kind::Toggle, "RaiseToAim", "Raise to Aim",
+        "Aim down sights by bringing the weapon's sight up to your eye.", on_off, 1);
+    add(kFirstPersonArms, kCategoryControls, Kind::Toggle, "FirstPersonArms", "First-Person Arms",
+        "Show the game's first-person arms and weapon on the body, holding the weapon exactly as animated.", on_off, 1);
     add(kBodyTracking, kCategoryControls, Kind::Toggle, "BodyTracking", "Body Tracking",
         "Use the headset's body tracking for your torso, elbows and legs when available.", on_off, 1);
     add(kHandTracking, kCategoryControls, Kind::Toggle, "HandTracking", "Tracked Fingers",
@@ -210,6 +218,10 @@ void VROptions::apply() const
     s.fingerPoses          = get(kFingerPoses) != 0;
     s.walkingLegs          = get(kWalkingLegs) != 0;
     s.bodyTracking         = get(kBodyTracking) != 0;
+    s.firstPersonArms      = get(kFirstPersonArms) != 0;
+    s.holsters             = get(kHolsters) != 0;
+    s.manualReload         = get(kManualReload) != 0;
+    s.raiseToAim           = get(kRaiseToAim) != 0;
     s.handTracking         = get(kHandTracking) != 0;
     s.hudPanel             = get(kHudPlacement) == 0;
 

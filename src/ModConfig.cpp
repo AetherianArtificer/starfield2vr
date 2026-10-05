@@ -10,6 +10,7 @@
 #include "ModSettings.h"
 #include "CreationEngine/CreationEngineEntry.h"
 #include "CreationEngine/VROptions.h"
+#include "CreationEngine/input/InputRequests.h"
 #include "CreationEngine/GameSettingsComponent.h"
 #include "CreationEngine/models/ModSettingsStore.h"
 #include "CreationEngine/models/GameFlow.h"
@@ -238,7 +239,19 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
 
         if (is_action_active_any_joystick(m_action_a_button_right)) buttons |= XINPUT_GAMEPAD_A;
         if (is_action_active_any_joystick(m_action_b_button_right)) buttons |= XINPUT_GAMEPAD_B;
-        if (is_action_active_any_joystick(m_action_a_button_left))  buttons |= XINPUT_GAMEPAD_X;
+        // X (reload) goes to the mod instead while an interaction owns it.
+        {
+            static bool x_was_down{false};
+            const bool  x_down = is_action_active_any_joystick(m_action_a_button_left);
+            if (x_down && input_requests::Suppressed(input_requests::kX)) {
+                if (!x_was_down) {
+                    input_requests::NoteReloadPress();
+                }
+            } else if (x_down) {
+                buttons |= XINPUT_GAMEPAD_X;
+            }
+            x_was_down = x_down;
+        }
         if (is_action_active_any_joystick(m_action_b_button_left))  buttons |= XINPUT_GAMEPAD_Y;
 
         if (is_left_joystick_click_down)  buttons |= XINPUT_GAMEPAD_LEFT_THUMB;
@@ -327,6 +340,12 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         if (block_sprint && !left_grip_down) {
             buttons &= ~XINPUT_GAMEPAD_LEFT_THUMB;
         }
+
+        // Weapon interactions.
+        if (input_requests::Suppressed(input_requests::kRightShoulder)) buttons &= ~XINPUT_GAMEPAD_RIGHT_SHOULDER;
+        if (input_requests::Requested(input_requests::kX))              buttons |= XINPUT_GAMEPAD_X;
+        if (input_requests::Requested(input_requests::kRightShoulder))  buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+        if (input_requests::Requested(input_requests::kLeftTrigger))    pXinputGamepad->bLeftTrigger = 255;
         return;
     }
 
