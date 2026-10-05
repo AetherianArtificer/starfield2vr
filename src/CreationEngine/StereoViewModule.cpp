@@ -1408,7 +1408,9 @@ void StereoViewModule::CaptureEyeImage(uint32_t eye, int pass_kind, void* render
             continue;
         }
         const auto& expected = m_eye_output_desc[eye];
-        if (pass_kind != 0 && (desc.Width != expected.Width || desc.Height != expected.Height || desc.Format != expected.Format)) {
+        // Sharpening writes into an output-sized texture a few pixels larger than the tonemap output.
+        if (pass_kind != 0 && (desc.Width + 16 < expected.Width || desc.Height + 16 < expected.Height || desc.Width > expected.Width + 64 ||
+                               desc.Height > expected.Height + 64 || desc.Format != expected.Format)) {
             continue;
         }
         if (output == nullptr || desc.Width * desc.Height > output->GetDesc().Width * output->GetDesc().Height) {
@@ -1430,9 +1432,18 @@ void StereoViewModule::CaptureEyeImage(uint32_t eye, int pass_kind, void* render
     if (pass_kind == 0) {
         m_eye_output_desc[eye] = desc;
     }
-    auto&      capture = m_eye_capture[eye];
-    if (capture == nullptr || capture->GetDesc().Width != desc.Width || capture->GetDesc().Height != desc.Height || capture->GetDesc().Format != desc.Format) {
-        capture.Reset();
+    Microsoft::WRL::ComPtr<ID3D12Resource> capture{};
+    for (auto& candidate : m_eye_capture[eye]) {
+        const auto candidate_desc = candidate->GetDesc();
+        if (candidate_desc.Width == desc.Width && candidate_desc.Height == desc.Height && candidate_desc.Format == desc.Format) {
+            capture = candidate;
+            break;
+        }
+    }
+    if (capture == nullptr) {
+        if (m_eye_capture[eye].size() >= 4) {
+            m_eye_capture[eye].erase(m_eye_capture[eye].begin());
+        }
         auto capture_desc  = CD3DX12_RESOURCE_DESC::Tex2D(desc.Format, desc.Width, desc.Height, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
         const CD3DX12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
         auto device = g_framework->get_d3d12_hook()->get_device();
@@ -1442,6 +1453,7 @@ void StereoViewModule::CaptureEyeImage(uint32_t eye, int pass_kind, void* render
         }
         capture->SetName(eye == 0 ? L"Native stereo left eye capture" : L"Native stereo right eye capture");
         spdlog::info("[Stereo] {} eye image {}x{} format {}", eye == 0 ? "Left" : "Right", desc.Width, desc.Height, (uint32_t)desc.Format);
+        m_eye_capture[eye].push_back(capture);
     }
 
     D3D12_RESOURCE_BARRIER to_copy[]{

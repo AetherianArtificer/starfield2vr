@@ -231,7 +231,8 @@ void CreationEngineRendererModule::SetWindowSize(int width, int height)
     }
 
     // Compare the render target, not the window: Windows clamps bordered windows to the screen size.
-    constexpr int kMaxResizeAttempts = 20;
+    // The game puts its own size back after some loads and menus, so a mismatch is always corrected.
+    constexpr int kMaxResizeAttempts = 1000000;
     static int    resize_attempts{ 0 };
     static int    last_target_width{ 0 };
     static int    last_target_height{ 0 };

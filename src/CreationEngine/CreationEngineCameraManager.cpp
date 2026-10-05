@@ -272,6 +272,16 @@ void CreationEngineCameraManager::onSetNiFrustumInternal(RE::NiCamera *pCamera, 
     auto eye = vr->is_native_stereo() ? StereoViewModule::Get()->EyeOf(pCamera) : (vr->get_current_render_eye() == VRRuntime::Eye::LEFT ? 0 : 1);
     auto runtime = vr->get_runtime();
     Vector4f frustum = runtime->frustums[eye];
+    // With native stereo the world camera draws nothing itself but decides what the game culls and animates for both
+    // eyes, so it covers both eyes' fields of view with some margin.
+    if (vr->is_native_stereo() && pCamera == CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera) {
+        constexpr float kMargin = 1.15f;
+        for (int side = 0; side < 4; ++side) {
+            const float a = runtime->frustums[0][side];
+            const float b = runtime->frustums[1][side];
+            frustum[side] = (std::abs(a) > std::abs(b) ? a : b) * kMargin;
+        }
+    }
     aiming_adjustments(frustum, get_fov_adjustment());
     pFrustum->left = frustum[0];
     pFrustum->right = frustum[1];
@@ -291,6 +301,10 @@ void CreationEngineCameraManager::onCalcNiFrustum(RE::NiCamera *pCamera, float f
     if (vr->is_hmd_active() && CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera == pCamera) {
         //        fov = fov + Constants::lodAdjustFov;
         m_fov_adjust = fov - playerCamera->fov;
+        // The first-person near plane (0.6) would cull the body and anything within reach before the eyes draw it.
+        if (vr->is_native_stereo()) {
+            nearz = std::min(nearz, 0.05f);
+        }
         vr->m_nearz = nearz;
         vr->m_farz = farz;
     }

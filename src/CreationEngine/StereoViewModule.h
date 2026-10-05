@@ -136,7 +136,8 @@ private:
     std::unique_ptr<FunctionHook> m_late_hooks[kLatePassCount]{};
     std::array<D3D12_RESOURCE_DESC, 2> m_eye_output_desc{};
     std::array<std::atomic<int>, kLatePassCount> m_late_logs{};
-    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> m_eye_capture{};
+    // Per eye, one capture texture for each output size the post chain writes.
+    std::array<std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>, 2> m_eye_capture{};
     std::array<bool, 2>                                   m_eye_capture_ready{};
     std::atomic<int>                                      m_capture_logs{ 0 };
     Microsoft::WRL::ComPtr<ID3D12Resource>                m_ui_capture{};
