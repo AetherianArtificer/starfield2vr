@@ -62,25 +62,6 @@ namespace
     constexpr size_t kCameraScissors      = 0x1F4;
     constexpr size_t kPassCameraView      = 0x24;
 
-    // A pass's command list for timing; null when the pass has none, instead of faulting.
-    uintptr_t CommandListContextGuarded(void* render_graph_data)
-    {
-        __try {
-            return static_cast<RE::CreationRendererPrivate::RenderGraphData*>(render_graph_data)->getCommandList();
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            return 0;
-        }
-    }
-
-    ID3D12GraphicsCommandList* TimingCommandList(void* render_graph_data)
-    {
-        if (render_graph_data == nullptr) {
-            return nullptr;
-        }
-        auto context = reinterpret_cast<RE::RenderGraphDataD3D12Context*>(CommandListContextGuarded(render_graph_data));
-        return context ? context->pID3D12CommandList : nullptr;
-    }
-
     template <class T>
     T& At(void* base, size_t offset)
     {
@@ -665,22 +646,12 @@ uintptr_t StereoViewModule::RunUpscalerPass(int pass_kind, void* pass, void* ren
     // DLSS keeps the right eye's history in a viewport of its own.
     const auto right_view = m_right_view_id & 0xFFFFFF;
     const bool right      = (At<uint32_t>(pass, kPassCameraView) & 0xFFFFFF) == right_view || (SceneOf(render_graph_data) & 0xFFFFFF) == right_view;
-    auto list = TimingCommandList(render_graph_data);
-    if (pass_kind == kDLSSInputs) {
-        PerfStats::MarkGpu(list, PerfStats::GpuPoint::kEyeUpscaleStart, right ? 1 : 0);
-    }
-    if (pass_kind == kDLSSUpscale) {
-        PerfStats::MarkGpu(list, PerfStats::GpuPoint::kEyeUpscaleEvalStart, right ? 1 : 0);
-    }
     UpscalerAfrNvidiaModule::set_secondary_view(right);
     UpscalerAfrNvidiaModule::set_in_upscaler_pass(true);
     auto result = original(pass, render_graph_data, pass_data);
     RenderPassProfiler::MarkPass(pass, render_graph_data);
     UpscalerAfrNvidiaModule::set_in_upscaler_pass(false);
     UpscalerAfrNvidiaModule::set_secondary_view(false);
-    if (pass_kind == kDLSSUpscale) {
-        PerfStats::MarkGpu(list, PerfStats::GpuPoint::kEyeUpscaleEnd, right ? 1 : 0);
-    }
     return result;
 }
 
@@ -1036,8 +1007,6 @@ uintptr_t StereoViewModule::RunLatePass(int pass_kind, void* pass, void* render_
     const int eye = EyeOfGraph(render_graph_data);
     if (eye >= 0) {
         CaptureEyeImage((uint32_t)eye, pass_kind, render_graph_data, pass_data);
-        // The last post effect of the eye's chain overwrites this point, so it ends up marking the chain's end.
-        PerfStats::MarkGpu(TimingCommandList(render_graph_data), PerfStats::GpuPoint::kEyePostEnd, eye);
     }
     return result;
 }
