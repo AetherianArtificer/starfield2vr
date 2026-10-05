@@ -359,8 +359,13 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
     static auto original_func = instance->m_onGetCameraRotationHook->get_original<decltype(onFPSGetCameraRotation)>();
     original_func(fps, quat_out);
     static auto vr = VR::get();
-    if (!vr->is_hmd_active() || ModConstants::cameraShake || ModSettings::showFlatScreenDisplay()) {
+    // The head's share of the player's yaw is kept through menus and pauses, so the view continues where the head
+    // points when they close.
+    if (!vr->is_hmd_active()) {
         yaw_offset = 0.0f;
+        return;
+    }
+    if (ModConstants::cameraShake || ModSettings::showFlatScreenDisplay()) {
         return;
     }
     if (!GameFlow::isImmovable() && !GameFlow::isControlledByAI()) {
@@ -414,7 +419,6 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
             tracking::RecordAppliedAim(aim_rotation, vr->m_engine_frame_count);
         }
     } else {
-        yaw_offset = 0.0f;
         GameFlow::pendingSnapYaw.store(0.0f);
     }
 }
