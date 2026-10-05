@@ -320,11 +320,34 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
         place(worldCamera, vr->get_eye_transform(VRRuntime::Eye::LEFT));
     }
 
-    // The cameras' world transforms follow at once, as the game skips its scene update while paused.
+    // How far the game's own sky camera rotation is from the world camera's, once the game has updated both.
+    auto root       = CreationEngineSingletonManager::GetSceneGraphRoot();
+    auto starfield  = root ? root->starfieldScene.pStarFieldCamera : nullptr;
+    static int checks = 0;
+    if (starfield != nullptr && checks < 3 && vr->m_engine_frame_count % 300 == 0) {
+        ++checks;
+        float difference = 0.0f;
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                difference = std::max(difference, std::fabs(starfield->local.rotate.entry[r][c] - worldCamera->world.rotate.entry[r][c]));
+            }
+        }
+        spdlog::info("[Sky] Starfield camera rotation differs from the world camera's by {:.4f}", difference);
+    }
+
+    // The cameras' world transforms follow at once, as the game skips its scene update while paused. The sky cameras
+    // take the world camera's rotation as the game gives it to them.
     for (auto camera : { worldCamera, right_camera, left_camera }) {
         if (camera != nullptr && camera->parent != nullptr) {
             RE::NiUpdateData data{};
             camera->UpdateWorldData(&data);
+        }
+    }
+    for (auto sky : { starfield, root ? root->starfieldScene.pGalaxyCamera : nullptr }) {
+        if (sky != nullptr) {
+            sky->local.rotate = worldCamera->world.rotate;
+            RE::NiUpdateData data{};
+            sky->UpdateWorldData(&data);
         }
     }
 }
