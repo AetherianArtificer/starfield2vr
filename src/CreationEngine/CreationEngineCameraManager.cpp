@@ -204,6 +204,11 @@ CreationEngineCameraManager::onScaleformSetViewPortInternal(uintptr_t *thisMovie
 
     auto width_multiplier = settings.hud_scale;
     auto height_multiplier = settings.hud_scale;
+    // The floating HUD panel gets the whole UI layer; its size in the world is set on the panel.
+    if (vr->is_native_hud_panel()) {
+        width_multiplier = 1.0f;
+        height_multiplier = 1.0f;
+    }
 
     if (side_by_side) {
         auto visible_height = std::min((int) ((float) backbuffer_size[1] * height_multiplier), viewport_buffer_height);

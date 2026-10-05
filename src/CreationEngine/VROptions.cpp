@@ -82,8 +82,9 @@ VROptions::VROptions()
     add(kStereoRendering, kCategoryDisplay, Kind::Choice, "StereoRenderingV3", "Stereo Rendering",
         "Native renders both eyes every frame from the same moment. Alternate Eye renders one eye per frame; use it if Native misbehaves.",
         { "Native", "Alternate Eye" }, 0);
-    add(kStereoHud, kCategoryDisplay, Kind::Choice, "NativeHudModeV2", "Native HUD Mode",
-        "How the HUD and menus are drawn with Native stereo rendering.", { "Both Eyes", "Left Eye Only" }, 0);
+    add(kStereoHud, kCategoryDisplay, Kind::Choice, "HudPlacement", "HUD Placement",
+        "Floating Panel shows the HUD on a panel in front of you that recentres when you turn away. Head Locked keeps it fixed in your view.",
+        { "Floating Panel", "Head Locked" }, 0);
     add(kStereoLayout, kCategoryDisplay, Kind::Choice, "NativeEyeLayoutV2", "Native Eye Layout",
         "Full Frame renders each eye over the whole frame, one after the other. Side By Side renders both eyes into halves of a double-width frame.",
         { "Full Frame", "Side By Side" }, 0);
@@ -213,13 +214,19 @@ void VROptions::apply() const
     s.fingerPoses          = get(kFingerPoses) != 0;
     s.stereoMode           = get(kStereoRendering) == 0 ? 1 : 2;
     s.nativeStereo         = s.stereoMode == 1;
-    s.stereoHudBothEyes    = get(kStereoHud) == 0;
+    s.stereoHudBothEyes    = true;
+    s.hudPanel             = get(kStereoHud) == 0;
     s.stereoDoubleWidth    = get(kStereoLayout) == 1;
     s.nativeLeftGraphFirst = get(kNativeGraphOrder) == 1;
 
     auto& hud       = GameFlow::gStore.hudSettings;
     hud.hudScale    = Pick(kHudSizes, get(kHudSize));
     hud.perspective = Pick(kHudDepths, get(kHudDepth));
+    // The floating panel spans 40, 50 or 60 degrees at 1.2, 2 or 3 metres.
+    constexpr std::array<float, 3> kHudPanelAngles{ 40.0f, 50.0f, 60.0f };
+    constexpr std::array<float, 3> kHudPanelDistances{ 1.2f, 2.0f, 3.0f };
+    s.hudPanelDistance = Pick(kHudPanelDistances, get(kHudDepth));
+    s.hudPanelWidth    = 2.0f * s.hudPanelDistance * std::tan(glm::radians(Pick(kHudPanelAngles, get(kHudSize))) * 0.5f);
 
     ModConstants::dominantEye      = get(kDominantEye);
     ModConstants::headTrackingType = get(kAimWith);

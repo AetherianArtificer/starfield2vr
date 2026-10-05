@@ -481,6 +481,8 @@ void StereoViewModule::OnFrameStart()
     if (native) {
         DisableFrameGeneration();
     }
+    const auto& settings = GameFlow::gStore.internalSettings;
+    vr->set_native_hud_panel(native && !m_double_width && settings.hudPanel, settings.hudPanelWidth, settings.hudPanelDistance);
     if (!native) {
         m_missed_appends = 0;
         vr->set_native_mono_frame(false);
