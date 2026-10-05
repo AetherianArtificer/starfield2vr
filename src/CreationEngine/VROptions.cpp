@@ -84,9 +84,9 @@ VROptions::VROptions()
         { "Native", "Alternate Eye" }, 0);
     add(kStereoHud, kCategoryDisplay, Kind::Choice, "NativeHudModeV2", "Native HUD Mode",
         "How the HUD and menus are drawn with Native stereo rendering.", { "Both Eyes", "Left Eye Only" }, 0);
-    add(kStereoLayout, kCategoryDisplay, Kind::Choice, "NativeEyeLayout", "Native Eye Layout",
-        "How Native stereo rendering fits both eyes into the game window. Double Width is sharper; Window Width works when the game cannot use a wider window.",
-        { "Window Width", "Double Width" }, 1);
+    add(kStereoLayout, kCategoryDisplay, Kind::Choice, "NativeEyeLayoutV2", "Native Eye Layout",
+        "Full Frame renders each eye over the whole frame, one after the other. Side By Side renders both eyes into halves of a double-width frame.",
+        { "Full Frame", "Side By Side" }, 0);
     add(kNativeGraphOrder, kCategoryDisplay, Kind::Choice, "NativeGraphOrder", "Native Eye Order (Test)",
         "Which eye's render graph runs first with Native stereo rendering.", { "Right Eye First", "Left Eye First" }, 0);
     add(kNativeRenewRightCamera, kCategoryDisplay, Kind::Action, "", "Renew Right Eye Camera (Test)",

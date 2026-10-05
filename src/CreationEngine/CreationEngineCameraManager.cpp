@@ -188,9 +188,10 @@ CreationEngineCameraManager::onScaleformSetViewPortInternal(uintptr_t *thisMovie
     if (!vr->is_hmd_active()) {
         return;
     }
+    const bool side_by_side = vr->is_native_stereo() && StereoViewModule::Get()->SideBySide();
     if (ModSettings::showFlatScreenDisplay()) {
         // The flat menu screen shows the left half of a side-by-side buffer.
-        if (vr->is_native_stereo()) {
+        if (side_by_side) {
             viewport->left = 0;
             viewport->top = 0;
             viewport->width = viewport_buffer_width / 2;
@@ -203,7 +204,7 @@ CreationEngineCameraManager::onScaleformSetViewPortInternal(uintptr_t *thisMovie
     auto width_multiplier = settings.hud_scale;
     auto height_multiplier = settings.hud_scale;
 
-    if (vr->is_native_stereo()) {
+    if (side_by_side) {
         auto visible_height = std::min((int) ((float) backbuffer_size[1] * height_multiplier), viewport_buffer_height);
         viewport->height = visible_height;
         viewport->top = (int) (viewport_buffer_height - visible_height) / 2;

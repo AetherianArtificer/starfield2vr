@@ -353,6 +353,12 @@ void StereoViewModule::InstallHooks()
         m_scaleform_composite_hook = std::make_unique<FunctionHook>(vtable[7], reinterpret_cast<uintptr_t>(&onScaleformComposite));
         m_scaleform_composite_hook->create();
     }
+    if (auto vtable = reinterpret_cast<uintptr_t*>(MemoryScan::VTable("HDRCompositeRenderPass", ".?AVHDRCompositeRenderPass@CreationRendererPrivate@@", 0))) {
+        m_hdr_composite_hook = std::make_unique<FunctionHook>(vtable[7], reinterpret_cast<uintptr_t>(&onHdrComposite));
+        m_hdr_composite_hook->create();
+    } else {
+        spdlog::error("[Stereo] HDRCompositeRenderPass not found; full-frame eyes cannot be captured");
+    }
     if (auto vtable = reinterpret_cast<uintptr_t*>(
             MemoryScan::VTable("CopyToRenderGraphOutputRenderPass", ".?AVCopyToRenderGraphOutputRenderPass@CreationRendererPrivate@@", 0))) {
         m_copy_to_output_hook = std::make_unique<FunctionHook>(vtable[7], reinterpret_cast<uintptr_t>(&onCopyToRenderGraphOutput));
@@ -467,11 +473,12 @@ void StereoViewModule::OnFrameStart()
     const auto backbuffer = vr->get_backbuffer_size();
     const auto eye_width  = (uint32_t)vr->get_hmd_width();
     const bool buffer_ready = double_width ? eye_width > 0 && backbuffer[0] + 8 >= eye_width * 2 : backbuffer[0] > 0;
+    vr->set_native_full_frame(!double_width);
     vr->request_native_stereo(requested && m_registered && buffer_ready);
 
     const bool native = vr->is_native_stereo();
     UpdateMenuFallback(native);
-    ApplyViewports(native);
+    ApplyViewports(native && m_double_width);
     ApplyNativeShadowSettings(native);
     if (!native) {
         m_missed_appends = 0;
@@ -595,6 +602,15 @@ void StereoViewModule::ApplyViewports(bool side_by_side)
         m_viewports_split = false;
         m_native_frames   = 0;
         spdlog::info("[Stereo] Views restored to full width");
+    }
+    if (!side_by_side) {
+        const float full[4]{ 0.0f, 1.0f, 1.0f, 0.0f };
+        for (auto camera : { m_left_camera, m_right_camera }) {
+            if (camera && (!SameRect(camera, kCameraViewport, full) || !SameRect(camera, kCameraScissors, full))) {
+                SetCameraRect(camera, offsets::NiCameraSetViewport(), full);
+                SetCameraRect(camera, offsets::NiCameraSetScissors(), full);
+            }
+        }
     }
 }
 
@@ -976,7 +992,7 @@ uintptr_t StereoViewModule::onScaleformComposite(void* pass, void* render_graph_
     static auto original = instance->m_scaleform_composite_hook->get_original<func_t>();
     static auto vr       = VR::get();
 
-    if (vr->is_native_stereo() && pass_data != nullptr && GameFlow::gStore.internalSettings.stereoHudBothEyes) {
+    if (vr->is_native_stereo() && instance->m_double_width && pass_data != nullptr && GameFlow::gStore.internalSettings.stereoHudBothEyes) {
         instance->MirrorHudToRightEye(render_graph_data, pass_data);
     }
     if (vr->is_native_stereo() && pass_data != nullptr && instance->m_composite_logs.fetch_add(1) < 4) {
@@ -1312,7 +1328,11 @@ uintptr_t StereoViewModule::onCopyToRenderGraphOutput(void* pass, void* render_g
     // The output copy writes into the view's scissor rect. Eye scissors stay full for culling, so for this pass the
     // scissor is narrowed to the eye's viewport and each eye lands in its own half.
     const auto viewport_id = render_graph_data ? At<uint32_t>(render_graph_data, 0x140) : 8u;
-    if (!vr->is_native_stereo() || viewport_id >= 8) {
+    static std::atomic<int> calls{ 0 };
+    if (vr->is_native_stereo() && calls.fetch_add(1) < 6) {
+        spdlog::info("[Stereo] Output copy pass: graph viewport {}, scene {:x}", viewport_id, instance->SceneOf(render_graph_data));
+    }
+    if (!vr->is_native_stereo() || !instance->m_double_width || viewport_id >= 8) {
         return original(pass, render_graph_data, pass_data);
     }
     auto rect = At<float*>(render_graph_data, 0x108 + 8 * (size_t)viewport_id);
@@ -1330,4 +1350,105 @@ uintptr_t StereoViewModule::onCopyToRenderGraphOutput(void* pass, void* render_g
     const auto result = original(pass, render_graph_data, pass_data);
     std::memcpy(rect + 4, scissors, sizeof(scissors));
     return result;
+}
+
+uintptr_t StereoViewModule::onHdrComposite(void* pass, void* render_graph_data, void* pass_data)
+{
+    static auto instance = Get();
+    using func_t         = uintptr_t(void*, void*, void*);
+    static auto original = instance->m_hdr_composite_hook->get_original<func_t>();
+    static auto vr       = VR::get();
+
+    const auto result = original(pass, render_graph_data, pass_data);
+    if (!vr->is_native_stereo() || instance->m_double_width || pass_data == nullptr) {
+        return result;
+    }
+    const auto scene = instance->SceneOf(render_graph_data) & 0xFFFFFF;
+    if (scene == (instance->m_left_view_id & 0xFFFFFF)) {
+        instance->CaptureEyeImage(0, render_graph_data, pass_data);
+    } else if (scene == (instance->m_right_view_id & 0xFFFFFF)) {
+        instance->CaptureEyeImage(1, render_graph_data, pass_data);
+    } else if (instance->m_capture_logs.load() < 24) {
+        ++instance->m_capture_logs;
+        spdlog::info("[Stereo] Tonemap pass for scene {:x} belongs to no eye (left {:x}, right {:x})", scene, instance->m_left_view_id, instance->m_right_view_id);
+    }
+    return result;
+}
+
+void StereoViewModule::CaptureEyeImage(uint32_t eye, void* render_graph_data, void* pass_data)
+{
+    static auto vr    = VR::get();
+    auto        data  = static_cast<RE::CreationRendererPrivate::RenderPassData*>(pass_data);
+    auto        graph = static_cast<RE::CreationRendererPrivate::RenderGraphData*>(render_graph_data);
+    if (data->renderPassItems == nullptr) {
+        return;
+    }
+    auto context = reinterpret_cast<RE::RenderGraphDataD3D12Context*>(graph->getCommandList());
+    if (context == nullptr || context->pID3D12CommandList == nullptr) {
+        return;
+    }
+    auto command_list = context->pID3D12CommandList;
+
+    // The tonemapped scene is the largest texture the pass writes.
+    const bool     log   = m_capture_logs.fetch_add(1) < 8;
+    const uint32_t count = (uint32_t)data->renderPassItems->_size;
+    ID3D12Resource*       output{ nullptr };
+    D3D12_RESOURCE_STATES output_state{};
+    for (uint32_t i = 0; i < count && i < 16; ++i) {
+        auto item     = data->getRenderPassItemByIndex(i);
+        auto resource = data->getNativeResourceByIndex(i);
+        if (item == nullptr || resource == nullptr) {
+            continue;
+        }
+        const auto desc  = resource->GetDesc();
+        const auto state = (D3D12_RESOURCE_STATES)RE::CreationRendererPrivate::RenderPassItem::getDXGIState(item->stateOrFlags);
+        if (log) {
+            spdlog::info("[Stereo] Tonemap pass ({} eye) resource {}: {:p} {}x{} format {} state {:x}", eye == 0 ? "left" : "right", i, (void*)resource, desc.Width,
+                         desc.Height, (uint32_t)desc.Format, (uint32_t)state);
+        }
+        const bool written = (state & (D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) != 0;
+        if (!written || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 || desc.Width < 256) {
+            continue;
+        }
+        if (output == nullptr || desc.Width * desc.Height > output->GetDesc().Width * output->GetDesc().Height) {
+            output       = resource;
+            output_state = state;
+        }
+    }
+    if (output == nullptr) {
+        if (log) {
+            spdlog::warn("[Stereo] Tonemap pass ({} eye) wrote no texture to capture", eye == 0 ? "left" : "right");
+        }
+        return;
+    }
+
+    const auto desc    = output->GetDesc();
+    auto&      capture = m_eye_capture[eye];
+    if (capture == nullptr || capture->GetDesc().Width != desc.Width || capture->GetDesc().Height != desc.Height || capture->GetDesc().Format != desc.Format) {
+        capture.Reset();
+        auto capture_desc  = CD3DX12_RESOURCE_DESC::Tex2D(desc.Format, desc.Width, desc.Height, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        const CD3DX12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
+        auto device = g_framework->get_d3d12_hook()->get_device();
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &capture_desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&capture)))) {
+            spdlog::error("[Stereo] Failed to create the {} eye capture texture", eye == 0 ? "left" : "right");
+            return;
+        }
+        capture->SetName(eye == 0 ? L"Native stereo left eye capture" : L"Native stereo right eye capture");
+        spdlog::info("[Stereo] {} eye captured from the tonemap output {}x{} format {}", eye == 0 ? "Left" : "Right", desc.Width, desc.Height, (uint32_t)desc.Format);
+    }
+
+    D3D12_RESOURCE_BARRIER to_copy[]{
+        CD3DX12_RESOURCE_BARRIER::Transition(output, output_state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        CD3DX12_RESOURCE_BARRIER::Transition(capture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+    };
+    command_list->ResourceBarrier(2, to_copy);
+    CD3DX12_TEXTURE_COPY_LOCATION dst{ capture.Get(), 0 };
+    CD3DX12_TEXTURE_COPY_LOCATION src{ output, 0 };
+    command_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    D3D12_RESOURCE_BARRIER restore[]{
+        CD3DX12_RESOURCE_BARRIER::Transition(output, D3D12_RESOURCE_STATE_COPY_SOURCE, output_state),
+        CD3DX12_RESOURCE_BARRIER::Transition(capture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+    };
+    command_list->ResourceBarrier(2, restore);
+    vr->set_native_eye_source(eye, capture.Get());
 }

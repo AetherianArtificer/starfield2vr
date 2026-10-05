@@ -37,6 +37,8 @@ public:
     [[nodiscard]] RE::NiCamera* LeftCamera() const { return m_left_camera; }
     // The back buffer should be two eyes wide (Double Width layout).
     [[nodiscard]] bool WantsSideBySide() const { return m_wants_side_by_side; }
+    // Side by side splits one double-width frame between the eyes; otherwise each eye renders the whole frame.
+    [[nodiscard]] bool SideBySide() const { return m_double_width; }
     // Eye a camera renders in native stereo: 0 left, 1 right, -1 not an eye camera.
     [[nodiscard]] int EyeOf(const RE::NiCamera* camera) const;
 
@@ -104,6 +106,8 @@ public:
     static uintptr_t onExecuteChildPass(void* graph, void* render_graph_data, void* container);
     static uintptr_t onScaleformComposite(void* pass, void* render_graph_data, void* pass_data);
     static uintptr_t onCopyToRenderGraphOutput(void* pass, void* render_graph_data, void* pass_data);
+    static uintptr_t onHdrComposite(void* pass, void* render_graph_data, void* pass_data);
+    void             CaptureEyeImage(uint32_t eye, void* render_graph_data, void* pass_data);
     static bool      onIsPrimarySceneView(void* view);
     static uintptr_t onSubmitRenderGraph(void* frame_list, void* record);
     bool             RegisterRightGraph();
@@ -117,6 +121,10 @@ private:
     std::unique_ptr<FunctionHook> m_execute_child_hook{};
     std::unique_ptr<FunctionHook> m_scaleform_composite_hook{};
     std::unique_ptr<FunctionHook> m_copy_to_output_hook{};
+    std::unique_ptr<FunctionHook> m_hdr_composite_hook{};
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> m_eye_capture{};
+    std::array<bool, 2>                                   m_eye_capture_ready{};
+    std::atomic<int>                                      m_capture_logs{ 0 };
     std::unique_ptr<FunctionHook> m_primary_view_hook{};
     // The right eye renders in its own render graph, so it never shares the left eye's working buffers.
     std::unique_ptr<FunctionHook> m_submit_graph_hook{};
