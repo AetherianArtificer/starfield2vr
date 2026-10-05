@@ -4,6 +4,9 @@
 #include <cmath>
 #include <algorithm>
 #include "ModSettingsStore.h"
+#include <CreationEngine/memory/ScanHelper.h>
+#include <RE/B/BSFixedString.h>
+#include <windows.h>
 #include "RE/P/PlayerCamera.h"
 #include <CreationEngine/CreationEngineSingletonManager.h>
 #include <mods/VR.hpp>
@@ -72,6 +75,125 @@ namespace GameFlow
             }
             loading_seen_this_frame = false;
         }
+    }
+
+    namespace
+    {
+        // The UI singleton: the global pointing at the object whose vtable is UI's.
+        uint8_t** FindUiSingleton()
+        {
+            const auto vtable = MemoryScan::VTable("UI", ".?AVUI@@", 0);
+            if (vtable == 0) {
+                return nullptr;
+            }
+            const auto base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+            const auto nt   = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
+            auto       sec  = IMAGE_FIRST_SECTION(nt);
+            for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+                if (std::strncmp(reinterpret_cast<const char*>(sec->Name), ".data", 8) != 0) {
+                    continue;
+                }
+                auto slots = reinterpret_cast<uint8_t**>(base + sec->VirtualAddress);
+                for (size_t n = 0; n < sec->Misc.VirtualSize / sizeof(void*); ++n) {
+                    auto candidate = slots[n];
+                    if (candidate == nullptr || (reinterpret_cast<uintptr_t>(candidate) & 7) != 0 ||
+                        (candidate >= base && candidate < base + nt->OptionalHeader.SizeOfImage)) {
+                        continue;
+                    }
+                    MEMORY_BASIC_INFORMATION info{};
+                    if (VirtualQuery(candidate, &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_READWRITE | PAGE_READONLY)) == 0) {
+                        continue;
+                    }
+                    if (*reinterpret_cast<uintptr_t*>(candidate) == vtable) {
+                        return &slots[n];
+                    }
+                }
+            }
+            return nullptr;
+        }
+
+        // The open menus' names, read under a fault guard; false when the stack does not hold menus (a layout mismatch).
+        bool ReadMenuNames(uint8_t* ui, const char** names, uint32_t& count)
+        {
+            const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+            const auto end  = base + reinterpret_cast<IMAGE_NT_HEADERS64*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew)->OptionalHeader.SizeOfImage;
+            __try {
+                const auto size  = *reinterpret_cast<uint32_t*>(ui + 0x3F0);
+                const auto menus = *reinterpret_cast<uint8_t***>(ui + 0x3F8);
+                if (size > 64 || (size > 0 && menus == nullptr)) {
+                    return false;
+                }
+                count = 0;
+                for (uint32_t i = 0; i < size; ++i) {
+                    const auto vtable = *reinterpret_cast<uintptr_t*>(menus[i]);
+                    if (vtable < base || vtable >= end) {
+                        return false;
+                    }
+                    names[count++] = reinterpret_cast<RE::BSFixedString*>(menus[i] + 0xB0)->c_str();
+                }
+                return true;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return false;
+            }
+        }
+
+        // Menus shown on the flat screen; others (the HUD, dialogue, scopes, faders) keep the 3D view.
+        bool IsFullscreenMenu(std::string_view name)
+        {
+            static constexpr std::string_view kMenus[]{
+                "MainMenu", "PauseMenu", "LoadingMenu", "MessageBoxMenu", "InventoryMenu", "DataMenu", "SkillsMenu", "StarMapMenu", "GalaxyStarMapMenu",
+                "WorkshopMenu", "ResearchMenu", "WeaponsCraftingMenu", "ArmorCraftingMenu", "IndustrialCraftingMenu", "DrugsCraftingMenu",
+                "SpaceshipEditorMenu", "ShipCrewMenu",
+            };
+            return std::find(std::begin(kMenus), std::end(kMenus), name) != std::end(kMenus);
+        }
+    }
+
+    bool isFullscreenMenuOpen()
+    {
+        static uint8_t** singleton = [] {
+            auto found = FindUiSingleton();
+            if (found == nullptr) {
+                spdlog::error("[GameFlow] UI singleton not found; fullscreen menus will not switch to the flat screen");
+            } else {
+                spdlog::info("[GameFlow] UI singleton at {:x}", reinterpret_cast<uintptr_t>(found) - reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)));
+            }
+            return found;
+        }();
+        if (singleton == nullptr || *singleton == nullptr) {
+            return false;
+        }
+        // The menu stack: size at 0x3F0, entries at 0x3F8, each a menu with its name at 0xB0.
+        static bool layout_ok = true;
+        const char* raw[64]{};
+        uint32_t    count = 0;
+        if (!layout_ok) {
+            return false;
+        }
+        if (!ReadMenuNames(*singleton, raw, count)) {
+            layout_ok = false;
+            spdlog::error("[GameFlow] The UI menu stack does not hold menus at the expected offsets; fullscreen menus will not switch to the flat screen");
+            return false;
+        }
+        bool                     fullscreen = false;
+        std::vector<std::string> names;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (raw[i] == nullptr) {
+                continue;
+            }
+            names.emplace_back(raw[i]);
+            fullscreen |= IsFullscreenMenu(raw[i]);
+        }
+        static std::vector<std::string> last_names;
+        if (names != last_names) {
+            std::string list;
+            for (const auto& n : names) {
+                list += (list.empty() ? "" : ", ") + n;
+            }
+            spdlog::info("[GameFlow] Open menus: {}{}", list.empty() ? "none" : list, fullscreen ? " (flat screen)" : "");
+            last_names = std::move(names);
+        }
+        return fullscreen;
     }
 
     void resetGameState() {

@@ -90,10 +90,7 @@ void CreationEngineRendererModule::RenderGraphStart(RE::CreationRendererPrivate:
     }
     if (m_startFramePass == pGraph && before) {
         GameFlow::resetGameState();
-        // Menus are not drawn on every render frame, so one counts as shown until it has been gone for a few frames.
-        static int frames_without_menu = 0;
-        frames_without_menu = GameFlow::isShowingMenu() ? 0 : frames_without_menu + 1;
-        ModSettings::g_internalSettings.showQuadDisplay = frames_without_menu < 10;
+        ModSettings::g_internalSettings.showQuadDisplay = GameFlow::isShowingMenu();
     }
 }
 
@@ -215,8 +212,8 @@ uintptr_t CreationEngineRendererModule::setReflexMarkerInternal(uintptr_t rcx, u
         vr->on_wait_rendering(oldFrameIndex);
         PerfStats::AddCpu(PerfStats::CpuSpan::kVrWait, since(start));
         vr->m_engine_frame_count = oldFrameIndex;
-        // One menu decision per frame: the render thread updates its flag while the game thread runs ahead.
-        ModSettings::g_internalSettings.showQuadDisplayFrame = ModSettings::g_internalSettings.showQuadDisplay;
+        // One menu decision per frame, from the game's open menus.
+        ModSettings::g_internalSettings.showQuadDisplayFrame = GameFlow::isFullscreenMenuOpen();
         vr->set_frame_flat(ModSettings::showFlatScreenDisplay());
         start = clock::now();
         vr->on_begin_rendering(oldFrameIndex);

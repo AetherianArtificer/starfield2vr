@@ -35,6 +35,9 @@ namespace GameFlow {
     void renderMenu(std::string_view menuNameHash);
     MenuSettings getMenuSettings(std::string_view menuNameHash);
     bool isShowingMenu();
+
+    // Whether a fullscreen menu is open in the game's menu stack. Game thread.
+    bool isFullscreenMenuOpen();
     bool isPilotingShip();
     bool isAimingDownSights();
     bool isWeaponDrawn();
