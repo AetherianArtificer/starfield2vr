@@ -56,7 +56,6 @@ public:
         kMatchBodyHeight,
         kHudPlacement,
         kEyeScreenshots,
-        kFoveatedRendering,
 
         kFirstId = 8600,
         kLastId  = 8699,

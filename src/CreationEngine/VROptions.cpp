@@ -75,9 +75,6 @@ VROptions::VROptions()
     add(kRenderResolution, kCategoryDisplay, Kind::Choice, "RenderResolution", "Render Resolution",
         "Resolution rendered for the headset. Lower it if the frame rate drops.",
         { "70%", "80%", "90%", "100%", "110%", "120%", "130%", "150%" }, 3);
-    add(kFoveatedRendering, kCategoryDisplay, Kind::Choice, "FoveatedRendering", "Foveated Rendering",
-        "Shade the edges of your view, where the lenses blur anyway, at a lower rate to raise the frame rate. Stronger saves more but the edges look softer.",
-        { "Off", "Light", "Balanced", "Strong" }, 2);
     add(kWorldScale, kCategoryDisplay, Kind::Choice, "WorldScale", "World Scale", "Make the world feel larger or smaller around you.",
         { "90%", "95%", "100%", "105%", "110%" }, 2);
     add(kMatchBodyHeight, kCategoryDisplay, Kind::Toggle, "MatchBodyHeight", "Match Body Height",
@@ -215,7 +212,6 @@ void VROptions::apply() const
     s.bodyTracking         = get(kBodyTracking) != 0;
     s.handTracking         = get(kHandTracking) != 0;
     s.hudPanel             = get(kHudPlacement) == 0;
-    s.foveation            = get(kFoveatedRendering);
 
     auto& hud       = GameFlow::gStore.hudSettings;
     hud.hudScale    = Pick(kHudSizes, get(kHudSize));
