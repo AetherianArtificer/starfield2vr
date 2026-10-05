@@ -154,8 +154,9 @@ namespace body
             bool torso{ false };
             bool elbow[2]{};
             bool legs{ false };
-            bool fingers[2]{};
-            int  hand_source[2]{};
+            bool  fingers[2]{};
+            int   hand_source[2]{};
+            float index_bend[2]{ -1.0f, -1.0f };
         };
         TrackingDiag g_track_diag;
 
@@ -1515,10 +1516,19 @@ namespace body
         {
             const auto& hand = g_tracked_hands[side];
             const auto& body = side == 0 ? g_bones.left.shape : g_bones.right.shape;
-            if (!GameFlow::gStore.internalSettings.handTracking || !hand.active || !body.valid) {
+            auto at = [&](int i) { return glm::vec3{ hand.joints[i].position }; };
+            // Index bend of the tracked hand (intermediate joint), for comparing a controller-derived hand with the trigger.
+            g_track_diag.index_bend[side] = -1.0f;
+            if (hand.active && hand.joints[7].position_valid && hand.joints[8].position_valid && hand.joints[9].position_valid) {
+                const auto a = glm::normalize(at(8) - at(7));
+                const auto b = glm::normalize(at(9) - at(8));
+                g_track_diag.index_bend[side] = glm::degrees(std::acos(std::clamp(glm::dot(a, b), -1.0f, 1.0f)));
+            }
+            // Only an optically tracked hand adds information; with a controller held, the controller's own touch and
+            // analog inputs drive the fingers and a held weapon keeps its grip.
+            if (!GameFlow::gStore.internalSettings.handTracking || !hand.active || hand.data_source != 1 || !body.valid) {
                 return false;
             }
-            auto at = [&](int i) { return glm::vec3{ hand.joints[i].position }; };
             for (const int i : { 1, 3, 12 }) {
                 if (!hand.joints[i].position_valid) {
                     return false;
@@ -2002,9 +2012,10 @@ namespace body
                         g_walk.state, g_walk.speed, g_lean_applied, glm::degrees(g_facing_yaw), g_diag.support_held, g_diag.support_distance, g_finger_diag[1].trigger,
                         g_finger_diag[1].grip, g_finger_diag[1].thumb, g_finger_diag[1].copied, g_finger_diag[0].trigger, g_finger_diag[0].grip,
                         g_finger_diag[0].thumb, g_finger_diag[0].copied);
-                    spdlog::info("[BodyIK] tracking: body supported {} active {} valid {} | torso {} elbows L {} R {} legs {} | fingers L {} (src {}) R {} (src {})",
+                    spdlog::info("[BodyIK] tracking: body supported {} active {} valid {} | torso {} elbows L {} R {} legs {} | fingers L {} (src {} bend {:.0f}) R {} (src {} bend {:.0f}) trigger R {:.2f}",
                         g_track_diag.supported, g_track_diag.active, g_track_diag.valid, g_track_diag.torso, g_track_diag.elbow[0], g_track_diag.elbow[1],
-                        g_track_diag.legs, g_track_diag.fingers[0], g_track_diag.hand_source[0], g_track_diag.fingers[1], g_track_diag.hand_source[1]);
+                        g_track_diag.legs, g_track_diag.fingers[0], g_track_diag.hand_source[0], g_track_diag.index_bend[0], g_track_diag.fingers[1],
+                        g_track_diag.hand_source[1], g_track_diag.index_bend[1], g_finger_diag[1].trigger);
                 }
             }
             return result;
