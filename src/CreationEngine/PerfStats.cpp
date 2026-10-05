@@ -1,5 +1,6 @@
 #include "PerfStats.h"
 #include "GpuQueueTiming.h"
+#include "RenderPassProfiler.h"
 
 #include <Framework.hpp>
 #include <algorithm>
@@ -220,6 +221,7 @@ namespace PerfStats
 
         CollectGpu();
         GpuQueueTiming::OnPresent();
+        RenderPassProfiler::OnPresent();
         g_frame_ms.push_back(std::chrono::duration<float, std::milli>(now - g_last_present).count());
         g_last_present = now;
 

@@ -4,6 +4,7 @@
 #include "CreationEngineSettings.h"
 #include "CreationEngineSingletonManager.h"
 #include "PerfStats.h"
+#include "RenderPassProfiler.h"
 #include "ModSettings.h"
 #include <CreationEngine/memory/offsets.h>
 #include <CreationEngine/memory/stereo_offsets.h>
@@ -413,6 +414,14 @@ void StereoViewModule::OnFrameStart()
 {
     static auto vr = VR::get();
 
+    // Every pass is hooked once the device exists, after this module's own pass hooks.
+    static bool profiler_installed = false;
+    if (!profiler_installed && g_framework->get_d3d12_hook() && g_framework->get_d3d12_hook()->get_device()) {
+        profiler_installed = true;
+        RenderPassProfiler::Install();
+    }
+    RenderPassProfiler::SetShareShadows(GameFlow::gStore.internalSettings.shareShadows);
+
     // Native presentation runs whenever the headset is active; until both eye views exist both eyes show the frame.
     const bool active = vr->is_hmd_active();
     vr->request_native_stereo(active);
@@ -667,6 +676,7 @@ uintptr_t StereoViewModule::RunUpscalerPass(int pass_kind, void* pass, void* ren
     UpscalerAfrNvidiaModule::set_secondary_view(right);
     UpscalerAfrNvidiaModule::set_in_upscaler_pass(true);
     auto result = original(pass, render_graph_data, pass_data);
+    RenderPassProfiler::MarkPass(pass, render_graph_data);
     UpscalerAfrNvidiaModule::set_in_upscaler_pass(false);
     UpscalerAfrNvidiaModule::set_secondary_view(false);
     if (pass_kind == kDLSSUpscale) {
@@ -697,7 +707,9 @@ uintptr_t StereoViewModule::onScaleformComposite(void* pass, void* render_graph_
     if (vr->is_native_stereo() && pass_data != nullptr) {
         instance->CaptureUiLayer(render_graph_data, pass_data);
     }
-    return original(pass, render_graph_data, pass_data);
+    const auto result = original(pass, render_graph_data, pass_data);
+    RenderPassProfiler::MarkPass(pass, render_graph_data);
+    return result;
 }
 
 bool StereoViewModule::RegisterRightGraph()
@@ -1018,6 +1030,7 @@ uintptr_t StereoViewModule::RunLatePass(int pass_kind, void* pass, void* render_
     static auto vr       = VR::get();
 
     const auto result = original(pass, render_graph_data, pass_data);
+    RenderPassProfiler::MarkPass(pass, render_graph_data);
     if (!vr->is_native_stereo() || pass_data == nullptr) {
         return result;
     }

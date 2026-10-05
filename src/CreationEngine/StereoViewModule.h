@@ -18,6 +18,8 @@ namespace RE
 class StereoViewModule
 {
 public:
+    // The eye whose graph the render graph data belongs to: 0 left, 1 right, -1 neither.
+    [[nodiscard]] int EyeOfGraphPublic(void* render_graph_data) const { return EyeOfGraph(render_graph_data); }
     static StereoViewModule* Get()
     {
         static auto instance(new StereoViewModule);
