@@ -47,13 +47,13 @@ namespace body
         };
         State g_state;
 
-        // The first-person pass stamps the frame it last ran; its arms are used only while it keeps running.
+        // The first-person pass stamps the frame it last ran (diagnostics).
         std::atomic<int> g_fp_last_frame{ -1000 };
         int              g_frame_counter{ 0 };
 
         bool FirstPersonArmsLive()
         {
-            return GameFlow::gStore.internalSettings.firstPersonArms && g_frame_counter - g_fp_last_frame.load() < 5;
+            return GameFlow::gStore.internalSettings.firstPersonArms;
         }
         std::atomic<RE::NiAVObject*> g_body_muzzle{ nullptr };
 
@@ -316,11 +316,15 @@ namespace body
             {
                 const auto pose_space = Compose(Inverse(to_world), desired);
                 const auto result     = Compose(Inverse(ParentWorld(i)), pose_space);
-                bool       finite     = std::isfinite(result.s) && result.s > 0.0f && result.s < 10.0f && glm::length(result.t) < 10.0f;
+                bool       finite     = std::isfinite(result.s);
                 for (int a = 0; a < 3 && finite; ++a) {
                     finite = std::isfinite(result.t[a]) && std::isfinite(result.r[a][0]) && std::isfinite(result.r[a][1]) && std::isfinite(result.r[a][2]);
                 }
-                if (finite) {
+                if (!finite) {
+                    spdlog::error("[BodyIK] non-finite transform computed for pose bone {}", i);
+                    return;
+                }
+                {
                     auto [entry, first] = (*g_written_active).try_emplace(i);
                     if (first) {
                         entry->second.animated = local[i];
@@ -2106,8 +2110,9 @@ namespace body
             for (int guard = 0; branch >= pose.top && guard < 64; ++guard) {
                 branch = pose.parent[branch];
             }
-            if (branch < 0 || branch >= pose.top || g_fp_diag.attach_offset > 2.0f) {
-                return;  // unexpected layout or spaces disagree; leave the rig as the game posed it
+            if (branch < 0 || branch >= pose.top) {
+                spdlog::error("[BodyIK] first-person rig: no top-level branch above R_Clavicle");
+                return;
             }
             const auto move = Compose(body, Inverse(rig));
             pose.SetGameWorld(branch, Compose(move, pose.GameWorld(branch)));
