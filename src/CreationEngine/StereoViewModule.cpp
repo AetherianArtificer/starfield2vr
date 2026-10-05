@@ -439,6 +439,18 @@ void StereoViewModule::OnFrameStart()
     MirrorMainView();
     UpdateEyeFrustums();
 
+    // The eyes' separation in the game world against the headset's, now and then.
+    static int separation_frames = 0;
+    if (++separation_frames % 900 == 1 && m_left_camera && m_right_camera) {
+        const auto& l = m_left_camera->world.translate;
+        const auto& r = m_right_camera->world.translate;
+        const float game = std::sqrt((l.x - r.x) * (l.x - r.x) + (l.y - r.y) * (l.y - r.y) + (l.z - r.z) * (l.z - r.z));
+        const auto  hmd_l = vr->get_eye_transform(VRRuntime::Eye::LEFT)[3];
+        const auto  hmd_r = vr->get_eye_transform(VRRuntime::Eye::RIGHT)[3];
+        const float hmd = glm::length(glm::vec3{ hmd_r } - glm::vec3{ hmd_l });
+        spdlog::info("[Stereo] Eye cameras {:.4f} apart in the game world; headset eyes {:.4f} m apart", game, hmd);
+    }
+
     // Without a fresh right eye graph this frame (a loading screen, a fullscreen menu) both eyes show the same image.
     m_missed_appends = m_appended.exchange(false) ? 0 : m_missed_appends + 1;
     vr->set_native_mono_frame(m_menu_fallback.load() || m_missed_appends > 1);
