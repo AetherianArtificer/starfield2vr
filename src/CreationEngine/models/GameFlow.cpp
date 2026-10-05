@@ -137,11 +137,11 @@ namespace GameFlow
             }
         }
 
-        // Menus shown on the flat screen; others (the HUD, dialogue, scopes, faders) keep the 3D view.
+        // Menus shown on the flat screen; others (the HUD, dialogue, popups, scopes, faders) keep the 3D view.
         bool IsFullscreenMenu(std::string_view name)
         {
             static constexpr std::string_view kMenus[]{
-                "MainMenu", "PauseMenu", "LoadingMenu", "MessageBoxMenu", "InventoryMenu", "DataMenu", "SkillsMenu", "StarMapMenu", "GalaxyStarMapMenu",
+                "MainMenu", "PauseMenu", "LoadingMenu", "InventoryMenu", "DataMenu", "SkillsMenu", "StarMapMenu", "GalaxyStarMapMenu",
                 "WorkshopMenu", "ResearchMenu", "WeaponsCraftingMenu", "ArmorCraftingMenu", "IndustrialCraftingMenu", "DrugsCraftingMenu",
                 "SpaceshipEditorMenu", "ShipCrewMenu",
             };
