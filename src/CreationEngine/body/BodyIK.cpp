@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -1191,13 +1192,6 @@ namespace body
             return g_facing_yaw;
         }
 
-        struct NativeDiag
-        {
-            bool      native{ false };
-            glm::vec3 hand_in_weapon{};
-        };
-        NativeDiag g_native_diag;
-
         // Where the drawn hand and weapon ended up against where they were placed (read from the scene next frame).
         struct HandCheck
         {
@@ -1813,15 +1807,9 @@ namespace body
 
         void UpdateWeaponActions(const Pose& pose, const std::optional<Xf>& weapon, bool drawn);
 
-        void ApplyIK(const Pose& pose)
+        // Crouch, torso and legs: everything that moves the chest, which the weapon and arms hang from.
+        void ApplyTorsoAndLegs(const Pose& pose)
         {
-            if ((*g_active_bones).head >= 0) {
-                pose.local[(*g_active_bones).head].scale = 0.0f;
-            }
-            MeasureHand(pose, (*g_active_bones).right, "right");
-            MeasureHand(pose, (*g_active_bones).left, "left");
-            MeasureElbow(pose, (*g_active_bones).right, "right");
-            MeasureElbow(pose, (*g_active_bones).left, "left");
             // Animated feet, captured before the pelvis moves (the feet hang below it).
             std::optional<std::pair<Xf, Xf>> feet;
             if ((*g_active_bones).left_leg.foot >= 0 && (*g_active_bones).right_leg.foot >= 0) {
@@ -1833,6 +1821,29 @@ namespace body
             }
             if (feet) {
                 ApplyLegs(pose, feet->first, feet->second);
+            }
+        }
+
+        // The weapon placed in the animation graph this frame, before the game's arm IK (see graph_stage).
+        struct StagedWeapon
+        {
+            bool held{ false };
+            Xf   weapon{};
+            bool support_held{ false };
+        };
+        StagedWeapon g_staged_weapon;
+
+        void ApplyIK(const Pose& pose, bool staged)
+        {
+            if ((*g_active_bones).head >= 0) {
+                pose.local[(*g_active_bones).head].scale = 0.0f;
+            }
+            MeasureHand(pose, (*g_active_bones).right, "right");
+            MeasureHand(pose, (*g_active_bones).left, "left");
+            MeasureElbow(pose, (*g_active_bones).right, "right");
+            MeasureElbow(pose, (*g_active_bones).left, "left");
+            if (!staged) {
+                ApplyTorsoAndLegs(pose);
             }
             MeasurePalmSide(pose, 0, (*g_active_bones).left.shape, (*g_active_bones).left.wrist);
             MeasurePalmSide(pose, 1, (*g_active_bones).right.shape, (*g_active_bones).right.wrist);
@@ -1857,191 +1868,32 @@ namespace body
                 }
                 return;
             }
-            std::optional<Xf>   held_weapon;
-            RE::NiAVObject*     first_weapon_node{ nullptr };
-            RE::NiAVObject*     first_right_wrist{ nullptr };
-            RE::NiAVObject*     first_left_wrist{ nullptr };
-
+            const std::optional<Xf> held_weapon = staged && g_staged_weapon.held ? std::optional<Xf>{ g_staged_weapon.weapon } : std::nullopt;
             g_support      = {};
-            g_native_diag  = {};
+            g_support.held = held_weapon && g_staged_weapon.support_held;
             auto& r = (*g_active_bones).right;
-            if (r.biceps >= 0 && r.forearm >= 0 && r.wrist >= 0 && r.shape.valid) {
+            {
+                auto       player = CreationEngineSingletonManager::GetPlayerRef();
+                const bool drawn  = player && player->IsWeaponDrawn();
+                g_body_muzzle     = drawn && (*g_active_bones).weapon_node ? FindDescendant((*g_active_bones).weapon_node, "ProjectileNode") : nullptr;
+                g_diag.weapon_aligned = held_weapon.has_value();
+                if (drawn && !held_weapon) {
+                    static std::chrono::steady_clock::time_point last{};
+                    if (const auto now = std::chrono::steady_clock::now(); now - last > std::chrono::seconds(1)) {
+                        last = now;
+                        spdlog::error("[Body] weapon drawn but not placed in the animation graph this frame (staged {})", staged);
+                    }
+                }
+            }
+            // A hand on the weapon is placed by the game's own arm IK (on R_HandIk); only a free hand is solved here.
+            if (!held_weapon && r.biceps >= 0 && r.forearm >= 0 && r.wrist >= 0 && r.shape.valid) {
                 const auto grip = HandWorld(tracking::GripPose(false));
                 const auto aim  = HandWorld(tracking::AimPose(false));
                 if (grip && aim) {
-                    auto wrist_target = WristTarget(pose, r, *aim, *grip);
-
-                    g_diag.weapon_aligned = false;
-                    auto player           = CreationEngineSingletonManager::GetPlayerRef();
-                    if (player && player->IsWeaponDrawn() && (*g_active_bones).weapon >= 0) {
-                        static RE::NiAVObject* first_root{ nullptr };
-                        static RE::NiAVObject* first_wrist{ nullptr };
-                        static RE::NiAVObject* first_left{ nullptr };
-                        static RE::NiAVObject* first_weapon{ nullptr };
-                        if (auto root = FirstPersonRoot(player); root != first_root) {
-                            first_root   = root;
-                            first_wrist  = root ? FindDescendant(root, "R_Wrist") : nullptr;
-                            first_left   = root ? FindDescendant(root, "L_Wrist") : nullptr;
-                            first_weapon = root ? FindDescendant(root, "Weapon") : nullptr;
-                            spdlog::info("[BodyIK] 1P rig: R_Wrist {} L_Wrist {} Weapon {}", first_wrist != nullptr, first_left != nullptr,
-                                first_weapon != nullptr);
-                        }
-                        first_weapon_node = first_weapon;
-                        first_right_wrist = first_wrist;
-                        first_left_wrist  = first_left;
-                        auto muzzle   = (*g_active_bones).weapon_node ? FindDescendant((*g_active_bones).weapon_node, "ProjectileNode") : nullptr;
-                        g_body_muzzle = muzzle;
-                        auto player_ref = CreationEngineSingletonManager::GetPlayerRef();
-                        if (third_person_mode::Active(player_ref) && r.wrist >= 0) {
-                            // The live third-person graph holds the weapon: its own IK has put the hands on R_HandIk and
-                            // L_HandIk, so the hands' places on the weapon are read from this same skeleton.
-                            const auto weapon_anim    = pose.GameWorld((*g_active_bones).weapon);
-                            const auto hand_in_weapon = Compose(Inverse(weapon_anim), pose.GameWorld(r.wrist));
-                            const auto& l_arm         = (*g_active_bones).left;
-                            const auto support_in_weapon = l_arm.wrist >= 0 ? std::optional<Xf>{ Compose(Inverse(weapon_anim), pose.GameWorld(l_arm.wrist)) }
-                                                                            : std::nullopt;
-                            g_native_diag.hand_in_weapon = hand_in_weapon.t;
-
-                            // Weapon bone axes: barrel +Y, up +Z.
-                            g_basis.weapon  = (*g_active_bones).weapon_node;
-                            g_basis.forward = glm::vec3{ 0.0f, 1.0f, 0.0f };
-                            g_basis.up      = glm::vec3{ 0.0f, 0.0f, 1.0f };
-                            g_basis.has     = true;
-
-                            Xf weapon_xf = weapon_anim;
-                            weapon_xf.r  = FrameOf(aim->forward, aim->up) * glm::transpose(FrameOf(g_basis.forward, g_basis.up));
-                            wrist_target = Compose(weapon_xf, hand_in_weapon);
-                            const auto palm_world = wrist_target.t + wrist_target.r * (r.shape.forward * r.shape.palm) * wrist_target.s;
-                            const auto seat       = grip->position - palm_world;
-                            weapon_xf.t += seat;
-                            wrist_target.t += seat;
-                            g_barrel.aim_forward = aim->forward;
-
-                            g_support = {};
-                            const auto left_grip = HandWorld(tracking::GripPose(true));
-                            if (GameFlow::gStore.internalSettings.supportHand && support_in_weapon && l_arm.shape.valid && left_grip) {
-                                auto support = Compose(weapon_xf, *support_in_weapon);
-                                auto palm    = support.t + support.r * (l_arm.shape.forward * l_arm.shape.palm) * support.s;
-                                const float distance    = glm::length(palm - left_grip->position);
-                                static bool held        = false;
-                                held                    = distance < (held ? 0.25f : 0.12f);
-                                g_diag.support_distance = distance;
-                                if (held) {
-                                    const auto pivot = grip->position;
-                                    const auto turn  = RotationBetween(palm - pivot, left_grip->position - pivot);
-                                    weapon_xf.r      = turn * weapon_xf.r;
-                                    weapon_xf.t      = pivot + turn * (weapon_xf.t - pivot);
-                                    wrist_target.r   = turn * wrist_target.r;
-                                    wrist_target.t   = pivot + turn * (wrist_target.t - pivot);
-                                    g_support.held   = true;
-                                    g_support.target = Compose(weapon_xf, *support_in_weapon);
-                                    g_barrel.aim_forward = glm::normalize(weapon_xf.r * g_basis.forward);
-                                }
-                            }
-                            g_barrel.placed        = true;
-                            g_barrel.placed_weapon = weapon_xf;
-                            pose.SetGameWorld((*g_active_bones).weapon, weapon_xf);
-                            g_diag.weapon_aligned = true;
-                            held_weapon           = weapon_xf;
-                            g_native_diag.native  = true;
-                            g_hand_check.placed        = true;
-                            g_hand_check.wrist_target  = wrist_target;
-                            g_hand_check.weapon_target = weapon_xf;
-                        } else {
-                        SampleWeaponBasis(first_weapon);
-                        if (first_wrist && first_weapon) {
-                            // The animation's grip: the hand in the weapon's space, transferred onto the body's hand by anatomy.
-                            MeasureFirstPersonHand(first_wrist, false);
-                            Xf first_hand_world = FromNi(first_wrist->world);
-                            if (g_first_hands[1].shape.valid) {
-                                first_hand_world = BodyWristFromFirstPerson(first_hand_world, r.shape, false);
-                            }
-                            auto hand_in_weapon = Compose(Inverse(FromNi(first_weapon->world)), first_hand_world);
-
-                            // Weapon models carry an authored right-hand IK target (R_HandIk). The hand's offset from it is
-                            // taken from the first-person rig and applied to the third-person model's own target.
-                            auto first_ik = FindDescendant(first_weapon, "R_HandIk");
-                            auto body_ik  = (*g_active_bones).weapon_node ? FindDescendant((*g_active_bones).weapon_node, "R_HandIk") : nullptr;
-                            static RE::NiAVObject* logged_ik{ nullptr };
-                            if (logged_ik != (*g_active_bones).weapon_node) {
-                                logged_ik = (*g_active_bones).weapon_node;
-                                spdlog::info("[BodyIK] R_HandIk: 1P {} 3P {}", first_ik != nullptr, body_ik != nullptr);
-                            }
-                            if (first_ik && body_ik) {
-                                const auto hand_from_ik = Compose(Inverse(FromNi(first_ik->world)), first_hand_world);
-                                const auto ik_in_weapon = Compose(Inverse(FromNi((*g_active_bones).weapon_node->world)), FromNi(body_ik->world));
-                                hand_in_weapon          = Compose(ik_in_weapon, hand_from_ik);
-                            }
-                            Xf         weapon_xf      = Compose(wrist_target, Inverse(hand_in_weapon));
-                            if (g_basis.has && g_basis.weapon == (*g_active_bones).weapon_node) {
-                                // Weapon from the aim ray: barrel forward, weapon up along the controller's up.
-                                weapon_xf.r = FrameOf(aim->forward, aim->up) * glm::transpose(FrameOf(g_basis.forward, g_basis.up));
-                                // Hand from the weapon, then both seated so the palm centre is on the grip point.
-                                wrist_target           = Compose(weapon_xf, hand_in_weapon);
-                                const auto palm_world  = wrist_target.t + wrist_target.r * (r.shape.forward * r.shape.palm) * wrist_target.s;
-                                const auto seat        = grip->position - palm_world;
-                                weapon_xf.t += seat;
-                                wrist_target.t += seat;
-                            }
-                            g_barrel.aim_forward = aim->forward;
-
-                            // Two-handed: the support grip is taken when the left hand comes near it; the weapon then
-                            // turns about the right grip so the support point lies toward the left hand (ROCK).
-                            g_support = {};
-                            const auto& l_arm = (*g_active_bones).left;
-                            const auto  left_grip = HandWorld(tracking::GripPose(true));
-                            if (GameFlow::gStore.internalSettings.supportHand && first_left && l_arm.shape.valid && left_grip) {
-                                MeasureFirstPersonHand(first_left, true);
-                                if (g_first_hands[0].shape.valid) {
-                                    const auto support_in_weapon = Compose(Inverse(FromNi(first_weapon->world)),
-                                        BodyWristFromFirstPerson(FromNi(first_left->world), l_arm.shape, true));
-                                    auto support = Compose(weapon_xf, support_in_weapon);
-                                    auto palm    = support.t + support.r * (l_arm.shape.forward * l_arm.shape.palm) * support.s;
-                                    const float distance    = glm::length(palm - left_grip->position);
-                                    static bool held        = false;
-                                    held                    = distance < (held ? 0.25f : 0.12f);
-                                    g_diag.support_distance = distance;
-                                    if (held) {
-                                        const auto pivot = grip->position;
-                                        const auto turn  = RotationBetween(palm - pivot, left_grip->position - pivot);
-                                        weapon_xf.r      = turn * weapon_xf.r;
-                                        weapon_xf.t      = pivot + turn * (weapon_xf.t - pivot);
-                                        wrist_target.r   = turn * wrist_target.r;
-                                        wrist_target.t   = pivot + turn * (wrist_target.t - pivot);
-                                        support          = Compose(weapon_xf, support_in_weapon);
-                                        g_support.held   = true;
-                                        g_support.target = support;
-                                        if (g_basis.has) {
-                                            g_barrel.aim_forward = glm::normalize(weapon_xf.r * g_basis.forward);
-                                        }
-                                    }
-                                }
-                            }
-
-                            g_barrel.placed        = true;
-                            g_barrel.placed_weapon = weapon_xf;
-                            pose.SetGameWorld((*g_active_bones).weapon, weapon_xf);
-                            g_diag.weapon_aligned = true;
-                            held_weapon           = weapon_xf;
-                        }
-                        }
-                    } else {
-                        g_body_muzzle = nullptr;
-                    }
                     const auto bend = TrackedBend(joint::kArmUpper[1], joint::kArmLower[1], joint::kWrist[1]);
                     g_track_diag.elbow[1] = bend.has_value();
-                    g_diag.right_gap      = SolveArm(pose, r, false, wrist_target, bend);
-                    if (held_weapon && g_native_diag.native) {
-                        static auto vr    = VR::get();
-                        const auto  input = vr->get_finger_state(false);
-                        if (g_finger_palm[1].valid) {
-                            const float index = input.trigger_touch ? 0.3f + 0.7f * input.trigger : 0.0f;
-                            CurlFinger(pose, (*g_active_bones).fingers[1][1], r.wrist, g_finger_palm[1].palm, 10.0f + 50.0f * index,
-                                10.0f + 70.0f * index);
-                        }
-                    } else {
-                        ApplyFingers(pose, 1, r.wrist, held_weapon ? first_right_wrist : nullptr);
-                    }
+                    g_diag.right_gap      = SolveArm(pose, r, false, WristTarget(pose, r, *aim, *grip), bend);
+                    ApplyFingers(pose, 1, r.wrist, nullptr);
                 }
             }
 
@@ -2050,17 +1902,13 @@ namespace body
                 const auto grip = HandWorld(tracking::GripPose(true));
                 const auto aim  = HandWorld(tracking::AimPose(true));
                 if (grip && aim) {
-                    auto       target  = WristTarget(pose, l, *aim, *grip);
-                    const bool on_grip = held_weapon && g_support.held;
-                    if (on_grip) {
-                        target = g_support.target;
-                    }
+                    const bool on_grip  = g_support.held;
                     g_diag.support_held = on_grip;
-                    const auto bend       = TrackedBend(joint::kArmUpper[0], joint::kArmLower[0], joint::kWrist[0]);
-                    g_track_diag.elbow[0] = bend.has_value();
-                    g_diag.left_gap       = SolveArm(pose, l, true, target, bend);
-                    if (!(on_grip && g_native_diag.native)) {
-                        ApplyFingers(pose, 0, l.wrist, on_grip ? first_left_wrist : nullptr);
+                    if (!on_grip) {
+                        const auto bend       = TrackedBend(joint::kArmUpper[0], joint::kArmLower[0], joint::kWrist[0]);
+                        g_track_diag.elbow[0] = bend.has_value();
+                        g_diag.left_gap       = SolveArm(pose, l, true, WristTarget(pose, l, *aim, *grip), bend);
+                        ApplyFingers(pose, 0, l.wrist, nullptr);
                     }
                 }
             }
@@ -2696,6 +2544,53 @@ namespace body
             return pose;
         }
 
+        // Body placed so the neck is under and behind the eyes; sets pose.root and returns the root used.
+        RE::NiTransform DecideRoot(Pose& pose, const RE::NiTransform& root_local)
+        {
+            // Horizontal only. Small offsets are taken by the spine (lean); beyond kLeanReach the body follows.
+            constexpr float kNeckBehindEyes = 0.12f;
+            constexpr float kLeanReach      = 0.20f;
+            RE::NiTransform shifted_root    = root_local;
+            g_lean                          = glm::vec3{ 0.0f };
+            auto world_camera               = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
+            if (world_camera && (*g_active_bones).neck >= 0) {
+                const auto eye = ToVec(world_camera->world.translate);
+                // Torso partly toward the hands (FRIK: 0.7 of the hands' yaw, within 50 degrees).
+                if (GameFlow::gStore.internalSettings.bodyFacing) {
+                    const auto yaw = TrackedFacingYaw(pose).value_or(FacingYaw(pose, eye));
+                    Xf         root = FromNi(shifted_root);
+                    const auto turn = glm::mat3_cast(glm::angleAxis(yaw, glm::vec3{ 0.0f, 0.0f, 1.0f }));
+                    const auto pivot = glm::vec3{ eye.x, eye.y, root.t.z };
+                    root.r          = turn * root.r;
+                    root.t          = pivot + turn * (root.t - pivot);
+                    ToNi(root, shifted_root);
+                    pose.root = root;
+                } else {
+                    g_facing_yaw = 0.0f;
+                }
+                auto forward = pose.root.r[1];
+                forward.z    = 0.0f;
+                if (glm::length(forward) > 1e-3f) {
+                    forward            = glm::normalize(forward);
+                    const auto neck    = pose.GameWorld((*g_active_bones).neck).t;
+                    auto       delta   = eye - forward * kNeckBehindEyes - neck;
+                    delta.z            = 0.0f;
+                    const float length = glm::length(delta);
+                    if (length < 1.0f) {
+                        auto body = delta;
+                        if (GameFlow::gStore.internalSettings.bodyLean) {
+                            body   = length > kLeanReach ? delta * ((length - kLeanReach) / length) : glm::vec3{ 0.0f };
+                            g_lean = delta - body;
+                        }
+                        shifted_root.translate.x += body.x;
+                        shifted_root.translate.y += body.y;
+                    }
+                }
+            }
+            pose.root = FromNi(shifted_root);
+            return shifted_root;
+        }
+
         bool RagdollActive(std::uint8_t* model)
         {
             auto component = *reinterpret_cast<void**>(model + 0x70);
@@ -2704,6 +2599,383 @@ namespace body
             }
             using fn_t = bool (*)(void*);
             return (*reinterpret_cast<fn_t**>(component))[4](component);
+        }
+
+
+        // The game's animation graph builds the body's pose in its own buffer: clips, then nodes such as the arms'
+        // two-bone IK (targets R_HandIk/L_HandIk, children of the weapon bone), then a copy into the model's locals
+        // that UpdateTransforms turns into worlds. Everything that moves the chest, and the weapon itself, is set
+        // in that buffer just before the arm IK solves, so the game puts the hands on the weapon.
+        namespace graph_stage
+        {
+            // Graph pose entry: rotation as a quaternion (w first), position, scale; parent-relative.
+            struct Bone32
+            {
+                float q[4];
+                float t[3];
+                float s;
+            };
+            static_assert(sizeof(Bone32) == 32);
+
+            // How the game turns a graph quaternion into a stored rotation, measured against the copied locals.
+            enum class Convention { Unknown, Direct, Transposed, Failed };
+            Convention g_convention{ Convention::Unknown };
+
+            Xf FromGraph(const Bone32& b, Convention c)
+            {
+                Xf x;
+                const auto r = glm::mat3_cast(glm::quat{ b.q[0], b.q[1], b.q[2], b.q[3] });
+                x.r          = c == Convention::Transposed ? glm::transpose(r) : r;
+                x.t          = { b.t[0], b.t[1], b.t[2] };
+                x.s          = b.s;
+                return x;
+            }
+
+            Bone32 ToGraph(const Xf& x, Convention c)
+            {
+                const auto q = glm::normalize(glm::quat_cast(c == Convention::Transposed ? glm::transpose(x.r) : x.r));
+                return Bone32{ { q.w, q.x, q.y, q.z }, { x.t.x, x.t.y, x.t.z }, x.s };
+            }
+
+            struct Write
+            {
+                int    graph;
+                int    model;
+                Bone32 value;
+            };
+
+            struct Stage
+            {
+                std::uint64_t      frame{ ~0ull };
+                bool               ran{ false };
+                RE::NiTransform    root{};
+                std::vector<Write> writes;
+            };
+            Stage                       g_stage;
+            std::mutex                  g_mutex;
+            std::atomic<std::uint64_t>  g_frames{ 0 };
+            RE::NiTransform             g_root_local{};
+            bool                        g_has_root_local{ false };
+            thread_local std::uint8_t*  t_model{ nullptr };
+            safetyhook::MidHook         g_generate_hook;
+            safetyhook::MidHook         g_ik_hook;
+
+            // Bones sampled from the graph (no writes yet) and compared with the copied locals to measure the convention.
+            struct Sample
+            {
+                int    model;
+                Bone32 value;
+            };
+            std::vector<Sample> g_samples;
+            bool                g_samples_pending{ false };
+
+            struct Diag
+            {
+                int   hits_right{ 0 }, hits_left{ 0 }, hits_other{ 0 };
+                float target_weight{ -1.0f }, weapon_weight{ -1.0f }, blend{ -1.0f };
+                int   other_target{ -1 };
+                float copy_error{ -1.0f };       // our writes against the copied locals (later nodes overwriting them)
+                float hand_to_ik{ -1.0f };       // right wrist against R_HandIk after the update (the game's IK)
+                float hand_to_ik_angle{ -1.0f };
+                float support_to_ik{ -1.0f };
+                float weapon_error{ -1.0f };     // weapon bone against its placement
+                bool  placed{ false };
+                std::string note;
+            };
+            Diag g_stage_diag;
+
+            std::uint8_t* BodyModel()
+            {
+                if (!g_state.active || !g_state.root) {
+                    return nullptr;
+                }
+                return *reinterpret_cast<std::uint8_t**>(reinterpret_cast<std::uint8_t*>(g_state.root) + kModelNodeOffset);
+            }
+
+            int Index(const char* name)
+            {
+                const auto it = (*g_active_bones).by_name.find(name);
+                return it == (*g_active_bones).by_name.end() ? -1 : it->second;
+            }
+
+            bool Staged()
+            {
+                std::lock_guard lock(g_mutex);
+                return g_stage.ran && g_stage.frame == g_frames.load();
+            }
+
+            void NoteRootLocal(const RE::NiTransform& root_local)
+            {
+                std::lock_guard lock(g_mutex);
+                g_root_local     = root_local;
+                g_has_root_local = true;
+            }
+
+            // The weapon on the controller: barrel along the aim (measured from the muzzle the game fires from),
+            // its grip (R_HandIk) seated so the palm centre is on the controller's grip point.
+            void PlaceWeapon(const Pose& pose)
+            {
+                g_staged_weapon = {};
+                auto player = CreationEngineSingletonManager::GetPlayerRef();
+                const auto& b = *g_active_bones;
+                if (!player || !player->IsWeaponDrawn() || b.weapon < 0) {
+                    return;
+                }
+                const int r_ik = Index("R_HandIk");
+                const int l_ik = Index("L_HandIk");
+                if (r_ik < 0 || l_ik < 0 || pose.parent[r_ik] != b.weapon || pose.parent[l_ik] != b.weapon) {
+                    g_stage_diag.note = "hand IK targets missing or not under the weapon bone";
+                    return;
+                }
+                if (!g_barrel.has_relation || g_barrel.weapon != b.weapon_node || !b.right.shape.valid) {
+                    g_stage_diag.note = "waiting for the muzzle and hand measurements";
+                    return;
+                }
+                const auto grip = HandWorld(tracking::GripPose(false));
+                const auto aim  = HandWorld(tracking::AimPose(false));
+                if (!grip || !aim) {
+                    return;
+                }
+                const auto hand_in_weapon    = FromNi(pose.local[r_ik]);
+                const auto support_in_weapon = FromNi(pose.local[l_ik]);
+                const auto forward           = glm::normalize(g_barrel.shot_in_weapon);
+                auto       up                = glm::vec3{ 0.0f, 0.0f, 1.0f } - forward * forward.z;
+                up                           = glm::normalize(up);
+
+                Xf weapon;
+                weapon.s = pose.GameWorld(b.weapon).s;
+                weapon.r = FrameOf(aim->forward, aim->up) * glm::transpose(FrameOf(forward, up));
+                weapon.t = glm::vec3{ 0.0f };
+                const auto& shape = b.right.shape;
+                const auto  wrist = Compose(weapon, hand_in_weapon);
+                weapon.t          = grip->position - (wrist.t + wrist.r * (shape.forward * shape.palm) * wrist.s);
+
+                // Two hands: the support grip is taken near the left hand, the weapon turned about the right grip
+                // toward it (ROCK).
+                bool        support_held = false;
+                const auto& l_shape      = b.left.shape;
+                const auto  left_grip    = HandWorld(tracking::GripPose(true));
+                if (GameFlow::gStore.internalSettings.supportHand && l_shape.valid && left_grip) {
+                    const auto  support  = Compose(weapon, support_in_weapon);
+                    const auto  palm     = support.t + support.r * (l_shape.forward * l_shape.palm) * support.s;
+                    const float distance = glm::length(palm - left_grip->position);
+                    static bool held     = false;
+                    held                 = distance < (held ? 0.25f : 0.12f);
+                    g_diag.support_distance = distance;
+                    if (held) {
+                        const auto pivot = grip->position;
+                        const auto turn  = RotationBetween(palm - pivot, left_grip->position - pivot);
+                        weapon.r         = turn * weapon.r;
+                        weapon.t         = pivot + turn * (weapon.t - pivot);
+                    }
+                    support_held = held;
+                }
+
+                pose.SetGameWorld(b.weapon, weapon);
+                g_staged_weapon.held         = true;
+                g_staged_weapon.weapon       = weapon;
+                g_staged_weapon.support_held = support_held;
+                g_barrel.placed              = true;
+                g_barrel.placed_weapon       = weapon;
+                g_barrel.aim_forward         = glm::normalize(weapon.r * forward);
+                g_hand_check.placed          = true;
+                g_hand_check.wrist_target    = Compose(weapon, hand_in_weapon);
+                g_hand_check.weapon_target   = weapon;
+                g_stage_diag.placed                = true;
+            }
+
+            // Once per frame, at the first arm IK of the body's graph.
+            void Run(std::uint8_t* model, Bone32* bones, int graph_bones)
+            {
+                g_stage.writes.clear();
+                if (!g_has_root_local || (*g_active_bones).storage != *reinterpret_cast<void**>(model + 0x10)) {
+                    return;
+                }
+                Pose pose = ReadPose(model, &g_root_local);
+                if (!pose.local) {
+                    return;
+                }
+                const int offset = *reinterpret_cast<std::uint16_t*>(model + 0x7e);
+                const int count  = std::min({ static_cast<int>(*reinterpret_cast<std::uint16_t*>(model + 0x7a)), graph_bones, pose.count - offset });
+
+                if (g_convention == Convention::Unknown) {
+                    if (!g_samples_pending) {
+                        g_samples.clear();
+                        for (const char* name : { "COM", "C_Spine", "C_Spine1", "C_Spine2", "C_Chest", "C_Neck", "L_Clavicle", "R_Clavicle",
+                                 "L_Thigh", "R_Thigh", "L_Calf", "R_Calf" }) {
+                            const int m = Index(name);
+                            if (m >= offset && m - offset < count) {
+                                g_samples.push_back({ m, bones[m - offset] });
+                            }
+                        }
+                        g_samples_pending = !g_samples.empty();
+                    }
+                    return;
+                }
+                if (g_convention == Convention::Failed) {
+                    return;
+                }
+
+                // The model's pose with this frame's graph values, in the layout the body code works on.
+                static std::vector<RE::NiTransform> locals;
+                locals.assign(pose.local, pose.local + pose.count);
+                for (int g = 0; g < count; ++g) {
+                    ToNi(FromGraph(bones[g], g_convention), locals[g + offset]);
+                }
+                pose.local = locals.data();
+
+                std::unordered_map<int, WrittenBone> written;
+                auto* const saved_written = g_written_active;
+                g_written_active          = &written;
+                SnapshotTracking();
+                g_stage.root = DecideRoot(pose, g_root_local);
+                ApplyTorsoAndLegs(pose);
+                PlaceWeapon(pose);
+                g_written_active = saved_written;
+
+                for (const auto& [m, entry] : written) {
+                    const int g = m - offset;
+                    if (g < 0 || g >= count) {
+                        spdlog::error("[Body] graph stage wrote bone {} outside the graph's pose", m);
+                        continue;
+                    }
+                    g_stage.writes.push_back({ g, m, ToGraph(FromNi(pose.local[m]), g_convention) });
+                }
+                g_stage.ran = true;
+            }
+
+            void OnGenerate(safetyhook::Context& ctx)
+            {
+                t_model = *reinterpret_cast<std::uint8_t**>(ctx.rdx + 0x50);
+            }
+
+            // TwoBoneIKNodeInstance::Generate, its input pose fetched and about to solve (0x227e15f).
+            void OnArmIK(safetyhook::Context& ctx)
+            {
+                auto model = t_model;
+                if (!model || model != BodyModel()) {
+                    return;
+                }
+                auto       instance = reinterpret_cast<std::uint8_t*>(ctx.rbx);
+                auto       bones    = reinterpret_cast<Bone32*>(ctx.r8);
+                auto       weights  = *reinterpret_cast<float**>(ctx.r9 + 8);
+                const int  target   = *reinterpret_cast<int*>(instance + 0x3c);
+                const int  offset   = *reinterpret_cast<std::uint16_t*>(model + 0x7e);
+
+                std::lock_guard lock(g_mutex);
+                const auto frame = g_frames.load();
+                if (g_stage.frame != frame) {
+                    g_stage.frame = frame;
+                    g_stage.ran   = false;
+                    Run(model, bones, *reinterpret_cast<int*>(ctx.r9 + 0xcc));
+                }
+                for (const auto& w : g_stage.writes) {
+                    bones[w.graph]   = w.value;
+                    weights[w.graph] = 1.0f;
+                }
+
+                const int r_ik = Index("R_HandIk"), l_ik = Index("L_HandIk");
+                if (target + offset == r_ik) {
+                    ++g_stage_diag.hits_right;
+                } else if (target + offset == l_ik) {
+                    ++g_stage_diag.hits_left;
+                } else {
+                    ++g_stage_diag.hits_other;
+                    g_stage_diag.other_target = target;
+                }
+                if (target + offset == r_ik && (*g_active_bones).weapon >= offset) {
+                    g_stage_diag.target_weight = weights[target];
+                    g_stage_diag.weapon_weight = weights[(*g_active_bones).weapon - offset];
+                    g_stage_diag.blend         = *reinterpret_cast<float*>(instance + 0x44);
+                }
+            }
+
+            // At UpdateTransforms, before anything is restored or written: the locals are the graph's copy.
+            void CheckCopied(const Pose& pose)
+            {
+                std::lock_guard lock(g_mutex);
+                if (g_samples_pending) {
+                    g_samples_pending = false;
+                    int direct = 0, transposed = 0;
+                    for (const auto& sample : g_samples) {
+                        const auto copied = FromNi(pose.local[sample.model]);
+                        auto close = [&](Convention c) {
+                            const auto x = FromGraph(sample.value, c);
+                            float      e = glm::length(x.t - copied.t);
+                            for (int a = 0; a < 3; ++a) {
+                                e = std::max(e, glm::length(x.r[a] - copied.r[a]));
+                            }
+                            return e < 1e-3f;
+                        };
+                        direct += close(Convention::Direct) ? 1 : 0;
+                        transposed += close(Convention::Transposed) ? 1 : 0;
+                    }
+                    const int n = static_cast<int>(g_samples.size());
+                    if (direct * 2 > n && direct > transposed) {
+                        g_convention = Convention::Direct;
+                    } else if (transposed * 2 > n && transposed > direct) {
+                        g_convention = Convention::Transposed;
+                    } else {
+                        g_convention = Convention::Failed;
+                    }
+                    spdlog::info("[Body] graph pose convention: {} of {} bones match direct, {} transposed -> {}", direct, n, transposed,
+                        g_convention == Convention::Direct ? "direct" : g_convention == Convention::Transposed ? "transposed" : "FAILED");
+                    if (g_convention == Convention::Failed) {
+                        spdlog::error("[Body] graph pose does not match the copied locals; the graph stage is disabled");
+                    }
+                }
+                if (g_stage.ran && g_stage.frame == g_frames.load()) {
+                    float worst = 0.0f;
+                    for (const auto& w : g_stage.writes) {
+                        const auto copied  = FromNi(pose.local[w.model]);
+                        const auto written = FromGraph(w.value, g_convention);
+                        worst              = std::max(worst, glm::length(copied.t - written.t));
+                        for (int a = 0; a < 3; ++a) {
+                            worst = std::max(worst, glm::length(copied.r[a] - written.r[a]));
+                        }
+                    }
+                    g_stage_diag.copy_error = worst;
+                }
+            }
+
+            // After UpdateTransforms: where the game's IK put the hands, from the final worlds.
+            void AfterUpdate(const Pose& pose)
+            {
+                const auto& b = *g_active_bones;
+                const int r_ik = Index("R_HandIk"), l_ik = Index("L_HandIk");
+                if (g_staged_weapon.held && r_ik >= 0 && b.right.wrist >= 0) {
+                    const auto wrist  = FromNi(pose.world[b.right.wrist]);
+                    const auto target = FromNi(pose.world[r_ik]);
+                    g_stage_diag.hand_to_ik = glm::length(wrist.t - target.t);
+                    const auto d      = glm::transpose(target.r) * wrist.r;
+                    g_stage_diag.hand_to_ik_angle = glm::degrees(std::acos(std::clamp((d[0][0] + d[1][1] + d[2][2] - 1.0f) * 0.5f, -1.0f, 1.0f)));
+                    if (l_ik >= 0 && b.left.wrist >= 0 && g_staged_weapon.support_held) {
+                        g_stage_diag.support_to_ik = glm::length(FromNi(pose.world[b.left.wrist]).t - FromNi(pose.world[l_ik]).t);
+                    }
+                    g_stage_diag.weapon_error = glm::length(FromNi(pose.world[b.weapon]).t - g_staged_weapon.weapon.t);
+                }
+                g_frames.fetch_add(1);
+            }
+
+            void Install()
+            {
+                const auto generate = MemoryScan::FuncRelocation(
+                    "4C 89 44 24 18 48 89 54 24 10 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 68", 0x221f6e0, 0);
+                const auto ik = MemoryScan::FuncRelocation("48 63 73 3C 4C 8B 9F D8 00 00 00 49", 0x227e15f, 0);
+                g_generate_hook = safetyhook::create_mid(reinterpret_cast<void*>(generate), &OnGenerate);
+                g_ik_hook       = safetyhook::create_mid(reinterpret_cast<void*>(ik), &OnArmIK);
+                spdlog::info("[Body] graph stage hooks: generate {} arm IK {}", static_cast<bool>(g_generate_hook), static_cast<bool>(g_ik_hook));
+            }
+
+            void Log()
+            {
+                std::lock_guard lock(g_mutex);
+                spdlog::info("[Body] graph stage: convention {} | arm IK hits R {} L {} other {} (target {}) | weights target {:.2f} weapon {:.2f} blend {:.2f} | placed {} | copy error {:.4f} | right hand to IK target {:.3f} m {:.1f} deg | support to IK {:.3f} m | weapon off placement {:.3f} m | {}",
+                    static_cast<int>(g_convention), g_stage_diag.hits_right, g_stage_diag.hits_left, g_stage_diag.hits_other, g_stage_diag.other_target, g_stage_diag.target_weight,
+                    g_stage_diag.weapon_weight, g_stage_diag.blend, g_stage_diag.placed, g_stage_diag.copy_error, g_stage_diag.hand_to_ik, g_stage_diag.hand_to_ik_angle, g_stage_diag.support_to_ik,
+                    g_stage_diag.weapon_error, g_stage_diag.note);
+                g_stage_diag = {};
+            }
         }
 
         // BSModelNode::UpdateTransforms: pose locals -> worlds -> synced to nodes, skin and geometry.
@@ -2722,57 +2994,23 @@ namespace body
                         FindBones(pose, storage);
                         (*g_written_active).clear();
                     }
+                    graph_stage::CheckCopied(pose);
                     RestoreAnimated(pose);
                     // Both transforms are final from the previous frame here.
                     MeasureBarrel();
 
-                    // Body placed so the neck is under and behind the eyes (horizontal only). Small offsets are taken
-                    // by the spine (lean); beyond kLeanReach the body follows.
-                    constexpr float kNeckBehindEyes = 0.12f;
-                    constexpr float kLeanReach      = 0.20f;
-                    shifted_root                    = *root_local;
-                    g_lean                          = glm::vec3{ 0.0f };
-                    auto world_camera               = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
-                    SnapshotTracking();
-                    if (world_camera && (*g_active_bones).neck >= 0) {
-                        const auto eye = ToVec(world_camera->world.translate);
-                        // Torso partly toward the hands (FRIK: 0.7 of the hands' yaw, within 50 degrees).
-                        if (GameFlow::gStore.internalSettings.bodyFacing) {
-                            const auto yaw = TrackedFacingYaw(pose).value_or(FacingYaw(pose, eye));
-                            Xf         root = FromNi(shifted_root);
-                            const auto turn = glm::mat3_cast(glm::angleAxis(yaw, glm::vec3{ 0.0f, 0.0f, 1.0f }));
-                            const auto pivot = glm::vec3{ eye.x, eye.y, root.t.z };
-                            root.r          = turn * root.r;
-                            root.t          = pivot + turn * (root.t - pivot);
-                            ToNi(root, shifted_root);
-                            pose.root = root;
-                        } else {
-                            g_facing_yaw = 0.0f;
-                        }
-                        auto forward = pose.root.r[1];
-                        forward.z    = 0.0f;
-                        if (glm::length(forward) > 1e-3f) {
-                            forward            = glm::normalize(forward);
-                            const auto neck    = pose.GameWorld((*g_active_bones).neck).t;
-                            auto       delta   = eye - forward * kNeckBehindEyes - neck;
-                            delta.z            = 0.0f;
-                            const float length = glm::length(delta);
-                            if (length < 1.0f) {
-                                auto body = delta;
-                                if (GameFlow::gStore.internalSettings.bodyLean) {
-                                    body   = length > kLeanReach ? delta * ((length - kLeanReach) / length) : glm::vec3{ 0.0f };
-                                    g_lean = delta - body;
-                                }
-                                shifted_root.translate.x += body.x;
-                                shifted_root.translate.y += body.y;
-                            }
-                        }
+                    const bool staged = graph_stage::Staged();
+                    if (staged) {
+                        shifted_root = graph_stage::g_stage.root;
+                        pose.root    = FromNi(shifted_root);
+                    } else {
+                        SnapshotTracking();
+                        shifted_root = DecideRoot(pose, *root_local);
                     }
-                    if (world_camera && world_camera->parent) {
+                    use_shifted = true;
+                    if (auto world_camera = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera; world_camera && world_camera->parent) {
                         tracking::UpdateTrackingScale(world_camera->parent->world.translate.z - root_local->translate.z);
                     }
-                    pose.root   = FromNi(shifted_root);
-                    use_shifted = true;
 
                     // Raw arm chain as read before any write, once per second.
                     static std::chrono::steady_clock::time_point last_dump{};
@@ -2794,11 +3032,15 @@ namespace body
                         spdlog::info("[BodyIK] wrist chain:{}", chain);
                     }
                     if (g_calibration.status == Calibration::Status::Ready) {
-                        ApplyIK(pose);
+                        ApplyIK(pose, staged);
                     }
+                    graph_stage::NoteRootLocal(*root_local);
                 }
             }
             auto result = g_model_update_hook.call<void*>(model, use_shifted ? &shifted_root : root_local, data, out);
+            if (pose.local) {
+                graph_stage::AfterUpdate(pose);
+            }
             if (pose.local) {
                 // The body's shoulders as rendered this frame (the first-person arms attach there).
                 const auto& b = *g_active_bones;
@@ -2908,13 +3150,7 @@ namespace body
                         g_track_diag.legs, g_track_diag.fingers[0], g_track_diag.hand_source[0], g_track_diag.index_bend[0], g_track_diag.fingers[1],
                         g_track_diag.hand_source[1], g_track_diag.index_bend[1], g_finger_diag[1].trigger);
                     {
-                        auto player_ref = CreationEngineSingletonManager::GetPlayerRef();
-                        auto camera     = CreationEngineSingletonManager::GetPlayerCameraSingleton();
-                        spdlog::info("[Body] native weapons: wanted {} mode {} live-body bit {} fp camera {} drawn {} | native grip {} hand in weapon ({:.3f},{:.3f},{:.3f})",
-                            third_person_mode::g_wanted.load(), third_person_mode::Active(player_ref),
-                            player_ref ? (third_person_mode::Flags(player_ref, third_person_mode::kLiveBodyFlags) & 8) != 0 : false,
-                            camera && camera->IsInFirstPerson(), player_ref && player_ref->IsWeaponDrawn(), g_native_diag.native,
-                            g_native_diag.hand_in_weapon.x, g_native_diag.hand_in_weapon.y, g_native_diag.hand_in_weapon.z);
+                        graph_stage::Log();
                         spdlog::info("[Body] hand check: wrist off target {:.3f} m {:.1f} deg | weapon off target {:.3f} m | drawn hand in weapon ({:.3f},{:.3f},{:.3f}) | weapon model '{}' at ({:.3f},{:.3f},{:.3f}) in the weapon bone",
                             g_hand_check.wrist_error, g_hand_check.wrist_angle, g_hand_check.weapon_error, g_hand_check.drawn_hand_in_weapon.x,
                             g_hand_check.drawn_hand_in_weapon.y, g_hand_check.drawn_hand_in_weapon.z, g_hand_check.model_name, g_hand_check.model_offset.x,
@@ -2958,6 +3194,7 @@ namespace body
         }
         g_model_update_hook = safetyhook::create_inline(reinterpret_cast<void*>(address), reinterpret_cast<void*>(&ModelNodeUpdateTransforms));
         third_person_mode::Install();
+        graph_stage::Install();
         spdlog::info("[BodyIK] model node hook: {}", static_cast<bool>(g_model_update_hook));
     }
 
