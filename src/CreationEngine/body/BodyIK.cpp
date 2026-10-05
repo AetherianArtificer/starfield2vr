@@ -1821,6 +1821,8 @@ namespace body
             glm::vec3 origin{};
             float     attach_offset{ 0.0f };
             float     attach_error{ -1.0f };
+            float     attach_angle{ 0.0f };
+            int       branch{ -1 };
             glm::vec3 root_translate{};
             bool      weapon{ false };
             bool      support{ false };
@@ -2094,15 +2096,22 @@ namespace body
                 }
             }
 
-            // Attach: the rig's collarbones onto the body's.
-            const auto rig_up   = pose.GameWorld(b.right.clavicle).r[2];
-            const auto rig      = ShoulderFrame(pose.GameWorld(b.left.clavicle).t, pose.GameWorld(b.right.clavicle).t, pose.root.r[2]);
-            const auto body     = ShoulderFrame(g_body_shoulders.left, g_body_shoulders.right, g_body_shoulders.up);
-            (void)rig_up;
-            const auto move     = Compose(body, Inverse(rig));
-            g_fp_diag.attach_offset = glm::length(move.t);
-            pose.root = Compose(Inverse(pose.to_world), Compose(move, Compose(pose.to_world, pose.root)));
-            ToNi(pose.root, root_out);
+            // Attach: the branch carrying the arms (not the root, which also carries the camera) is moved so the rig's
+            // collarbones sit on the body's.
+            const auto rig  = ShoulderFrame(pose.GameWorld(b.left.clavicle).t, pose.GameWorld(b.right.clavicle).t, pose.root.r[2]);
+            const auto body = ShoulderFrame(g_body_shoulders.left, g_body_shoulders.right, g_body_shoulders.up);
+            g_fp_diag.attach_offset = glm::length(body.t - rig.t);
+            g_fp_diag.attach_angle  = glm::degrees(glm::angle(glm::quat_cast(body.r * glm::transpose(rig.r))));
+            int branch = b.right.clavicle;
+            for (int guard = 0; branch >= pose.top && guard < 64; ++guard) {
+                branch = pose.parent[branch];
+            }
+            if (branch < 0 || branch >= pose.top || g_fp_diag.attach_offset > 2.0f) {
+                return;  // unexpected layout or spaces disagree; leave the rig as the game posed it
+            }
+            const auto move = Compose(body, Inverse(rig));
+            pose.SetGameWorld(branch, Compose(move, pose.GameWorld(branch)));
+            g_fp_diag.branch = branch;
             g_fp_diag.active = true;
             g_fp_last_frame  = g_frame_counter;
 
@@ -2337,7 +2346,6 @@ namespace body
                 g_fp_diag.attach_error = glm::length(pose.GameWorld(g_first_bones.right.clavicle).t - g_body_shoulders.right);
             }
             if (g_fp_diag.active) {
-                root->world = root_world;
                 for (const auto& [index, entry] : g_written_first) {
                     if (index >= 0 && index < static_cast<int>(f.nodes.size())) {
                         f.nodes[index]->local = f.local[index];
@@ -2630,10 +2638,11 @@ namespace body
                         g_track_diag.supported, g_track_diag.active, g_track_diag.valid, g_track_diag.torso, g_track_diag.elbow[0], g_track_diag.elbow[1],
                         g_track_diag.legs, g_track_diag.fingers[0], g_track_diag.hand_source[0], g_track_diag.index_bend[0], g_track_diag.fingers[1],
                         g_track_diag.hand_source[1], g_track_diag.index_bend[1], g_finger_diag[1].trigger);
-                    spdlog::info("[BodyIK] first-person arms: setting {} root hits {} body active {} shoulders {} | active {} live {} origin ({:.1f},{:.1f},{:.1f}) root ({:.2f},{:.2f},{:.2f}) attach move {:.2f} m error {:.3f} m | weapon {} support {}",
+                    spdlog::info("[BodyIK] first-person arms: setting {} root hits {} body active {} shoulders {} | active {} live {} origin ({:.1f},{:.1f},{:.1f}) root ({:.2f},{:.2f},{:.2f}) shoulders apart {:.2f} m {:.0f} deg, branch {}, after {:.3f} m | weapon {} support {}",
                         GameFlow::gStore.internalSettings.firstPersonArms, g_fp_root_hits.exchange(0), g_state.active, g_body_shoulders.valid,
                         g_fp_diag.active, FirstPersonArmsLive(), g_fp_diag.origin.x, g_fp_diag.origin.y, g_fp_diag.origin.z, g_fp_diag.root_translate.x,
-                        g_fp_diag.root_translate.y, g_fp_diag.root_translate.z, g_fp_diag.attach_offset, g_fp_diag.attach_error, g_fp_diag.weapon,
+                        g_fp_diag.root_translate.y, g_fp_diag.root_translate.z, g_fp_diag.attach_offset, g_fp_diag.attach_angle, g_fp_diag.branch,
+                        g_fp_diag.attach_error, g_fp_diag.weapon,
                         g_fp_diag.support);
                     {
                         auto player = CreationEngineSingletonManager::GetPlayerRef();
