@@ -626,6 +626,9 @@ uintptr_t StereoViewModule::RunUpscalerPass(int pass_kind, void* pass, void* ren
     if (pass_kind == kDLSSInputs) {
         PerfStats::MarkGpu(list, PerfStats::GpuPoint::kEyeUpscaleStart, right ? 1 : 0);
     }
+    if (pass_kind == kDLSSUpscale) {
+        PerfStats::MarkGpu(list, PerfStats::GpuPoint::kEyeUpscaleEvalStart, right ? 1 : 0);
+    }
     UpscalerAfrNvidiaModule::set_secondary_view(right);
     auto result = original(pass, render_graph_data, pass_data);
     UpscalerAfrNvidiaModule::set_secondary_view(false);

@@ -55,9 +55,12 @@ namespace PerfStats
         std::array<MarkerFrame, kMarkerFrames>  g_marker_frames{};
         Average                                 g_cpu_simulation, g_cpu_submit, g_cpu_present;
 
-        // GPU timestamps: per frame slot, three points per eye.
+        std::mutex             g_cpu_mutex;
+        std::array<Average, 4> g_cpu_spans{};
+
+        // GPU timestamps: per frame slot, four points per eye.
         constexpr int kSlots   = 4;
-        constexpr int kPerSlot = 6;
+        constexpr int kPerSlot = 8;
         constexpr int kQueries = kSlots * kPerSlot;
         std::mutex                                g_gpu_mutex;
         Microsoft::WRL::ComPtr<ID3D12QueryHeap>   g_query_heap;
@@ -70,7 +73,7 @@ namespace PerfStats
         Average                                   g_gpu_eyes;
         std::array<Average, 2>                    g_gpu_upscale, g_gpu_post;
 
-        int QueryIndex(PerfStats::GpuPoint point, int eye) { return (eye & 1) * 3 + (int)point; }
+        int QueryIndex(PerfStats::GpuPoint point, int eye) { return (eye & 1) * 4 + (int)point; }
 
         bool EnsureQueries()
         {
@@ -132,13 +135,13 @@ namespace PerfStats
                     }
                 };
                 for (int eye = 0; eye < 2; ++eye) {
-                    const int e = eye * 3;
-                    span(e + 0, e + 1, g_gpu_upscale[eye]);
-                    span(e + 1, e + 2, g_gpu_post[eye]);
+                    const int e = eye * 4;
+                    span(e + 1, e + 2, g_gpu_upscale[eye]);
+                    span(e + 2, e + 3, g_gpu_post[eye]);
                 }
-                // From the right eye's DLSS to the end of the left eye's post chain: the left eye's scene rendering
-                // and both eyes' upscale and post work.
-                span(3, 2, g_gpu_eyes);
+                // From the right eye's DLSS inputs to the end of the left eye's post chain: the left eye's scene
+                // rendering and both eyes' upscale and post work.
+                span(4, 3, g_gpu_eyes);
                 const D3D12_RANGE nothing{ 0, 0 };
                 g_readback->Unmap(0, &nothing);
                 g_written[slot] = 0;
@@ -187,9 +190,18 @@ namespace PerfStats
 
             spdlog::info("[Perf] {:.1f} fps | frame avg {:.1f} ms, p99 {:.1f} ms, max {:.1f} ms | budget {:.1f} ms ({:.0f} Hz), {:.0f}% over", fps, sum / count, p99,
                 g_frame_ms.back(), budget_ms, period > 0.0 ? 1.0 / period : 0.0, 100.0f * over / count);
-            spdlog::info("[Perf] CPU: simulation {:.1f} ms, render submit {:.1f} ms, present {:.1f} ms | GPU: right DLSS to left post end {:.1f} ms; "
-                         "left eye DLSS {:.1f}, post {:.1f} ms; right eye DLSS {:.1f}, post {:.1f} ms",
-                simulation, submit, present, eyes, upscale[0], post[0], upscale[1], post[1]);
+            std::array<double, 4> mod{};
+            {
+                std::scoped_lock _{ g_cpu_mutex };
+                for (size_t i = 0; i < mod.size(); ++i) {
+                    mod[i] = g_cpu_spans[i].take();
+                }
+            }
+            spdlog::info("[Perf] CPU: simulation {:.1f} ms, render submit {:.1f} ms, present {:.1f} ms | in simulation: VR wait {:.1f}, VR sync {:.1f}, mod frame {:.2f}, "
+                         "body IK {:.2f} ms",
+                simulation, submit, present, mod[0], mod[1], mod[2], mod[3]);
+            spdlog::info("[Perf] GPU: right eye DLSS inputs to left eye post end {:.1f} ms | left eye DLSS {:.2f}, post {:.2f} ms | right eye DLSS {:.2f}, post {:.2f} ms",
+                eyes, upscale[0], post[0], upscale[1], post[1]);
 
             g_frame_ms.clear();
         }
@@ -237,6 +249,12 @@ namespace PerfStats
         stage(0, 1, g_cpu_simulation);
         stage(2, 3, g_cpu_submit);
         stage(4, 5, g_cpu_present);
+    }
+
+    void AddCpu(CpuSpan span, double ms)
+    {
+        std::scoped_lock _{ g_cpu_mutex };
+        g_cpu_spans[(size_t)span].add(ms);
     }
 
     void MarkGpu(void* command_list, GpuPoint point, int eye)

@@ -1,3 +1,4 @@
+#include <CreationEngine/PerfStats.h>
 #include "BodyIK.h"
 
 #include <algorithm>
@@ -1823,7 +1824,21 @@ namespace body
         }
 
         // BSModelNode::UpdateTransforms: pose locals -> worlds -> synced to nodes, skin and geometry.
+        void* ModelNodeUpdateTransformsBody(std::uint8_t* model, const RE::NiTransform* root_local, RE::NiUpdateData* data, void* out);
+
+        // Times the player body's update; every other model passes straight through.
         void* ModelNodeUpdateTransforms(std::uint8_t* model, const RE::NiTransform* root_local, RE::NiUpdateData* data, void* out)
+        {
+            if (!g_state.root || model != *reinterpret_cast<std::uint8_t**>(reinterpret_cast<std::uint8_t*>(g_state.root) + kModelNodeOffset)) {
+                return ModelNodeUpdateTransformsBody(model, root_local, data, out);
+            }
+            const auto start  = std::chrono::steady_clock::now();
+            auto       result = ModelNodeUpdateTransformsBody(model, root_local, data, out);
+            PerfStats::AddCpu(PerfStats::CpuSpan::kBodyIk, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+            return result;
+        }
+
+        void* ModelNodeUpdateTransformsBody(std::uint8_t* model, const RE::NiTransform* root_local, RE::NiUpdateData* data, void* out)
         {
             const bool ours = g_state.active && g_calibration.status != Calibration::Status::Failed && g_state.root && root_local &&
                               model == *reinterpret_cast<std::uint8_t**>(reinterpret_cast<std::uint8_t*>(g_state.root) + kModelNodeOffset);
