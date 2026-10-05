@@ -89,6 +89,7 @@ public:
     }
 
     void                          UpdateWorldCamera();
+    void                          RotateSkyCameras(const RE::NiMatrix3& head_rotation);
     static void                   SnapshotAimPose();
     // Muzzle of the weapon held by the shown body, or null when the body is not driving the weapon.
     static RE::NiAVObject*        GetBodyMuzzle();
@@ -97,6 +98,7 @@ public:
     // The player fired: the weapon's pose in the first-person rig is sampled as its firing grip.
     static void                   NotifyPlayerFired();
     static void onNiAVObjectUpdateWorld(RE::NiAVObject* obj, RE::NiUpdateData* a_data);
+    static void onNiCameraUpdateWorld(RE::NiCamera* camera, RE::NiUpdateData* a_data);
     void onScaleformSetViewPort(uintptr_t* thisMovie, Scaleform::Gfx::Viewport* viewport);
 
     CreationEngineCameraManager(const CreationEngineCameraManager&)            = delete;
@@ -113,6 +115,11 @@ private:
     CreationEngineCameraManager()  = default;
     ~CreationEngineCameraManager() = default;
     std::unique_ptr<FunctionHook> m_onNiAVObjectUpdateWorldHook{};
+    std::unique_ptr<FunctionHook> m_onNiCameraUpdateWorldHook{};
+    // Head rotation relative to the game's camera, applied to the sky cameras as they update.
+    std::mutex                    m_sky_mutex{};
+    RE::NiMatrix3                 m_sky_head_rotation{};
+    bool                          m_sky_head_valid{ false };
     std::unique_ptr<FunctionHook> m_onUpdateWorldHook{};
     std::unique_ptr<FunctionHook> m_onPerformInputProcessingHook{};
     std::unique_ptr<FunctionHook> m_onCameraCutProcessEventHook{};
