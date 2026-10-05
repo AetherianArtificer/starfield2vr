@@ -69,13 +69,6 @@ void CreationEngineCameraManager::InstallHooks() {
                                                                    reinterpret_cast<uintptr_t>(&onNiAVObjectUpdateWorld));
     m_onNiAVObjectUpdateWorldHook->create();
 
-    // NiCamera::UpdateWorld computes a camera's world transform and hands it to the renderer.
-    if (auto camera_vtable = reinterpret_cast<uintptr_t*>(MemoryScan::VTable("NiCamera::vftable", ".?AVNiCamera@@", 0))) {
-        m_onNiCameraUpdateWorldHook = std::make_unique<FunctionHook>(camera_vtable[79], reinterpret_cast<uintptr_t>(&onNiCameraUpdateWorld));
-        m_onNiCameraUpdateWorldHook->create();
-    } else {
-        spdlog::error("[Sky] NiCamera vtable not found; the sky will not follow the head");
-    }
 
     REL::Relocation<uintptr_t> onGetCameraRotationAddr{ GameStore::MemoryOffsets::FirstPersonState::GetRotationQuatV() };
     m_onGetCameraRotationHook = std::make_unique<FunctionHook>(onGetCameraRotationAddr.address(), reinterpret_cast<uintptr_t>(&onFPSGetCameraRotation));
@@ -352,7 +345,6 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
 
     // In native stereo the world camera is the left eye and the right eye camera shares its parent.
     auto right_camera = vr->is_native_stereo() ? StereoViewModule::Get()->RightCamera() : nullptr;
-    RE::NiMatrix3 world_head_rotation{};
     auto place = [&](RE::NiCamera* camera, const glm::mat4& eye_transform) {
         glm::mat4 local;
         if (!GameFlow::isImmovable() && !GameFlow::isControlledByAI() && GameFlow::isInFirstPerson()) {
@@ -363,16 +355,15 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
             auto eye = eye_transform;
             eye[3]   = glm::vec4{ glm::vec3{ eye[3] } * tracking_scale, 1.0f };
             // The camera's parent carries the aim rotation; keep the view on the head.
-            local = glm::inverse(tracking::CameraParentAimRotation(vr->m_engine_frame_count)) * hmd_transform * eye;
+            // Native stereo turns the camera's parent with the head (see onFPSGetCameraRotation), so that rotation is undone.
+            const auto parent_aim = vr->is_native_stereo() ? tracking::AppliedAimRotation() : tracking::CameraParentAimRotation(vr->m_engine_frame_count);
+            local = glm::inverse(parent_aim) * hmd_transform * eye;
         } else {
             auto head_rotation = vr->get_transform(0);
             head_rotation[3] -= glm::vec4{ tracking::StandingOriginPosition(), 0.0f };
             local = head_rotation * eye_transform;
         }
         local = tracking::ToHavokSpace(local);
-        if (camera == worldCamera) {
-            world_head_rotation = *(RE::NiMatrix3*) &local;
-        }
         camera->local.rotate = originalRotation * *(RE::NiMatrix3*) &local;
         camera->local.translate.x = local[3][0];
         camera->local.translate.y = local[3][1];
@@ -388,89 +379,8 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
     } else {
         place(worldCamera, vr->get_current_eye_transform());
     }
-    {
-        std::scoped_lock _{ m_sky_mutex };
-        m_sky_head_rotation = world_head_rotation;
-        m_sky_head_valid    = right_camera != nullptr;
-    }
-    if (right_camera) {
-        RotateSkyCameras(world_head_rotation);
-    }
 }
 
-void CreationEngineCameraManager::RotateSkyCameras(const RE::NiMatrix3& head_rotation) {
-    // The stars, planets and galaxy are drawn by the starfield scene's own cameras, which follow the game's view but not
-    // the head; the head rotation is applied on top of whatever orientation the game gives them this frame.
-    struct Tracked {
-        RE::NiMatrix3 base_local{};
-        RE::NiMatrix3 written_local{};
-        RE::NiMatrix3 base_world{};
-        RE::NiMatrix3 written_world{};
-        bool          valid{ false };
-    };
-    static Tracked tracked[2]{};
-    auto root = CreationEngineSingletonManager::GetSceneGraphRoot();
-    if (root == nullptr) {
-        return;
-    }
-    auto same = [](const RE::NiMatrix3& a, const RE::NiMatrix3& b) { return std::memcmp(&a, &b, sizeof(RE::NiMatrix3)) == 0; };
-    RE::NiCamera* cameras[2]{ root->starfieldScene.pStarFieldCamera, root->starfieldScene.pGalaxyCamera };
-    for (int i = 0; i < 2; ++i) {
-        auto camera = cameras[i];
-        if (camera == nullptr) {
-            continue;
-        }
-        auto& t = tracked[i];
-        if (!t.valid || !same(camera->local.rotate, t.written_local)) {
-            t.base_local = camera->local.rotate;
-        }
-        if (!t.valid || !same(camera->world.rotate, t.written_world)) {
-            t.base_world = camera->world.rotate;
-        }
-        (void)t;
-    }
-
-    static int frames = 0;
-    if (++frames % 600 == 1) {
-        auto forward = [](RE::NiCamera* camera) {
-            return camera ? std::format("({:.2f}, {:.2f}, {:.2f})", camera->world.rotate.entry[0].pt[0], camera->world.rotate.entry[1].pt[0], camera->world.rotate.entry[2].pt[0])
-                          : std::string{ "none" };
-        };
-        spdlog::info("[Sky] Camera forward: world {}, starfield {}, galaxy {}", forward(root->worldCamera), forward(cameras[0]), forward(cameras[1]));
-    }
-}
-
-
-void CreationEngineCameraManager::onNiCameraUpdateWorld(RE::NiCamera* camera, RE::NiUpdateData* a_data) {
-    static auto instance = CreationEngineCameraManager::Get();
-    static auto original = instance->m_onNiCameraUpdateWorldHook->get_original<decltype(onNiCameraUpdateWorld)>();
-    auto        root     = CreationEngineSingletonManager::GetSceneGraphRoot();
-    const bool  sky      = root && camera && (camera == root->starfieldScene.pStarFieldCamera || camera == root->starfieldScene.pGalaxyCamera);
-    if (!sky) {
-        original(camera, a_data);
-        return;
-    }
-    RE::NiMatrix3 head{};
-    {
-        std::scoped_lock _{ instance->m_sky_mutex };
-        if (!instance->m_sky_head_valid) {
-            original(camera, a_data);
-            return;
-        }
-        head = instance->m_sky_head_rotation;
-    }
-    // The game sets the sky cameras from its own camera, which follows the aim; the head turns them for this update only.
-    const auto game_rotation = camera->local.rotate;
-    camera->local.rotate     = game_rotation * head;
-    original(camera, a_data);
-    camera->local.rotate = game_rotation;
-
-    static int logged = 0;
-    if (logged < 2) {
-        ++logged;
-        spdlog::info("[Sky] Head rotation applied to the {} camera as it updates", camera == root->starfieldScene.pStarFieldCamera ? "starfield" : "galaxy");
-    }
-}
 
 void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *fps, RE::NiQuaternion *quat_out) {
     static auto instance = CreationEngineCameraManager::Get();
@@ -502,7 +412,9 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
         auto current_hmd_rotation = vr->get_rotation(0);
         auto rotation_quat = glm::normalize(glm::quat_cast(tracking::ToHavokSpace(current_hmd_rotation)));
         auto ni_hmd_rotation = RE::NiQuaternion(rotation_quat.w, rotation_quat.x, rotation_quat.y, rotation_quat.z);
-        const auto aim_rotation = tracking::AimRotation();
+        // With native stereo the game camera follows the head, as everything the game draws relative to its camera (sky,
+        // galaxy, sun, audio) expects; the weapon keeps aiming with the hand through the muzzle launch override.
+        const auto aim_rotation = vr->is_native_stereo() ? current_hmd_rotation : tracking::AimRotation();
         const auto aim_quat = glm::normalize(glm::quat_cast(tracking::ToHavokSpace(aim_rotation)));
         const auto ni_aim_rotation = RE::NiQuaternion(aim_quat.w, aim_quat.x, aim_quat.y, aim_quat.z);
         {
