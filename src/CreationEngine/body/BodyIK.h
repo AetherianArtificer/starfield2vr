@@ -3,6 +3,7 @@
 namespace RE
 {
     class NiAVObject;
+    class NiUpdateData;
 }
 
 // Third-person body shown in first person with arm, leg and weapon IK.
@@ -12,6 +13,10 @@ namespace body
     void InstallModelNodeHook();
     // Called for each object as it updates its world transform; toggles the body at its 3P root.
     void OnUpdateWorld(RE::NiAVObject* obj, int engine_frame);
+    // The first-person rig's root has updated, its children have not: poses the rig's arms and weapon on the body.
+    bool OnFirstPersonRootUpdated(RE::NiAVObject* root, RE::NiUpdateData* data);
+    // The first-person rig is posed on the body this frame (its meshes must not follow the head).
+    bool FirstPersonArmsActive();
     // Muzzle of the weapon held by the shown body, or null when the body is not driving the weapon.
     RE::NiAVObject* GetBodyMuzzle();
     // Aim direction (game world) the held weapon was posed along this frame, if any.

@@ -376,17 +376,25 @@ namespace body
         Bones  g_first_bones;
         Bones* g_active_bones{ &g_body_bones };
 
-        void FindBones(const Pose& pose, const void* storage)
+        // Bones by name. Pose-buffer skeletons list their nodes in the model's sync list; a flattened node tree
+        // passes its nodes directly.
+        void FindBones(const Pose& pose, const void* storage, const std::vector<std::pair<int, RE::NiAVObject*>>* nodes = nullptr)
         {
             (*g_active_bones)         = {};
             (*g_active_bones).storage = storage;
             std::vector<std::pair<int, std::string>> named;
-            const auto entries = *reinterpret_cast<std::uint8_t**>(pose.model + 0x20);
-            const auto count   = *reinterpret_cast<std::uint32_t*>(pose.model + 0x18);
-            for (std::uint32_t e = 0; entries && e < count; ++e) {
-                const auto idx  = *reinterpret_cast<std::uint16_t*>(entries + e * 16);
-                const auto node = *reinterpret_cast<RE::NiAVObject**>(entries + e * 16 + 8);
-                if (!node || idx >= pose.count) {
+            std::vector<std::pair<int, RE::NiAVObject*>> listed;
+            if (nodes) {
+                listed = *nodes;
+            } else {
+                const auto entries = *reinterpret_cast<std::uint8_t**>(pose.model + 0x20);
+                const auto count   = *reinterpret_cast<std::uint32_t*>(pose.model + 0x18);
+                for (std::uint32_t e = 0; entries && e < count; ++e) {
+                    listed.emplace_back(*reinterpret_cast<std::uint16_t*>(entries + e * 16), *reinterpret_cast<RE::NiAVObject**>(entries + e * 16 + 8));
+                }
+            }
+            for (const auto& [idx, node] : listed) {
+                if (!node || idx < 0 || idx >= pose.count) {
                     continue;
                 }
                 const std::string_view name{ node->name.c_str() };
@@ -1812,6 +1820,8 @@ namespace body
             bool      active{ false };
             glm::vec3 origin{};
             float     attach_offset{ 0.0f };
+            float     attach_error{ -1.0f };
+            glm::vec3 root_translate{};
             bool      weapon{ false };
             bool      support{ false };
         };
@@ -1994,6 +2004,51 @@ namespace body
             input_requests::SetHeld(input_requests::kLeftTrigger, aim);
         }
 
+        // Moving parts of a weapon model by node name (receiver rig nodes and attach points), with a provisional
+        // mechanical class. Logged when the held weapon changes.
+        void LogWeaponParts(RE::NiAVObject* weapon)
+        {
+            static RE::NiAVObject* logged{ nullptr };
+            if (!weapon || weapon == logged) {
+                return;
+            }
+            logged = weapon;
+            int magazine = 0, bolt = 0;
+            bool p_mag = false, p_slide = false, p_foregrip = false, pump = false, battery = false, trigger = false, muzzle = false;
+            std::string names;
+            std::vector<RE::NiAVObject*> stack{ weapon };
+            RE::NiAVObject* children[96]{};
+            while (!stack.empty() && names.size() < 6000) {
+                auto node = stack.back();
+                stack.pop_back();
+                const std::string_view name{ node->name.c_str() };
+                if (!name.empty()) {
+                    names += " ";
+                    names += name;
+                }
+                if (Contains(name, "Magazine")) ++magazine;
+                if (name.size() >= 4 && Contains(name.substr(0, 4), "Bolt")) ++bolt;
+                p_mag      = p_mag || Contains(name, "P-Mag");
+                p_slide    = p_slide || Contains(name, "P-Slide");
+                p_foregrip = p_foregrip || Contains(name, "P-Foregrip");
+                pump       = pump || Contains(name, "Pump_Grip");
+                battery    = battery || Contains(name, "P-Battery");
+                trigger    = trigger || Contains(name, "Trigger");
+                muzzle     = muzzle || name == "ProjectileNode";
+                const auto count = ReadChildren(node, children, 96);
+                for (std::uint16_t i = 0; i < count; ++i) {
+                    if (children[i]) {
+                        stack.push_back(children[i]);
+                    }
+                }
+            }
+            const char* kind = pump ? "pump" : (!p_mag && magazine >= 5) ? "revolver/sequential" : battery ? "cell" : (p_slide || bolt > 0) && p_mag ? "magazine + slide/bolt"
+                             : p_mag ? "magazine" : "unknown";
+            spdlog::info("[Weapon] parts: magazine nodes {} bolt nodes {} P-Mag {} P-Slide {} P-Foregrip {} Pump_Grip {} P-Battery {} trigger {} muzzle {} -> {}",
+                magazine, bolt, p_mag, p_slide, p_foregrip, pump, battery, trigger, muzzle, kind);
+            spdlog::info("[Weapon] nodes:{}", names);
+        }
+
         // Frame at the collarbones: origin between them, forward from up x (left to right), up.
         Xf ShoulderFrame(const glm::vec3& left, const glm::vec3& right, const glm::vec3& up)
         {
@@ -2064,6 +2119,7 @@ namespace body
                 if (grip && aim) {
                     auto wrist_target = WristTarget(pose, r, *aim, *grip);
                     if (drawn) {
+                        LogWeaponParts(b.weapon_node);
                         auto muzzle   = b.weapon_node ? FindDescendant(b.weapon_node, "ProjectileNode") : nullptr;
                         g_body_muzzle = muzzle;
 
@@ -2168,6 +2224,130 @@ namespace body
             UpdateWeaponActions(pose, weapon_xf, drawn);
         }
 
+        // The first-person rig updates node by node (no pose buffer: only the third-person root gets a model node),
+        // parents before children, and its meshes capture their bones as they update. When its root has updated,
+        // its tree is flattened into the pose layout the IK uses, solved, and the changed locals are written back
+        // before any child updates.
+        struct FlatRig
+        {
+            std::vector<RE::NiAVObject*> nodes;
+            std::vector<std::uint16_t>   parent;
+            std::vector<RE::NiTransform> local;
+            std::vector<RE::NiTransform> world;
+            std::uint16_t                top{ 0 };
+            std::size_t                  signature{ 0 };
+        };
+        FlatRig g_flat;
+
+        void FlattenRig(RE::NiAVObject* root)
+        {
+            auto& f = g_flat;
+            f.nodes.clear();
+            f.parent.clear();
+            RE::NiAVObject* children[96]{};
+            auto count = ReadChildren(root, children, 96);
+            for (std::uint16_t i = 0; i < count; ++i) {
+                if (children[i]) {
+                    f.nodes.push_back(children[i]);
+                    f.parent.push_back(0);
+                }
+            }
+            f.top = static_cast<std::uint16_t>(f.nodes.size());
+            for (std::size_t i = 0; i < f.nodes.size() && f.nodes.size() < 1024; ++i) {
+                count = ReadChildren(f.nodes[i], children, 96);
+                for (std::uint16_t c = 0; c < count; ++c) {
+                    if (children[c]) {
+                        f.nodes.push_back(children[c]);
+                        f.parent.push_back(static_cast<std::uint16_t>(i));
+                    }
+                }
+            }
+            std::size_t signature = f.nodes.size();
+            for (auto* node : f.nodes) {
+                signature = signature * 1315423911u ^ reinterpret_cast<std::uintptr_t>(node);
+            }
+            f.signature = signature;
+        }
+
+        bool g_first_person_handled{ false };
+
+        bool HandleFirstPersonRoot(RE::NiAVObject* root, RE::NiUpdateData* data)
+        {
+            g_first_person_handled = false;
+            if (!g_state.active || !GameFlow::gStore.internalSettings.firstPersonArms || !root) {
+                return false;
+            }
+            const auto previous = g_flat.signature;
+            FlattenRig(root);
+            auto& f = g_flat;
+            if (f.nodes.empty()) {
+                return false;
+            }
+            const bool rebuilt = previous != f.signature;
+            if (rebuilt) {
+                g_written_first.clear();
+            }
+            // Writes the animation did not replace are put back to their animated value before reading.
+            for (const auto& [index, entry] : g_written_first) {
+                if (index < static_cast<int>(f.nodes.size()) && std::memcmp(&f.nodes[index]->local, &entry.written, sizeof(RE::NiTransform)) == 0) {
+                    f.nodes[index]->local = entry.animated;
+                }
+            }
+            g_written_first.clear();
+            f.local.resize(f.nodes.size());
+            f.world.resize(f.nodes.size());
+            for (std::size_t i = 0; i < f.nodes.size(); ++i) {
+                f.local[i] = f.nodes[i]->local;
+                f.world[i] = f.nodes[i]->local;
+            }
+
+            Pose pose;
+            pose.local  = f.local.data();
+            pose.world  = f.world.data();
+            pose.parent = f.parent.data();
+            pose.count  = static_cast<std::uint16_t>(f.nodes.size());
+            pose.top    = f.top;
+            pose.root   = FromNi(root->world);
+
+            g_active_bones   = &g_first_bones;
+            g_written_active = &g_written_first;
+            g_finger_palm    = g_finger_palm_first;
+            if (rebuilt || g_first_bones.storage == nullptr) {
+                std::vector<std::pair<int, RE::NiAVObject*>> listed;
+                for (std::size_t i = 0; i < f.nodes.size(); ++i) {
+                    listed.emplace_back(static_cast<int>(i), f.nodes[i]);
+                }
+                FindBones(pose, reinterpret_cast<const void*>(f.signature), &listed);
+                spdlog::info("[BodyIK] first-person rig: {} nodes under '{}' (top {})", f.nodes.size(), root->name.c_str(), f.top);
+            }
+
+            glm::vec3 origin{ 0.0f };
+            if (data) {
+                if (auto saved = *reinterpret_cast<RE::NiPoint3**>(reinterpret_cast<std::uint8_t*>(data) + 0x28)) {
+                    origin = ToVec(*saved);
+                }
+            }
+            RE::NiTransform root_world = root->world;
+            ApplyFirstPerson(pose, origin, root_world);
+            g_fp_diag.root_translate = ToVec(root->world.translate);
+            if (g_fp_diag.active && g_first_bones.right.clavicle >= 0) {
+                g_fp_diag.attach_error = glm::length(pose.GameWorld(g_first_bones.right.clavicle).t - g_body_shoulders.right);
+            }
+            if (g_fp_diag.active) {
+                root->world = root_world;
+                for (const auto& [index, entry] : g_written_first) {
+                    if (index >= 0 && index < static_cast<int>(f.nodes.size())) {
+                        f.nodes[index]->local = f.local[index];
+                    }
+                }
+                g_first_person_handled = true;
+            }
+            g_active_bones   = &g_body_bones;
+            g_written_active = &g_written_body;
+            g_finger_palm    = g_finger_palm_body;
+            return g_first_person_handled;
+        }
+
         safetyhook::InlineHook g_model_update_hook;
 
         // The pose-buffer conventions are measured against the engine before any write.
@@ -2249,38 +2429,6 @@ namespace body
         // BSModelNode::UpdateTransforms: pose locals -> worlds -> synced to nodes, skin and geometry.
         void* ModelNodeUpdateTransforms(std::uint8_t* model, const RE::NiTransform* root_local, RE::NiUpdateData* data, void* out)
         {
-            // First-person rig, when its arms are shown on the body.
-            if (g_state.active && root_local && GameFlow::gStore.internalSettings.firstPersonArms) {
-                auto player = CreationEngineSingletonManager::GetPlayerRef();
-                auto first  = player ? FirstPersonRoot(player) : nullptr;
-                if (first && model == *reinterpret_cast<std::uint8_t**>(reinterpret_cast<std::uint8_t*>(first) + kModelNodeOffset) && !RagdollActive(model)) {
-                    Pose pose = ReadPose(model, root_local);
-                    if (pose.local) {
-                        g_active_bones   = &g_first_bones;
-                        g_written_active = &g_written_first;
-                        g_finger_palm    = g_finger_palm_first;
-                        const auto storage = *reinterpret_cast<void**>(model + 0x10);
-                        if (g_first_bones.storage != storage) {
-                            FindBones(pose, storage);
-                            g_written_first.clear();
-                        }
-                        RestoreAnimated(pose);
-                        glm::vec3 origin{ 0.0f };
-                        if (data) {
-                            if (auto saved = *reinterpret_cast<RE::NiPoint3**>(reinterpret_cast<std::uint8_t*>(data) + 0x28)) {
-                                origin = ToVec(*saved);
-                            }
-                        }
-                        RE::NiTransform root = *root_local;
-                        ApplyFirstPerson(pose, origin, root);
-                        g_active_bones   = &g_body_bones;
-                        g_written_active = &g_written_body;
-                        g_finger_palm    = g_finger_palm_body;
-                        return g_model_update_hook.call<void*>(model, &root, data, out);
-                    }
-                }
-            }
-
             const bool ours = g_state.active && g_calibration.status != Calibration::Status::Failed && g_state.root && root_local &&
                               model == *reinterpret_cast<std::uint8_t**>(reinterpret_cast<std::uint8_t*>(g_state.root) + kModelNodeOffset);
             Pose            pose;
@@ -2479,8 +2627,9 @@ namespace body
                         g_track_diag.supported, g_track_diag.active, g_track_diag.valid, g_track_diag.torso, g_track_diag.elbow[0], g_track_diag.elbow[1],
                         g_track_diag.legs, g_track_diag.fingers[0], g_track_diag.hand_source[0], g_track_diag.index_bend[0], g_track_diag.fingers[1],
                         g_track_diag.hand_source[1], g_track_diag.index_bend[1], g_finger_diag[1].trigger);
-                    spdlog::info("[BodyIK] first-person arms: active {} origin ({:.1f},{:.1f},{:.1f}) attach {:.2f} m | weapon {} support {}",
-                        g_fp_diag.active, g_fp_diag.origin.x, g_fp_diag.origin.y, g_fp_diag.origin.z, g_fp_diag.attach_offset, g_fp_diag.weapon,
+                    spdlog::info("[BodyIK] first-person arms: active {} live {} origin ({:.1f},{:.1f},{:.1f}) root ({:.2f},{:.2f},{:.2f}) attach move {:.2f} m error {:.3f} m | weapon {} support {}",
+                        g_fp_diag.active, FirstPersonArmsLive(), g_fp_diag.origin.x, g_fp_diag.origin.y, g_fp_diag.origin.z, g_fp_diag.root_translate.x,
+                        g_fp_diag.root_translate.y, g_fp_diag.root_translate.z, g_fp_diag.attach_offset, g_fp_diag.attach_error, g_fp_diag.weapon,
                         g_fp_diag.support);
                     {
                         auto player = CreationEngineSingletonManager::GetPlayerRef();
@@ -2535,5 +2684,18 @@ namespace body
     void NotifyPlayerFired()
     {
         g_fire_sample = true;
+    }
+}
+
+namespace body
+{
+    bool OnFirstPersonRootUpdated(RE::NiAVObject* root, RE::NiUpdateData* data)
+    {
+        return HandleFirstPersonRoot(root, data);
+    }
+
+    bool FirstPersonArmsActive()
+    {
+        return g_first_person_handled && FirstPersonArmsLive();
     }
 }

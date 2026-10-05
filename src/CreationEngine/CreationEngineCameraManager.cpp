@@ -149,10 +149,15 @@ void CreationEngineCameraManager::onNiAVObjectUpdateWorld(RE::NiAVObject *obj, R
         body::OnUpdateWorld(obj, vr->m_engine_frame_count);
 
         auto camera_root = getCameraRootNode();
+        if (camera_root && obj == camera_root) {
+            original_func(obj, a_data);
+            body::OnFirstPersonRootUpdated(obj, a_data);
+            return;
+        }
         if (obj->parent && camera_root && camera_root == obj->parent) {
             const bool is_mesh = !std::strstr(obj->name.c_str(), "Camera");
             original_func(obj, a_data);
-            if (is_mesh) {
+            if (is_mesh && !body::FirstPersonArmsActive()) {
                 UpdateMesh(obj);
             }
             return;
