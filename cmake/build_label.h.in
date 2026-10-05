@@ -1,0 +1,3 @@
+#pragma once
+
+#define SFVR_BUILD_LABEL "@SFVR_GIT_BRANCH@ @SFVR_GIT_COMMIT@"
