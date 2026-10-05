@@ -503,9 +503,6 @@ void StereoViewModule::OnFrameStart()
         StartCensus();
         vr->request_backbuffer_dump(Framework::get_persistent_dir(std::format("vr_native_stereo_{}.png", variant)).wstring());
     }
-    if (gameplay && m_stereo_frames == kFramesUntilSnapshot + 30) {
-        AdvanceExperiment();
-    }
 }
 
 void StereoViewModule::LogRenderSizes() const
@@ -540,9 +537,15 @@ void StereoViewModule::ApplyViewports(bool side_by_side)
                 std::memcpy(m_saved_starfield_viewport, &At<float>(starfield_camera, kCameraViewport), sizeof(m_saved_starfield_viewport));
                 std::memcpy(m_saved_starfield_scissors, &At<float>(starfield_camera, kCameraScissors), sizeof(m_saved_starfield_scissors));
             }
+            const float full[4]{ 0.0f, 1.0f, 1.0f, 0.0f };
             if (std::abs(m_saved_viewport[1] - m_saved_viewport[0]) < 0.01f) {
-                const float full[4]{ 0.0f, 1.0f, 1.0f, 0.0f };
                 std::memcpy(m_saved_viewport, full, sizeof(full));
+            }
+            if (std::abs(m_saved_scissors[1] - m_saved_scissors[0]) < 0.99f) {
+                std::memcpy(m_saved_scissors, full, sizeof(full));
+            }
+            if (std::abs(m_saved_starfield_scissors[1] - m_saved_starfield_scissors[0]) < 0.99f) {
+                std::memcpy(m_saved_starfield_scissors, full, sizeof(full));
             }
             spdlog::info("[Stereo] Splitting views; world camera viewport was ({}, {}, {}, {}) scissors ({}, {}, {}, {})", m_saved_viewport[0], m_saved_viewport[1],
                          m_saved_viewport[2], m_saved_viewport[3], m_saved_scissors[0], m_saved_scissors[1], m_saved_scissors[2], m_saved_scissors[3]);
@@ -553,12 +556,16 @@ void StereoViewModule::ApplyViewports(bool side_by_side)
         const float left_half[4]{ m_saved_viewport[0], middle, m_saved_viewport[2], m_saved_viewport[3] };
         const float right_half[4]{ middle, m_saved_viewport[1], m_saved_viewport[2], m_saved_viewport[3] };
 
-        // The engine may reset a camera's viewport, so it is reapplied whenever it differs.
+        // The engine may reset a camera's viewport, so it is reapplied whenever it differs. Scissors stay full: culling
+        // tests each eye's own screen space against them, so a half-width scissor culls half of every eye's view.
         const bool world_draws = m_left_camera == nullptr || m_menu_fallback.load();
         for (auto camera : { m_left_camera, world_draws ? world_camera : nullptr, starfield_camera }) {
             if (camera && !SameRect(camera, kCameraViewport, left_half)) {
                 SetCameraRect(camera, offsets::NiCameraSetViewport(), left_half);
-                SetCameraRect(camera, offsets::NiCameraSetScissors(), left_half);
+            }
+            const float* full_scissors = camera == starfield_camera ? m_saved_starfield_scissors : m_saved_scissors;
+            if (camera && !SameRect(camera, kCameraScissors, full_scissors)) {
+                SetCameraRect(camera, offsets::NiCameraSetScissors(), full_scissors);
             }
         }
         if (!world_draws && !SameRect(world_camera, kCameraViewport, m_saved_viewport)) {
@@ -567,7 +574,9 @@ void StereoViewModule::ApplyViewports(bool side_by_side)
         }
         if (m_right_camera && !SameRect(m_right_camera, kCameraViewport, right_half)) {
             SetCameraRect(m_right_camera, offsets::NiCameraSetViewport(), right_half);
-            SetCameraRect(m_right_camera, offsets::NiCameraSetScissors(), right_half);
+        }
+        if (m_right_camera && !SameRect(m_right_camera, kCameraScissors, m_saved_scissors)) {
+            SetCameraRect(m_right_camera, offsets::NiCameraSetScissors(), m_saved_scissors);
         }
     } else if (m_viewports_split) {
         SetCameraRect(world_camera, offsets::NiCameraSetViewport(), m_saved_viewport);
