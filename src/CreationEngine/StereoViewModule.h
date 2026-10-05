@@ -96,10 +96,12 @@ private:
     static uintptr_t onSetMultiCameraViewData(void* column, uint32_t graph_index, ViewIdArray* views);
     static uintptr_t onSubmitRenderGraph(void* frame_list, void* record);
     static uintptr_t onScaleformComposite(void* pass, void* render_graph_data, void* pass_data);
+    static uintptr_t onSetupSceneView(uintptr_t a1, uintptr_t view, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8);
 
     std::unique_ptr<FunctionHook> m_set_multi_view_hook{};
     std::unique_ptr<FunctionHook> m_submit_graph_hook{};
     std::unique_ptr<FunctionHook> m_scaleform_composite_hook{};
+    std::unique_ptr<FunctionHook> m_setup_view_hook{};
     std::unique_ptr<FunctionHook> m_upscaler_hooks[kUpscalerPassCount]{};
     std::unique_ptr<FunctionHook> m_late_hooks[kLatePassCount]{};
 

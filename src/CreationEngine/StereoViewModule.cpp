@@ -346,6 +346,12 @@ void StereoViewModule::InstallHooks()
     m_submit_graph_hook->create();
     InstallUpscalerHooks();
     InstallLatePassHooks();
+    if (auto setup = offsets::SetupSceneView()) {
+        m_setup_view_hook = std::make_unique<FunctionHook>(setup, reinterpret_cast<uintptr_t>(&onSetupSceneView));
+        m_setup_view_hook->create();
+    } else {
+        spdlog::error("[Stereo] Scene view setup not found; the right eye's DLSS gets the left eye's constants");
+    }
     if (auto vtable = reinterpret_cast<uintptr_t*>(
             MemoryScan::VTable("ScaleformCompositeRenderPass", ".?AVScaleformCompositeRenderPass@CreationRendererPrivate@@", 0))) {
         m_scaleform_composite_hook = std::make_unique<FunctionHook>(vtable[7], reinterpret_cast<uintptr_t>(&onScaleformComposite));
@@ -1039,3 +1045,22 @@ int StereoViewModule::EyeOfGraph(void* render_graph_data) const
     return -1;
 }
 
+
+uintptr_t StereoViewModule::onSetupSceneView(uintptr_t a1, uintptr_t view, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8)
+{
+    static auto instance = Get();
+    using func_t         = uintptr_t(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+    static auto original = instance->m_setup_view_hook->get_original<func_t>();
+    static auto vr       = VR::get();
+
+    // The view's DLSS constants are sent from here, outside the DLSS passes: the right eye's go to its own viewport.
+    const bool right = vr->is_native_stereo() && instance->m_registered && view != 0 &&
+                       (At<uint32_t>(reinterpret_cast<void*>(view), 0x24) & 0xFFFFFF) == (instance->m_right_view_id & 0xFFFFFF);
+    if (!right) {
+        return original(a1, view, a3, a4, a5, a6, a7, a8);
+    }
+    UpscalerAfrNvidiaModule::set_secondary_view(true);
+    const auto result = original(a1, view, a3, a4, a5, a6, a7, a8);
+    UpscalerAfrNvidiaModule::set_secondary_view(false);
+    return result;
+}
