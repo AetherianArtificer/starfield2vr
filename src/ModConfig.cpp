@@ -253,10 +253,10 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             }
             x_was_down = x_down;
         }
-        if (is_action_active_any_joystick(m_action_b_button_left))  buttons |= XINPUT_GAMEPAD_Y;
+        const auto modifier_down = is_action_active_any_joystick(m_action_b_button_left);
 
         if (is_left_joystick_click_down)  buttons |= XINPUT_GAMEPAD_LEFT_THUMB;
-        if (is_right_joystick_click_down && !is_action_active_any_joystick(m_action_system_button)) buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+        if (is_right_joystick_click_down && !modifier_down) buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
 
         const auto left_trigger_down  = is_action_active(m_action_trigger, left_joystick);
         const auto right_trigger_down = is_action_active(m_action_trigger, right_joystick);
@@ -267,24 +267,18 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         const auto now = clock::now();
         const auto left_axis  = get_joystick_axis(left_joystick);
 
-        // The grips are the hands' own (grabbing); they send nothing to the game. The menu button is the modifier:
-        // tap = Start (pause), hold alone = View/Back (data menus); held with the left stick = D-pad, with the
-        // left trigger = LB, with the right trigger = RB, with the left stick click = flat-screen view, with the
-        // right stick click = eye screenshots.
-        static bool              menu_was_down{false};
-        static bool              menu_used_as_modifier{false};
-        static clock::time_point menu_down_since{};
-        static clock::time_point start_pulse_until{};
-        static clock::time_point back_pulse_until{};
+        // The grips are the hands' own (grabbing); they send nothing to the game. Y is the modifier: a tap sends Y;
+        // held with the left stick = D-pad, with the left trigger = LB, with the right trigger = RB, with the left
+        // stick click = flat-screen view, with the right stick click = eye screenshots. (Virtual Desktop owns a held
+        // menu button.)
+        static bool              modifier_was_down{false};
+        static bool              modifier_used{false};
+        static clock::time_point y_pulse_until{};
 
-        const auto menu_down = is_action_active_any_joystick(m_action_system_button);
-        if (menu_down) {
-            if (!menu_was_down) {
-                menu_down_since = now;
-            }
+        if (modifier_down) {
             if (std::abs(left_axis.x) >= kStickDeflection || std::abs(left_axis.y) >= kStickDeflection || is_left_joystick_click_down ||
                 is_right_joystick_click_down || left_trigger_down || right_trigger_down) {
-                menu_used_as_modifier = true;
+                modifier_used = true;
             }
             if (left_axis.y >= kStickDeflection)  buttons |= XINPUT_GAMEPAD_DPAD_UP;
             if (left_axis.y <= -kStickDeflection) buttons |= XINPUT_GAMEPAD_DPAD_DOWN;
@@ -299,7 +293,6 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
                 pXinputGamepad->bRightTrigger = 0;
             }
             if (is_right_joystick_click_down) {
-                menu_used_as_modifier = true;
                 static clock::time_point last_screenshot{};
                 if (now - last_screenshot > kMenuHold) {
                     last_screenshot = now;
@@ -315,24 +308,42 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
                     flat_screen = !flat_screen;
                 }
             }
-        } else if (menu_was_down) {
-            if (!menu_used_as_modifier) {
-                (now - menu_down_since < kMenuHold ? start_pulse_until : back_pulse_until) = now + kTapPulse;
+        } else if (modifier_was_down) {
+            if (!modifier_used) {
+                y_pulse_until = now + kTapPulse;
             }
-            menu_used_as_modifier = false;
+            modifier_used = false;
+        }
+        modifier_was_down = modifier_down;
+        if (now < y_pulse_until) buttons |= XINPUT_GAMEPAD_Y;
+
+        // Menu button: tap = Start (pause), hold = View/Back (data menus).
+        static bool              menu_was_down{false};
+        static clock::time_point menu_down_since{};
+        static clock::time_point start_pulse_until{};
+
+        const auto menu_down = is_action_active_any_joystick(m_action_system_button);
+        if (menu_down) {
+            if (!menu_was_down) {
+                menu_down_since = now;
+            }
+            if (now - menu_down_since >= kMenuHold) {
+                buttons |= XINPUT_GAMEPAD_BACK;
+            }
+        } else if (menu_was_down && now - menu_down_since < kMenuHold) {
+            start_pulse_until = now + kTapPulse;
         }
         menu_was_down = menu_down;
 
         if (now < start_pulse_until) buttons |= XINPUT_GAMEPAD_START;
-        if (now < back_pulse_until)  buttons |= XINPUT_GAMEPAD_BACK;
 
         if (is_action_active_any_joystick(m_action_dpad_up))    buttons |= XINPUT_GAMEPAD_DPAD_UP;
         if (is_action_active_any_joystick(m_action_dpad_right)) buttons |= XINPUT_GAMEPAD_DPAD_RIGHT;
         if (is_action_active_any_joystick(m_action_dpad_down))  buttons |= XINPUT_GAMEPAD_DPAD_DOWN;
         if (is_action_active_any_joystick(m_action_dpad_left))  buttons |= XINPUT_GAMEPAD_DPAD_LEFT;
 
-        // The left stick is a D-pad while the menu button is held.
-        if (!menu_down) {
+        // The left stick is a D-pad while Y is held.
+        if (!modifier_down) {
             pXinputGamepad->sThumbLX = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbLX + move_axis.x * 32767.0f, -32767.0f, 32767.0f);
             pXinputGamepad->sThumbLY = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbLY + move_axis.y * 32767.0f, -32767.0f, 32767.0f);
         }
@@ -340,7 +351,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             pXinputGamepad->sThumbRX = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbRX + look_axis.x * 32767.0f, -32767.0f, 32767.0f);
         }
         pXinputGamepad->sThumbRY = (int16_t)std::clamp<float>((float)pXinputGamepad->sThumbRY + look_axis.y * 32767.0f, -32767.0f, 32767.0f);
-        if (block_sprint && !menu_down) {
+        if (block_sprint && !modifier_down) {
             buttons &= ~XINPUT_GAMEPAD_LEFT_THUMB;
         }
 
@@ -380,7 +391,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             pXinputGamepad->wButtons |= XINPUT_GAMEPAD_LEFT_THUMB;
         }
 
-        if (is_right_joystick_click_down && !is_action_active_any_joystick(m_action_system_button)) {
+        if (is_right_joystick_click_down) {
             pXinputGamepad->wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB;
         }
     }
