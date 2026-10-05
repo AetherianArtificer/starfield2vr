@@ -91,31 +91,6 @@ void CreationEngineRendererModule::RenderGraphStart(RE::CreationRendererPrivate:
         GameFlow::resetGameState();
         ModSettings::g_internalSettings.showQuadDisplay = GameFlow::isShowingMenu();
     }
-
-    // GPU timestamps as graphs finish recording, where their command list is known to be open.
-    if (before || pGraph->name == nullptr || pRenderGraphData == nullptr) {
-        return;
-    }
-    const bool frame_start = strcmp(pGraph->name, "CRBeginFrame") == 0;
-    const bool frame_end   = strcmp(pGraph->name, "CREndFrame") == 0;
-    const bool scene       = strcmp(pGraph->name, "Frame") == 0;
-    if (!frame_start && !frame_end && !scene) {
-        return;
-    }
-    auto context = reinterpret_cast<RE::RenderGraphDataD3D12Context*>(pRenderGraphData->getCommandList());
-    if (context == nullptr || context->pID3D12CommandList == nullptr) {
-        return;
-    }
-    const int frame = GameFlow::renderLoopFrameCount();
-    static std::atomic<int> scene_graphs{ 0 };
-    if (frame_start) {
-        scene_graphs = 0;
-        PerfStats::MarkGpu(context->pID3D12CommandList, PerfStats::GpuPoint::kFrameStart, frame);
-    } else if (frame_end) {
-        PerfStats::MarkGpu(context->pID3D12CommandList, PerfStats::GpuPoint::kFrameEnd, frame);
-    } else if (const int order = scene_graphs.fetch_add(1); order < 2) {
-        PerfStats::MarkGpu(context->pID3D12CommandList, order == 0 ? PerfStats::GpuPoint::kFirstEye : PerfStats::GpuPoint::kSecondEye, frame);
-    }
 }
 
 //__int64 CreationEngineRendererModule::onRenderFrameStart(void* pVoid, __int64 i, __int64 i1, __int64 i2)
