@@ -120,6 +120,12 @@ namespace body
                 return player && (Flags(player, kRigModeFlags) & 8) != 0;
             }
 
+            // Game 1.16.244 addresses without a unique signature.
+            std::uintptr_t GameAddress(std::uintptr_t offset)
+            {
+                return reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)) + offset;
+            }
+
             template <class Fn>
             Fn Resolve(const char* pattern, std::uintptr_t offset)
             {
@@ -143,8 +149,8 @@ namespace body
                 static auto hide_slots  = Resolve<hide_slots_t>("48 89 5C 24 10 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 50 45 0F B6 F8 44", 0x50c140);
                 static auto hide_helmet = Resolve<hide_helmet_t>("48 89 5C 24 10 48 89 74 24 18 57 48 83 EC 30 41 8B F8 0F", 0xb71430);
                 static auto refresh     = Resolve<refresh_t>("48 89 5C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 D9 48 81 EC A0 00 00 00 48 8B F1", 0x1a34a50);
-                static auto blend       = reinterpret_cast<blend_t>(MemoryScan::FuncRelocation("", 0x1a3ce80, 0));
-                static auto mask_addr   = MemoryScan::FuncRelocation("", 0x5F46750, 0);
+                static auto blend       = reinterpret_cast<blend_t>(GameAddress(0x1a3ce80));
+                static auto mask_addr   = GameAddress(0x5F46750);
                 const auto  mask        = *reinterpret_cast<std::uint32_t*>(mask_addr);
 
                 Flags(player, kLiveBodyFlags) |= 8;
