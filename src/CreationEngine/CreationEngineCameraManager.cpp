@@ -234,6 +234,10 @@ CreationEngineCameraManager::onScaleformSetViewPortInternal(uintptr_t *thisMovie
         // Dominant eye is left
         offset_left = (current_eye == VRRuntime::Eye::LEFT) ? settings.perspective : 0;
     }
+    // Native stereo draws one UI layer for both eyes and separates it when presenting.
+    if (vr->is_native_stereo()) {
+        offset_left = 0;
+    }
 
     auto visible_width = std::min((int) ((float) backbuffer_size[0] * width_multiplier), viewport_buffer_width);
     auto visible_height = std::min((int) ((float) backbuffer_size[1] * height_multiplier), viewport_buffer_height);

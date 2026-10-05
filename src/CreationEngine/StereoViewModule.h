@@ -54,6 +54,9 @@ private:
     void ApplyViewports(bool side_by_side);
     bool RenewRightCamera();
     void ApplyNativeShadowSettings(bool native);
+    void DisableFrameGeneration();
+    void*        m_frame_generation_setting{ nullptr };
+    bool         m_frame_generation_looked_up{ false };
     void UpdateMenuFallback(bool native);
     bool  m_shadow_settings_applied{ false };
     float m_saved_shadow_fade_seconds{ 0.75f };
@@ -67,6 +70,8 @@ private:
     [[nodiscard]] std::string Variant() const;
     std::atomic<bool> m_renew_right_camera{ false };
     int               m_right_camera_generation{ 0 };
+    float             m_eye_near{ -1.0f };
+    float             m_eye_far{ -1.0f };
     // Diagnostic sequence: each configuration is captured once during first-person gameplay.
     void              AdvanceExperiment();
     int               m_experiment_stage{ 0 };
@@ -125,6 +130,8 @@ private:
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> m_eye_capture{};
     std::array<bool, 2>                                   m_eye_capture_ready{};
     std::atomic<int>                                      m_capture_logs{ 0 };
+    Microsoft::WRL::ComPtr<ID3D12Resource>                m_ui_capture{};
+    void                                                  CaptureUiLayer(void* render_graph_data, void* pass_data);
     std::unique_ptr<FunctionHook> m_primary_view_hook{};
     // The right eye renders in its own render graph, so it never shares the left eye's working buffers.
     std::unique_ptr<FunctionHook> m_submit_graph_hook{};

@@ -480,6 +480,9 @@ void StereoViewModule::OnFrameStart()
     UpdateMenuFallback(native);
     ApplyViewports(native && m_double_width);
     ApplyNativeShadowSettings(native);
+    if (native) {
+        DisableFrameGeneration();
+    }
     if (!native) {
         m_missed_appends = 0;
         vr->set_native_mono_frame(false);
@@ -686,6 +689,19 @@ void StereoViewModule::UpdateRightFrustum()
         return;
     }
     auto world_camera = root->worldCamera;
+    // The game moves its camera's near plane (much closer in first person than while loading); the eye cameras follow.
+    const float near_plane = world_camera->viewFrustum._near;
+    const float far_plane  = world_camera->viewFrustum._far;
+    if (near_plane != m_eye_near || far_plane != m_eye_far) {
+        m_eye_near = near_plane;
+        m_eye_far  = far_plane;
+        for (auto camera : { m_right_camera, m_left_camera }) {
+            if (camera) {
+                Fn<void (*)(void*, float, float)>(offsets::NiCameraSetNearFar())(camera, near_plane, far_plane);
+            }
+        }
+        spdlog::info("[Stereo] Eye cameras near {} far {}", near_plane, far_plane);
+    }
     At<float>(m_right_camera, kCameraMinNear) = At<float>(world_camera, kCameraMinNear);
     At<float>(m_right_camera, kCameraAspect)  = At<float>(world_camera, kCameraAspect);
     if (At<uint8_t>(m_right_camera, kCameraClipspaceType) != At<uint8_t>(world_camera, kCameraClipspaceType)) {
@@ -994,6 +1010,9 @@ uintptr_t StereoViewModule::onScaleformComposite(void* pass, void* render_graph_
 
     if (vr->is_native_stereo() && instance->m_double_width && pass_data != nullptr && GameFlow::gStore.internalSettings.stereoHudBothEyes) {
         instance->MirrorHudToRightEye(render_graph_data, pass_data);
+    }
+    if (vr->is_native_stereo() && !instance->m_double_width && pass_data != nullptr) {
+        instance->CaptureUiLayer(render_graph_data, pass_data);
     }
     if (vr->is_native_stereo() && pass_data != nullptr && instance->m_composite_logs.fetch_add(1) < 4) {
         auto data  = static_cast<RE::CreationRendererPrivate::RenderPassData*>(pass_data);
@@ -1451,4 +1470,74 @@ void StereoViewModule::CaptureEyeImage(uint32_t eye, void* render_graph_data, vo
     };
     command_list->ResourceBarrier(2, restore);
     vr->set_native_eye_source(eye, capture.Get());
+}
+
+void StereoViewModule::DisableFrameGeneration()
+{
+    // Generated frames are interpolated from consecutive presented images, which in native stereo hold the eyes in turn.
+    if (!m_frame_generation_looked_up) {
+        m_frame_generation_looked_up = true;
+        for (auto type : { CreationEngineSettings::SettingType::kINIPrefSetting, CreationEngineSettings::SettingType::kINISetting }) {
+            if ((m_frame_generation_setting = CreationEngineSettings::get_setting("uiFrameGenerationTech:Display", type)) != nullptr) {
+                break;
+            }
+        }
+        if (m_frame_generation_setting == nullptr) {
+            spdlog::warn("[Stereo] Frame generation setting not found");
+        }
+    }
+    auto setting = static_cast<RE::Setting*>(m_frame_generation_setting);
+    if (setting && setting->GetValue<uint32_t>(0) != 0) {
+        spdlog::info("[Stereo] Frame generation {} turned off for native stereo", setting->GetValue<uint32_t>(0));
+        setting->SetValue<uint32_t>(0);
+    }
+}
+
+void StereoViewModule::CaptureUiLayer(void* render_graph_data, void* pass_data)
+{
+    static auto vr    = VR::get();
+    auto        data  = static_cast<RE::CreationRendererPrivate::RenderPassData*>(pass_data);
+    auto        graph = static_cast<RE::CreationRendererPrivate::RenderGraphData*>(render_graph_data);
+    if (data->renderPassItems == nullptr || data->renderPassItems->_size == 0) {
+        return;
+    }
+    auto context = reinterpret_cast<RE::RenderGraphDataD3D12Context*>(graph->getCommandList());
+    auto item    = data->getRenderPassItemByIndex(0);
+    auto layer   = data->getNativeResourceByIndex(0);
+    if (context == nullptr || context->pID3D12CommandList == nullptr || item == nullptr || layer == nullptr) {
+        return;
+    }
+    // The first texture of the composite is the UI layer.
+    const auto desc  = layer->GetDesc();
+    const auto state = (D3D12_RESOURCE_STATES)RE::CreationRendererPrivate::RenderPassItem::getDXGIState(item->stateOrFlags);
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 || desc.Width < 64) {
+        return;
+    }
+    if (m_ui_capture == nullptr || m_ui_capture->GetDesc().Width != desc.Width || m_ui_capture->GetDesc().Height != desc.Height || m_ui_capture->GetDesc().Format != desc.Format) {
+        m_ui_capture.Reset();
+        auto capture_desc = CD3DX12_RESOURCE_DESC::Tex2D(desc.Format, desc.Width, desc.Height, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        const CD3DX12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
+        if (FAILED(g_framework->get_d3d12_hook()->get_device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &capture_desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                                                       nullptr, IID_PPV_ARGS(&m_ui_capture)))) {
+            spdlog::error("[Stereo] Failed to create the UI layer capture texture");
+            return;
+        }
+        m_ui_capture->SetName(L"Native stereo UI layer capture");
+        spdlog::info("[Stereo] UI layer captured for both eyes: {}x{} format {} state {:x}", desc.Width, desc.Height, (uint32_t)desc.Format, (uint32_t)state);
+    }
+    auto command_list = context->pID3D12CommandList;
+    D3D12_RESOURCE_BARRIER to_copy[]{
+        CD3DX12_RESOURCE_BARRIER::Transition(layer, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        CD3DX12_RESOURCE_BARRIER::Transition(m_ui_capture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+    };
+    command_list->ResourceBarrier(2, to_copy);
+    CD3DX12_TEXTURE_COPY_LOCATION dst{ m_ui_capture.Get(), 0 };
+    CD3DX12_TEXTURE_COPY_LOCATION src{ layer, 0 };
+    command_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    D3D12_RESOURCE_BARRIER restore[]{
+        CD3DX12_RESOURCE_BARRIER::Transition(layer, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+        CD3DX12_RESOURCE_BARRIER::Transition(m_ui_capture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+    };
+    command_list->ResourceBarrier(2, restore);
+    vr->set_native_ui_source(m_ui_capture.Get());
 }
