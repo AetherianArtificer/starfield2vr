@@ -2681,8 +2681,9 @@ namespace body
             // Bones sampled from the graph (no writes yet) and compared with the copied locals to measure the convention.
             struct Sample
             {
-                int    model;
-                Bone32 value;
+                int         model;
+                Bone32      value;
+                const char* name;
             };
             std::vector<Sample> g_samples;
             bool                g_samples_pending{ false };
@@ -2874,7 +2875,7 @@ namespace body
                                  "L_Thigh", "R_Thigh", "L_Calf", "R_Calf" }) {
                             const int m = Index(name);
                             if (m >= offset && m - offset < count) {
-                                g_samples.push_back({ m, bones[m - offset] });
+                                g_samples.push_back({ m, bones[m - offset], name });
                             }
                         }
                         g_samples_pending = !g_samples.empty();
@@ -2971,7 +2972,8 @@ namespace body
                 std::lock_guard lock(g_mutex);
                 if (g_samples_pending) {
                     g_samples_pending = false;
-                    int direct = 0, transposed = 0;
+                    int         direct = 0, transposed = 0;
+                    std::string changed;
                     for (const auto& sample : g_samples) {
                         const auto copied = FromNi(pose.local[sample.model]);
                         auto close = [&](Convention c) {
@@ -2982,19 +2984,24 @@ namespace body
                             }
                             return e < 1e-3f;
                         };
-                        direct += close(Convention::Direct) ? 1 : 0;
-                        transposed += close(Convention::Transposed) ? 1 : 0;
+                        const bool d = close(Convention::Direct), tr = close(Convention::Transposed);
+                        direct += d ? 1 : 0;
+                        transposed += tr ? 1 : 0;
+                        if (!d && !tr) {
+                            changed += std::string(" ") + sample.name;
+                        }
                     }
+                    // Bones that later graph nodes change (foot IK, aiming) match neither; the rest decide.
                     const int n = static_cast<int>(g_samples.size());
-                    if (direct * 2 > n && direct > transposed) {
+                    if (direct >= 3 && direct > transposed * 2) {
                         g_convention = Convention::Direct;
-                    } else if (transposed * 2 > n && transposed > direct) {
+                    } else if (transposed >= 3 && transposed > direct * 2) {
                         g_convention = Convention::Transposed;
                     } else {
                         g_convention = Convention::Failed;
                     }
-                    spdlog::info("[Body] graph pose convention: {} of {} bones match direct, {} transposed -> {}", direct, n, transposed,
-                        g_convention == Convention::Direct ? "direct" : g_convention == Convention::Transposed ? "transposed" : "FAILED");
+                    spdlog::info("[Body] graph pose convention: {} of {} bones match direct, {} transposed -> {} | changed after the arm IK:{}", direct, n,
+                        transposed, g_convention == Convention::Direct ? "direct" : g_convention == Convention::Transposed ? "transposed" : "FAILED", changed);
                     if (g_convention == Convention::Failed) {
                         spdlog::error("[Body] graph pose does not match the copied locals; the graph stage is disabled");
                     }
