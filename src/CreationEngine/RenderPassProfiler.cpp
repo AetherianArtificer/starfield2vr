@@ -10,7 +10,7 @@
 #include <d3d12.h>
 #include <string>
 #include <unordered_map>
-#include <memory/FunctionHook.h>
+#include <MinHook.h>
 #include <vector>
 #include <wrl/client.h>
 
@@ -33,10 +33,11 @@ namespace RenderPassProfiler
         };
         std::vector<PassClass>                g_classes;
         std::unordered_map<uintptr_t, int>    g_class_of_vtable;
-        std::array<std::unique_ptr<FunctionHook>, kMaxHooks> g_hooks;
+        std::array<uintptr_t, kMaxHooks>      g_originals{};
         int                                   g_hook_count{ 0 };
         std::atomic<bool>                     g_share_shadows{ false };
         std::atomic<uint32_t>                 g_skipped{ 0 };
+        std::atomic<bool>                     g_ready{ false };
 
         // Shadow map work that does not depend on the eye: clears, culling for the shadow views, the shadow draws and
         // the pyramids built from the maps. The per-eye passes that sample the maps keep running.
@@ -126,7 +127,7 @@ namespace RenderPassProfiler
 
         int ClassOf(void* pass)
         {
-            if (pass == nullptr) {
+            if (pass == nullptr || !g_ready.load(std::memory_order_acquire)) {
                 return -1;
             }
             const auto it = g_class_of_vtable.find(*reinterpret_cast<uintptr_t*>(pass));
@@ -168,7 +169,7 @@ namespace RenderPassProfiler
                 g_skipped.fetch_add(1, std::memory_order_relaxed);
                 return 0;
             }
-            const auto result = g_hooks[hook]->get_original<func_t>()(pass, render_graph_data, pass_data);
+            const auto result = reinterpret_cast<func_t*>(g_originals[hook])(pass, render_graph_data, pass_data);
             Mark(cls, render_graph_data);
             return result;
         }
@@ -331,44 +332,50 @@ namespace RenderPassProfiler
             e.resize(kQueriesPerSlot);
         }
 
+        // The class table is complete before any hook goes live, as the hooks read it from the render threads.
         const auto vtables = FindPassVtables();
-        std::unordered_map<uintptr_t, int> hook_of_function;
-        static const auto detours = Detours(std::make_integer_sequence<int, kMaxHooks>{});
-        int skipped_functions = 0;
         for (const auto& [name, vtable] : vtables) {
             if ((int)g_classes.size() >= kMaxClasses) {
                 break;
             }
-            const int cls = (int)g_classes.size();
             PassClass info{ name };
             info.shadow_map = std::any_of(std::begin(kShadowMapPasses), std::end(kShadowMapPasses), [&](const char* s) { return name == s; });
+            g_class_of_vtable[vtable] = (int)g_classes.size();
             g_classes.push_back(info);
-            g_class_of_vtable[vtable] = cls;
+        }
+        g_sums.assign(g_classes.size(), {});
+        g_ready.store(true, std::memory_order_release);
 
+        // All hooks are created first, with their originals stored, then enabled together.
+        static const auto detours = Detours(std::make_integer_sequence<int, kMaxHooks>{});
+        std::unordered_map<uintptr_t, int> hook_of_function;
+        std::vector<uintptr_t>             targets;
+        int                                skipped_functions = 0;
+        for (const auto& [vtable, cls] : g_class_of_vtable) {
             const auto execute = reinterpret_cast<const uintptr_t*>(vtable)[kExecuteSlot];
             if (hook_of_function.contains(execute)) {
                 continue;
             }
             // Import thunks and functions another hook already patched are left alone.
             const auto first = *reinterpret_cast<const uint8_t*>(execute);
-            if (first == 0xE9 || first == 0xFF || g_hook_count >= kMaxHooks) {
+            void*      original = nullptr;
+            if (first == 0xE9 || first == 0xFF || g_hook_count >= kMaxHooks ||
+                MH_CreateHook(reinterpret_cast<void*>(execute), reinterpret_cast<void*>(detours[g_hook_count]), &original) != MH_OK) {
                 hook_of_function[execute] = -1;
                 ++skipped_functions;
                 continue;
             }
-            auto hooked = std::make_unique<FunctionHook>(execute, detours[g_hook_count]);
-            if (!hooked->create()) {
-                hook_of_function[execute] = -1;
-                ++skipped_functions;
-                continue;
-            }
-            g_hooks[g_hook_count]     = std::move(hooked);
+            g_originals[g_hook_count] = reinterpret_cast<uintptr_t>(original);
             hook_of_function[execute] = g_hook_count++;
+            targets.push_back(execute);
         }
-        g_sums.assign(g_classes.size(), {});
+        for (auto target : targets) {
+            MH_QueueEnableHook(reinterpret_cast<void*>(target));
+        }
+        const auto applied = MH_ApplyQueued();
         const auto shadow = std::count_if(g_classes.begin(), g_classes.end(), [](const PassClass& c) { return c.shadow_map; });
-        spdlog::info("[Passes] {} render pass classes, {} execute functions hooked, {} left alone; {} shadow map pass classes", g_classes.size(), g_hook_count,
-                     skipped_functions, shadow);
+        spdlog::info("[Passes] {} render pass classes, {} execute functions hooked ({}), {} left alone; {} shadow map pass classes", g_classes.size(), g_hook_count,
+                     MH_StatusToString(applied), skipped_functions, shadow);
     }
 
     void MarkPass(void* pass, void* render_graph_data)
