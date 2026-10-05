@@ -203,13 +203,15 @@ void CreationEngineRendererModule::RenderGraphStart(RE::CreationRendererPrivate:
 void CreationEngineRendererModule::SetWindowSize(int width, int height)
 {
     static std::atomic<bool> inside_change{ false };
-    static int               last_synced_frame{ 1000 };
+    // Checked from the first frames on, so the intro screens already get the headset's size.
+    constexpr int            kCheckInterval = 30;
+    static int               last_synced_frame{ -kCheckInterval };
     auto                     fc = GameFlow::renderLoopFrameCount();
     if(inside_change.exchange(true)) {
         return;
     }
 
-    if (m_creationEngineSettings == nullptr || *m_creationEngineSettings == nullptr || (fc - last_synced_frame) < 5*72) {
+    if (m_creationEngineSettings == nullptr || *m_creationEngineSettings == nullptr || (fc - last_synced_frame) < kCheckInterval) {
         inside_change.store(false);
         return;
     }
@@ -229,7 +231,7 @@ void CreationEngineRendererModule::SetWindowSize(int width, int height)
     }
 
     // Compare the render target, not the window: Windows clamps bordered windows to the screen size.
-    constexpr int kMaxResizeAttempts = 3;
+    constexpr int kMaxResizeAttempts = 20;
     static int    resize_attempts{ 0 };
     static int    last_target_width{ 0 };
     static int    last_target_height{ 0 };
