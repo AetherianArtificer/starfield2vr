@@ -4,9 +4,6 @@
 #include <cmath>
 #include <algorithm>
 #include "ModSettingsStore.h"
-#include <CreationEngine/memory/ScanHelper.h>
-#include <RE/B/BSFixedString.h>
-#include <windows.h>
 #include "RE/P/PlayerCamera.h"
 #include <CreationEngine/CreationEngineSingletonManager.h>
 #include <mods/VR.hpp>
@@ -35,6 +32,8 @@ namespace GameFlow
         RE::NiPoint3 position_before_loading{};
         bool         have_position_before_loading{false};
         constexpr float kLoadingMoveToRecenter = 10.0f;
+
+        std::vector<std::string> last_menus;
 
         bool PlayerPosition(RE::NiPoint3& out)
         {
@@ -77,101 +76,26 @@ namespace GameFlow
         }
     }
 
-    namespace
-    {
-        // The global holding the UI singleton, from a load of it in the game's code.
-        uint8_t** FindUiSingleton()
-        {
-            const auto slot = MemoryScan::InstructionRelocation("48 8B 0D ? ? ? ? E8 ? ? ? ? 44 0F B6 F8 48 8B 7C", 3, 7, 0x5fd9b80);
-            return reinterpret_cast<uint8_t**>(slot);
-        }
-
-        // The open menus' names, read under a fault guard; false when the stack does not hold menus (a layout mismatch).
-        bool ReadMenuNames(uint8_t* ui, const char** names, uint32_t& count)
-        {
-            const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-            const auto end  = base + reinterpret_cast<IMAGE_NT_HEADERS64*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew)->OptionalHeader.SizeOfImage;
-            __try {
-                const auto size  = *reinterpret_cast<uint32_t*>(ui + 0x3F0);
-                const auto menus = *reinterpret_cast<uint8_t***>(ui + 0x3F8);
-                if (size > 64 || (size > 0 && menus == nullptr)) {
-                    return false;
-                }
-                count = 0;
-                for (uint32_t i = 0; i < size; ++i) {
-                    const auto vtable = *reinterpret_cast<uintptr_t*>(menus[i]);
-                    if (vtable < base || vtable >= end) {
-                        return false;
-                    }
-                    names[count++] = reinterpret_cast<RE::BSFixedString*>(menus[i] + 0xB0)->c_str();
-                }
-                return true;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                return false;
-            }
-        }
-
-        // Menus shown on the flat screen; others (the HUD, dialogue, popups, scopes, faders) keep the 3D view.
-        bool IsFullscreenMenu(std::string_view name)
-        {
-            static constexpr std::string_view kMenus[]{
-                "MainMenu", "PauseMenu", "LoadingMenu", "InventoryMenu", "DataMenu", "SkillsMenu", "StarMapMenu", "GalaxyStarMapMenu",
-                "WorkshopMenu", "ResearchMenu", "WeaponsCraftingMenu", "ArmorCraftingMenu", "IndustrialCraftingMenu", "DrugsCraftingMenu",
-                "SpaceshipEditorMenu", "ShipCrewMenu",
-            };
-            return std::find(std::begin(kMenus), std::end(kMenus), name) != std::end(kMenus);
-        }
-    }
-
-    bool isFullscreenMenuOpen()
-    {
-        static uint8_t** singleton = [] {
-            auto found = FindUiSingleton();
-            if (found == nullptr) {
-                spdlog::error("[GameFlow] UI singleton not found; fullscreen menus will not switch to the flat screen");
-            } else {
-                spdlog::info("[GameFlow] UI singleton at {:x}", reinterpret_cast<uintptr_t>(found) - reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)));
-            }
-            return found;
-        }();
-        if (singleton == nullptr || *singleton == nullptr) {
-            return false;
-        }
-        // The menu stack: size at 0x3F0, entries at 0x3F8, each a menu with its name at 0xB0.
-        static bool layout_ok = true;
-        const char* raw[64]{};
-        uint32_t    count = 0;
-        if (!layout_ok) {
-            return false;
-        }
-        if (!ReadMenuNames(*singleton, raw, count)) {
-            layout_ok = false;
-            spdlog::error("[GameFlow] The UI menu stack does not hold menus at the expected offsets; fullscreen menus will not switch to the flat screen");
-            return false;
-        }
-        bool                     fullscreen = false;
-        std::vector<std::string> names;
-        for (uint32_t i = 0; i < count; ++i) {
-            if (raw[i] == nullptr) {
-                continue;
-            }
-            names.emplace_back(raw[i]);
-            fullscreen |= IsFullscreenMenu(raw[i]);
-        }
-        static std::vector<std::string> last_names;
-        if (names != last_names) {
-            std::string list;
-            for (const auto& n : names) {
-                list += (list.empty() ? "" : ", ") + n;
-            }
-            spdlog::info("[GameFlow] Open menus: {}{}", list.empty() ? "none" : list, fullscreen ? " (flat screen)" : "");
-            last_names = std::move(names);
-        }
-        return fullscreen;
-    }
-
     void resetGameState() {
         update_loading_recenter();
+        {
+            std::vector<std::string> menus;
+            for (auto part : gStore.debugData.ui_parts) {
+                std::string name{ part };
+                if (std::find(menus.begin(), menus.end(), name) == menus.end()) {
+                    menus.push_back(name);
+                }
+            }
+            std::sort(menus.begin(), menus.end());
+            if (menus != last_menus) {
+                std::string list;
+                for (const auto& m : menus) {
+                    list += (list.empty() ? "" : ", ") + m;
+                }
+                spdlog::info("[GameFlow] Menus drawn: {}", list.empty() ? "none" : list);
+                last_menus = std::move(menus);
+            }
+        }
         ship_hud_last_frame.store(ship_hud_seen_this_frame);
         ship_hud_seen_this_frame = false;
         gStore.debugData.ui_parts.clear();
