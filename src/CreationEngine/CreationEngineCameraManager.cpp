@@ -69,6 +69,14 @@ void CreationEngineCameraManager::InstallHooks() {
                                                                    reinterpret_cast<uintptr_t>(&onNiAVObjectUpdateWorld));
     m_onNiAVObjectUpdateWorldHook->create();
 
+    // NiCamera::UpdateWorld computes a camera's world transform and hands it to the renderer.
+    if (auto camera_vtable = reinterpret_cast<uintptr_t*>(MemoryScan::VTable("NiCamera::vftable", ".?AVNiCamera@@", 0))) {
+        m_onNiCameraUpdateWorldHook = std::make_unique<FunctionHook>(camera_vtable[79], reinterpret_cast<uintptr_t>(&onNiCameraUpdateWorld));
+        m_onNiCameraUpdateWorldHook->create();
+    } else {
+        spdlog::error("[Sky] NiCamera vtable not found; the sky will not follow the head");
+    }
+
     REL::Relocation<uintptr_t> onGetCameraRotationAddr{ GameStore::MemoryOffsets::FirstPersonState::GetRotationQuatV() };
     m_onGetCameraRotationHook = std::make_unique<FunctionHook>(onGetCameraRotationAddr.address(), reinterpret_cast<uintptr_t>(&onFPSGetCameraRotation));
     m_onGetCameraRotationHook->create();
@@ -380,6 +388,11 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
     } else {
         place(worldCamera, vr->get_current_eye_transform());
     }
+    {
+        std::scoped_lock _{ m_sky_mutex };
+        m_sky_head_rotation = world_head_rotation;
+        m_sky_head_valid    = right_camera != nullptr;
+    }
     if (right_camera) {
         RotateSkyCameras(world_head_rotation);
     }
@@ -414,11 +427,7 @@ void CreationEngineCameraManager::RotateSkyCameras(const RE::NiMatrix3& head_rot
         if (!t.valid || !same(camera->world.rotate, t.written_world)) {
             t.base_world = camera->world.rotate;
         }
-        t.written_local       = t.base_local * head_rotation;
-        t.written_world       = t.base_world * head_rotation;
-        t.valid               = true;
-        camera->local.rotate  = t.written_local;
-        camera->world.rotate  = t.written_world;
+        (void)t;
     }
 
     static int frames = 0;
@@ -431,6 +440,37 @@ void CreationEngineCameraManager::RotateSkyCameras(const RE::NiMatrix3& head_rot
     }
 }
 
+
+void CreationEngineCameraManager::onNiCameraUpdateWorld(RE::NiCamera* camera, RE::NiUpdateData* a_data) {
+    static auto instance = CreationEngineCameraManager::Get();
+    static auto original = instance->m_onNiCameraUpdateWorldHook->get_original<decltype(onNiCameraUpdateWorld)>();
+    auto        root     = CreationEngineSingletonManager::GetSceneGraphRoot();
+    const bool  sky      = root && camera && (camera == root->starfieldScene.pStarFieldCamera || camera == root->starfieldScene.pGalaxyCamera);
+    if (!sky) {
+        original(camera, a_data);
+        return;
+    }
+    RE::NiMatrix3 head{};
+    {
+        std::scoped_lock _{ instance->m_sky_mutex };
+        if (!instance->m_sky_head_valid) {
+            original(camera, a_data);
+            return;
+        }
+        head = instance->m_sky_head_rotation;
+    }
+    // The game sets the sky cameras from its own camera, which follows the aim; the head turns them for this update only.
+    const auto game_rotation = camera->local.rotate;
+    camera->local.rotate     = game_rotation * head;
+    original(camera, a_data);
+    camera->local.rotate = game_rotation;
+
+    static int logged = 0;
+    if (logged < 2) {
+        ++logged;
+        spdlog::info("[Sky] Head rotation applied to the {} camera as it updates", camera == root->starfieldScene.pStarFieldCamera ? "starfield" : "galaxy");
+    }
+}
 
 void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *fps, RE::NiQuaternion *quat_out) {
     static auto instance = CreationEngineCameraManager::Get();
