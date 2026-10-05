@@ -1,6 +1,7 @@
 #include "StereoViewModule.h"
 
 #include "CreationEngineRendererModule.h"
+#include "CreationEngineSettings.h"
 #include <_deps/directxtk12-src/Src/d3dx12.h>
 #include <intrin.h>
 #include <safetyhook/easy.hpp>
@@ -462,7 +463,9 @@ void StereoViewModule::OnFrameStart()
     vr->request_native_stereo(requested && m_registered && buffer_ready);
 
     const bool native = vr->is_native_stereo();
+    UpdateMenuFallback(native);
     ApplyViewports(native);
+    ApplyNativeShadowSettings(native);
     if (!native) {
         m_missed_appends = 0;
         vr->set_native_mono_frame(false);
@@ -477,7 +480,7 @@ void StereoViewModule::OnFrameStart()
     }
 
     m_missed_appends = m_appended.exchange(false) ? 0 : m_missed_appends + 1;
-    vr->set_native_mono_frame(m_missed_appends > 1);
+    vr->set_native_mono_frame(m_menu_fallback.load() || m_missed_appends > 1);
 
     if (++m_native_frames == kFramesUntilStable) {
         ClearCrashGuard();
@@ -548,21 +551,24 @@ void StereoViewModule::ApplyViewports(bool side_by_side)
         const float right_half[4]{ middle, m_saved_viewport[1], m_saved_viewport[2], m_saved_viewport[3] };
 
         // The engine may reset a camera's viewport, so it is reapplied whenever it differs.
-        for (auto camera : { m_left_camera ? m_left_camera : world_camera, starfield_camera }) {
+        const bool world_draws = m_left_camera == nullptr || m_menu_fallback.load();
+        for (auto camera : { m_left_camera, world_draws ? world_camera : nullptr, starfield_camera }) {
             if (camera && !SameRect(camera, kCameraViewport, left_half)) {
                 SetCameraRect(camera, offsets::NiCameraSetViewport(), left_half);
                 SetCameraRect(camera, offsets::NiCameraSetScissors(), left_half);
             }
+        }
+        if (!world_draws && !SameRect(world_camera, kCameraViewport, m_saved_viewport)) {
+            SetCameraRect(world_camera, offsets::NiCameraSetViewport(), m_saved_viewport);
+            SetCameraRect(world_camera, offsets::NiCameraSetScissors(), m_saved_scissors);
         }
         if (m_right_camera && !SameRect(m_right_camera, kCameraViewport, right_half)) {
             SetCameraRect(m_right_camera, offsets::NiCameraSetViewport(), right_half);
             SetCameraRect(m_right_camera, offsets::NiCameraSetScissors(), right_half);
         }
     } else if (m_viewports_split) {
-        if (m_left_camera == nullptr) {
-            SetCameraRect(world_camera, offsets::NiCameraSetViewport(), m_saved_viewport);
-            SetCameraRect(world_camera, offsets::NiCameraSetScissors(), m_saved_scissors);
-        }
+        SetCameraRect(world_camera, offsets::NiCameraSetViewport(), m_saved_viewport);
+        SetCameraRect(world_camera, offsets::NiCameraSetScissors(), m_saved_scissors);
         if (starfield_camera) {
             SetCameraRect(starfield_camera, offsets::NiCameraSetViewport(), m_saved_starfield_viewport);
             SetCameraRect(starfield_camera, offsets::NiCameraSetScissors(), m_saved_starfield_scissors);
@@ -677,7 +683,7 @@ uintptr_t StereoViewModule::onSetMultiCameraViewData(void* column, uint32_t grap
     static auto vr       = VR::get();
 
     auto root = CreationEngineSingletonManager::GetSceneGraphRoot();
-    if (instance->m_right_graph_ready && instance->m_left_camera && vr->is_native_stereo() && views && root && views->size == 1 &&
+    if (instance->m_right_graph_ready && instance->m_left_camera && vr->is_native_stereo() && !instance->m_menu_fallback.load() && views && root && views->size == 1 &&
         column == StorageColumn(offsets::RenderGraphStorage(), kMultiCameraViewColumn) && graph_index == (At<uint32_t>(root, kRootMainRenderGraph) & 0xFFFFFF) &&
         (views->data()[0] & 0xFFFFFF) == (At<uint32_t>(root, kRootMainView) & 0xFFFFFF)) {
         ViewIdArray left{};
@@ -1151,7 +1157,8 @@ uintptr_t StereoViewModule::onSubmitRenderGraph(void* frame_list, void* record)
     static auto vr       = VR::get();
 
     auto root = CreationEngineSingletonManager::GetSceneGraphRoot();
-    if (instance->m_right_graph_ready && vr->is_native_stereo() && root && record == reinterpret_cast<uint8_t*>(root) + kRootMainGraphRecord &&
+    if (instance->m_right_graph_ready && vr->is_native_stereo() && !instance->m_menu_fallback.load() && root &&
+        record == reinterpret_cast<uint8_t*>(root) + kRootMainGraphRecord &&
         At<uint32_t>(root, kRootMainView) != kInvalidId) {
         instance->PrepareRightGraph();
         if (GameFlow::gStore.internalSettings.nativeLeftGraphFirst) {
@@ -1191,4 +1198,44 @@ bool StereoViewModule::RenewRightCamera()
     ++m_right_camera_generation;
     spdlog::info("[Stereo] Right eye now uses camera {:x}, view {:x} (generation {})", m_right_camera->cameraHandleID, m_right_view_id, m_right_camera_generation);
     return true;
+}
+
+void StereoViewModule::UpdateMenuFallback(bool native)
+{
+    static auto vr       = VR::get();
+    const bool  fallback = native && ModSettings::showFlatScreenDisplay();
+    if (fallback != m_menu_fallback.load()) {
+        m_menu_fallback.store(fallback);
+        m_menu_frames = 0;
+        spdlog::info("[Stereo] {}", fallback ? "Fullscreen menu: the main graph renders the game's own view in the left half, shown on the flat screen"
+                                              : "Fullscreen menu closed: both eye views render again");
+    }
+    if (fallback && ++m_menu_frames == 90 && !m_menu_dumped) {
+        m_menu_dumped = true;
+        vr->request_backbuffer_dump(Framework::get_persistent_dir("vr_native_stereo_menu.png").wstring());
+    }
+}
+
+void StereoViewModule::ApplyNativeShadowSettings(bool native)
+{
+    // Every eye view runs the dynamic shadow selection, but the per-light fade state is shared: each eye resets the fades of
+    // lights only the other eye sees, so those shadows keep restarting their tiled fade. The main view whose LOD the
+    // dynamic shadow maps borrow is not rendered in native stereo, so each shadow map picks its own.
+    if (native == m_shadow_settings_applied) {
+        return;
+    }
+    m_shadow_settings_applied = native;
+    auto settings = CreationEngineSettings::Get();
+    using Type    = CreationEngineSettings::SettingType;
+    constexpr auto kFade = "fDynamicShadowFadeSeconds:Shadows";
+    constexpr auto kLod  = "bDynamicShadowmapsUseMainViewLOD:Shadows";
+    if (native) {
+        m_saved_shadow_fade_seconds  = settings->get_setting(kFade, Type::kINISetting, 0.75f);
+        m_saved_shadow_main_view_lod = settings->get_setting(kLod, Type::kINISetting, true);
+    }
+    const bool fade = settings->set_setting(kFade, Type::kINISetting, native ? 0.0f : m_saved_shadow_fade_seconds);
+    const bool lod  = settings->set_setting(kLod, Type::kINISetting, native ? false : m_saved_shadow_main_view_lod);
+    spdlog::info("[Stereo] Shadow settings {}: dynamic shadow fade {}s ({}), main view LOD {} ({})", native ? "for native stereo" : "restored",
+                 settings->get_setting(kFade, Type::kINISetting, -1.0f), fade ? "set" : "not found", settings->get_setting(kLod, Type::kINISetting, false),
+                 lod ? "set" : "not found");
 }

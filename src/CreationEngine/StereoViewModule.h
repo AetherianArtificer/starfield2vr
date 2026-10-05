@@ -51,6 +51,15 @@ private:
     bool TryRegister();
     void ApplyViewports(bool side_by_side);
     bool RenewRightCamera();
+    void ApplyNativeShadowSettings(bool native);
+    void UpdateMenuFallback(bool native);
+    bool  m_shadow_settings_applied{ false };
+    float m_saved_shadow_fade_seconds{ 0.75f };
+    bool  m_saved_shadow_main_view_lod{ true };
+    // Fullscreen menus run the game's own single view; they are shown on the flat screen.
+    std::atomic<bool> m_menu_fallback{ false };
+    int               m_menu_frames{ 0 };
+    bool              m_menu_dumped{ false };
     [[nodiscard]] std::string Variant() const;
     std::atomic<bool> m_renew_right_camera{ false };
     int               m_right_camera_generation{ 0 };
