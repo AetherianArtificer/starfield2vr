@@ -3,6 +3,7 @@
 #include "CreationEngineRendererModule.h"
 #include "CreationEngineSettings.h"
 #include "CreationEngineSingletonManager.h"
+#include "FoveatedRendering.h"
 #include "PerfStats.h"
 #include "ModSettings.h"
 #include <CreationEngine/memory/offsets.h>
@@ -435,6 +436,7 @@ void StereoViewModule::OnFrameStart()
     if (!stereo) {
         m_missed_appends = 0;
         vr->set_native_mono_frame(true);
+        FoveatedRendering::OnFrameStart(false, settings.foveation);
         return;
     }
 
@@ -464,6 +466,7 @@ void StereoViewModule::OnFrameStart()
     // Without a fresh right eye graph this frame (a loading screen, a fullscreen menu) both eyes show the same image.
     m_missed_appends = m_appended.exchange(false) ? 0 : m_missed_appends + 1;
     vr->set_native_mono_frame(m_menu_fallback.load() || m_missed_appends > 1);
+    FoveatedRendering::OnFrameStart(!m_menu_fallback.load() && m_missed_appends <= 1, settings.foveation);
 
     // Requested screenshots are taken after a second of gameplay with both eyes, so a menu is never captured.
     if (m_screenshot_requested.load()) {

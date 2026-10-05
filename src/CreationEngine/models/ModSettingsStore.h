@@ -36,6 +36,7 @@ namespace GameFlow
             bool hudPanel{true};
             float hudPanelWidth{1.86f};
             float hudPanelDistance{2.0f};
+            int   foveation{2}; // 0 off, 1 light, 2 balanced, 3 strong
             int   turnMode{0}; // 0 = snap, 1 = smooth (game's own stick look)
             float snapTurnDegrees{45.0f};
             bool  turnFade{false};
