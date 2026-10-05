@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <RE/N/NiCamera.h>
+#include <RE/P/PlayerCamera.h>
 #include <safetyhook/easy.hpp>
 #include <mods/VR.hpp>
 
@@ -94,6 +95,135 @@ namespace body
             static auto vr = VR::get();
             return GameFlow::gStore.internalSettings.weaponFollowsHand && vr->is_hmd_active() && !ModSettings::showFlatScreenDisplay() &&
                    vr->is_using_controllers() && GameFlow::isInFirstPerson() && !GameFlow::isImmovable() && !GameFlow::isControlledByAI();
+        }
+
+        // "Third-person rig in first person" (the pilot seat's mode): the third-person body and its animation graph
+        // are the live ones while the camera stays first-person. Only the active graph receives weapon events, so
+        // this is what makes the body draw, hold, fire and reload with its own authored animations. Entered through
+        // the game's SetFirstPerson; Use3PRig is detoured so the camera is not moved onto the third-person skeleton.
+        namespace third_person_mode
+        {
+            constexpr std::size_t kLiveBodyFlags = 0x112A;  // bit 3: third-person body live
+            constexpr std::size_t kRigModeFlags  = 0x112F;  // bit 3: third-person rig in first person
+
+            std::atomic<bool> g_wanted{ false };
+            safetyhook::InlineHook g_use_3p_rig_hook;
+            void*                  g_save_original{ nullptr };
+
+            std::uint8_t& Flags(RE::PlayerCharacter* player, std::size_t offset)
+            {
+                return *(reinterpret_cast<std::uint8_t*>(player) + offset);
+            }
+
+            bool Active(RE::PlayerCharacter* player)
+            {
+                return player && (Flags(player, kRigModeFlags) & 8) != 0;
+            }
+
+            template <class Fn>
+            Fn Resolve(const char* pattern, std::uintptr_t offset)
+            {
+                return reinterpret_cast<Fn>(MemoryScan::FuncRelocation(pattern, offset, 0));
+            }
+
+            // Enable path of Use3PRig without the camera retarget (0x1e8ba70).
+            std::uintptr_t Use3PRig(RE::PlayerCharacter* player, bool enable)
+            {
+                auto self = CreationEngineSingletonManager::GetPlayerRef();
+                if (!enable || !g_wanted || player != self) {
+                    return g_use_3p_rig_hook.call<std::uintptr_t>(player, enable);
+                }
+                if (Active(player)) {
+                    return 0;
+                }
+                using hide_slots_t  = void (*)(void*, std::uint32_t, bool);
+                using hide_helmet_t = void (*)(RE::PlayerCharacter*, bool, std::uint32_t);
+                using refresh_t     = void (*)(RE::PlayerCharacter*);
+                using blend_t       = void (*)(RE::PlayerCharacter*, float);
+                static auto hide_slots  = Resolve<hide_slots_t>("48 89 5C 24 10 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 50 45 0F B6 F8 44", 0x50c140);
+                static auto hide_helmet = Resolve<hide_helmet_t>("48 89 5C 24 10 48 89 74 24 18 57 48 83 EC 30 41 8B F8 0F", 0xb71430);
+                static auto refresh     = Resolve<refresh_t>("48 89 5C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 D9 48 81 EC A0 00 00 00 48 8B F1", 0x1a34a50);
+                static auto blend       = reinterpret_cast<blend_t>(MemoryScan::FuncRelocation("", 0x1a3ce80, 0));
+                static auto mask_addr   = MemoryScan::FuncRelocation("", 0x5F46750, 0);
+                const auto  mask        = *reinterpret_cast<std::uint32_t*>(mask_addr);
+
+                Flags(player, kLiveBodyFlags) |= 8;
+                hide_slots(*reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(player) + 0xC8), mask, true);
+                hide_helmet(player, true, mask);
+                SetAppCulled(ThirdPersonRoot(player), false);
+                SetAppCulled(FirstPersonRoot(player), true);
+                SetAppCulled(FaceNode(player), true);
+                Flags(player, kRigModeFlags) |= 8;
+                refresh(player);
+                blend(player, 0.01f);
+                spdlog::info("[Body] third-person rig in first person: on");
+                return 0;
+            }
+
+            void SetFirstPerson(RE::PlayerCharacter* player)
+            {
+                using fn_t     = void (*)(RE::PlayerCharacter*, bool);
+                static auto fn = Resolve<fn_t>("88 54 24 10 48 89 4C 24 08 55 53 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 B8", 0x1a3f340);
+                fn(player, true);
+            }
+
+            // Saves never record the mode (the game would restore a third-person camera from it).
+            void SaveWithoutMode(RE::PlayerCharacter* player, void* a2, void* a3, void* a4)
+            {
+                const auto live = Flags(player, kLiveBodyFlags);
+                const auto rig  = Flags(player, kRigModeFlags);
+                if (rig & 8) {
+                    Flags(player, kLiveBodyFlags) &= ~8;
+                    Flags(player, kRigModeFlags) &= ~8;
+                }
+                reinterpret_cast<void (*)(RE::PlayerCharacter*, void*, void*, void*)>(g_save_original)(player, a2, a3, a4);
+                Flags(player, kLiveBodyFlags) = live;
+                Flags(player, kRigModeFlags)  = rig;
+            }
+
+            void Install()
+            {
+                const auto address = MemoryScan::FuncRelocation("48 89 5C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 60 0F", 0x1a3ef40, 0);
+                g_use_3p_rig_hook  = safetyhook::create_inline(reinterpret_cast<void*>(address), reinterpret_cast<void*>(&Use3PRig));
+                spdlog::info("[Body] Use3PRig hook: {}", static_cast<bool>(g_use_3p_rig_hook));
+            }
+
+            void HookSave(RE::PlayerCharacter* player)
+            {
+                if (g_save_original || !player) {
+                    return;
+                }
+                auto vtable = *reinterpret_cast<void***>(player);
+                DWORD old{};
+                if (VirtualProtect(&vtable[0xD0 / 8], sizeof(void*), PAGE_READWRITE, &old)) {
+                    g_save_original      = vtable[0xD0 / 8];
+                    vtable[0xD0 / 8]     = reinterpret_cast<void*>(&SaveWithoutMode);
+                    VirtualProtect(&vtable[0xD0 / 8], sizeof(void*), old, &old);
+                    spdlog::info("[Body] save hook installed");
+                }
+            }
+
+            // Main-thread, once per frame: keep the mode in step with the VR body and first-person camera.
+            void Update()
+            {
+                auto player = CreationEngineSingletonManager::GetPlayerRef();
+                auto camera = CreationEngineSingletonManager::GetPlayerCameraSingleton();
+                if (!player || !camera) {
+                    return;
+                }
+                HookSave(player);
+                const bool want = g_state.active && GameFlow::gStore.internalSettings.nativeWeapons;
+                const bool fps  = camera->IsInFirstPerson();
+                if (want != g_wanted.load()) {
+                    g_wanted = want;
+                    if (fps) {
+                        SetFirstPerson(player);  // enters the mode, or (wanted off) runs the game's own exit
+                    }
+                    spdlog::info("[Body] third-person rig in first person wanted: {}", want);
+                } else if (want && fps && !Active(player)) {
+                    SetFirstPerson(player);  // the game left the mode (furniture exit, camera change)
+                }
+            }
         }
 
         // Called when the 3P root updates, before its skeleton.
@@ -1039,6 +1169,13 @@ namespace body
             return g_facing_yaw;
         }
 
+        struct NativeDiag
+        {
+            bool      native{ false };
+            glm::vec3 hand_in_weapon{};
+        };
+        NativeDiag g_native_diag;
+
         // Support hand on the held weapon this frame.
         struct Support
         {
@@ -1669,7 +1806,8 @@ namespace body
             RE::NiAVObject*     first_right_wrist{ nullptr };
             RE::NiAVObject*     first_left_wrist{ nullptr };
 
-            g_support = {};
+            g_support      = {};
+            g_native_diag  = {};
             auto& r = (*g_active_bones).right;
             if (r.biceps >= 0 && r.forearm >= 0 && r.wrist >= 0 && r.shape.valid) {
                 const auto grip = HandWorld(tracking::GripPose(false));
@@ -1697,6 +1835,60 @@ namespace body
                         first_left_wrist  = first_left;
                         auto muzzle   = (*g_active_bones).weapon_node ? FindDescendant((*g_active_bones).weapon_node, "ProjectileNode") : nullptr;
                         g_body_muzzle = muzzle;
+                        auto player_ref = CreationEngineSingletonManager::GetPlayerRef();
+                        if (third_person_mode::Active(player_ref) && r.wrist >= 0) {
+                            // The live third-person graph holds the weapon: its own IK has put the hands on R_HandIk and
+                            // L_HandIk, so the hands' places on the weapon are read from this same skeleton.
+                            const auto weapon_anim    = pose.GameWorld((*g_active_bones).weapon);
+                            const auto hand_in_weapon = Compose(Inverse(weapon_anim), pose.GameWorld(r.wrist));
+                            const auto& l_arm         = (*g_active_bones).left;
+                            const auto support_in_weapon = l_arm.wrist >= 0 ? std::optional<Xf>{ Compose(Inverse(weapon_anim), pose.GameWorld(l_arm.wrist)) }
+                                                                            : std::nullopt;
+                            g_native_diag.hand_in_weapon = hand_in_weapon.t;
+
+                            // Weapon bone axes: barrel +Y, up +Z.
+                            g_basis.weapon  = (*g_active_bones).weapon_node;
+                            g_basis.forward = glm::vec3{ 0.0f, 1.0f, 0.0f };
+                            g_basis.up      = glm::vec3{ 0.0f, 0.0f, 1.0f };
+                            g_basis.has     = true;
+
+                            Xf weapon_xf = weapon_anim;
+                            weapon_xf.r  = FrameOf(aim->forward, aim->up) * glm::transpose(FrameOf(g_basis.forward, g_basis.up));
+                            wrist_target = Compose(weapon_xf, hand_in_weapon);
+                            const auto palm_world = wrist_target.t + wrist_target.r * (r.shape.forward * r.shape.palm) * wrist_target.s;
+                            const auto seat       = grip->position - palm_world;
+                            weapon_xf.t += seat;
+                            wrist_target.t += seat;
+                            g_barrel.aim_forward = aim->forward;
+
+                            g_support = {};
+                            const auto left_grip = HandWorld(tracking::GripPose(true));
+                            if (GameFlow::gStore.internalSettings.supportHand && support_in_weapon && l_arm.shape.valid && left_grip) {
+                                auto support = Compose(weapon_xf, *support_in_weapon);
+                                auto palm    = support.t + support.r * (l_arm.shape.forward * l_arm.shape.palm) * support.s;
+                                const float distance    = glm::length(palm - left_grip->position);
+                                static bool held        = false;
+                                held                    = distance < (held ? 0.25f : 0.12f);
+                                g_diag.support_distance = distance;
+                                if (held) {
+                                    const auto pivot = grip->position;
+                                    const auto turn  = RotationBetween(palm - pivot, left_grip->position - pivot);
+                                    weapon_xf.r      = turn * weapon_xf.r;
+                                    weapon_xf.t      = pivot + turn * (weapon_xf.t - pivot);
+                                    wrist_target.r   = turn * wrist_target.r;
+                                    wrist_target.t   = pivot + turn * (wrist_target.t - pivot);
+                                    g_support.held   = true;
+                                    g_support.target = Compose(weapon_xf, *support_in_weapon);
+                                    g_barrel.aim_forward = glm::normalize(weapon_xf.r * g_basis.forward);
+                                }
+                            }
+                            g_barrel.placed        = true;
+                            g_barrel.placed_weapon = weapon_xf;
+                            pose.SetGameWorld((*g_active_bones).weapon, weapon_xf);
+                            g_diag.weapon_aligned = true;
+                            held_weapon           = weapon_xf;
+                            g_native_diag.native  = true;
+                        } else {
                         SampleWeaponBasis(first_weapon);
                         if (first_wrist && first_weapon) {
                             // The animation's grip: the hand in the weapon's space, transferred onto the body's hand by anatomy.
@@ -1773,13 +1965,24 @@ namespace body
                             g_diag.weapon_aligned = true;
                             held_weapon           = weapon_xf;
                         }
+                        }
                     } else {
                         g_body_muzzle = nullptr;
                     }
                     const auto bend = TrackedBend(joint::kArmUpper[1], joint::kArmLower[1], joint::kWrist[1]);
                     g_track_diag.elbow[1] = bend.has_value();
                     g_diag.right_gap      = SolveArm(pose, r, false, wrist_target, bend);
-                    ApplyFingers(pose, 1, r.wrist, held_weapon ? first_right_wrist : nullptr);
+                    if (held_weapon && g_native_diag.native) {
+                        static auto vr    = VR::get();
+                        const auto  input = vr->get_finger_state(false);
+                        if (g_finger_palm[1].valid) {
+                            const float index = input.trigger_touch ? 0.3f + 0.7f * input.trigger : 0.0f;
+                            CurlFinger(pose, (*g_active_bones).fingers[1][1], r.wrist, g_finger_palm[1].palm, 10.0f + 50.0f * index,
+                                10.0f + 70.0f * index);
+                        }
+                    } else {
+                        ApplyFingers(pose, 1, r.wrist, held_weapon ? first_right_wrist : nullptr);
+                    }
                 }
             }
 
@@ -1797,7 +2000,9 @@ namespace body
                     const auto bend       = TrackedBend(joint::kArmUpper[0], joint::kArmLower[0], joint::kWrist[0]);
                     g_track_diag.elbow[0] = bend.has_value();
                     g_diag.left_gap       = SolveArm(pose, l, true, target, bend);
-                    ApplyFingers(pose, 0, l.wrist, on_grip ? first_left_wrist : nullptr);
+                    if (!(on_grip && g_native_diag.native)) {
+                        ApplyFingers(pose, 0, l.wrist, on_grip ? first_left_wrist : nullptr);
+                    }
                 }
             }
             {
@@ -2643,6 +2848,15 @@ namespace body
                         g_track_diag.supported, g_track_diag.active, g_track_diag.valid, g_track_diag.torso, g_track_diag.elbow[0], g_track_diag.elbow[1],
                         g_track_diag.legs, g_track_diag.fingers[0], g_track_diag.hand_source[0], g_track_diag.index_bend[0], g_track_diag.fingers[1],
                         g_track_diag.hand_source[1], g_track_diag.index_bend[1], g_finger_diag[1].trigger);
+                    {
+                        auto player_ref = CreationEngineSingletonManager::GetPlayerRef();
+                        auto camera     = CreationEngineSingletonManager::GetPlayerCameraSingleton();
+                        spdlog::info("[Body] native weapons: wanted {} mode {} live-body bit {} fp camera {} drawn {} | native grip {} hand in weapon ({:.3f},{:.3f},{:.3f})",
+                            third_person_mode::g_wanted.load(), third_person_mode::Active(player_ref),
+                            player_ref ? (third_person_mode::Flags(player_ref, third_person_mode::kLiveBodyFlags) & 8) != 0 : false,
+                            camera && camera->IsInFirstPerson(), player_ref && player_ref->IsWeaponDrawn(), g_native_diag.native,
+                            g_native_diag.hand_in_weapon.x, g_native_diag.hand_in_weapon.y, g_native_diag.hand_in_weapon.z);
+                    }
                     spdlog::info("[BodyIK] first-person arms: setting {} root hits {} body active {} shoulders {} | active {} live {} origin ({:.1f},{:.1f},{:.1f}) root ({:.2f},{:.2f},{:.2f}) shoulders apart {:.2f} m {:.0f} deg, branch {}, after {:.3f} m | weapon {} support {}",
                         GameFlow::gStore.internalSettings.firstPersonArms, g_fp_root_hits.exchange(0), g_state.active, g_body_shoulders.valid,
                         g_fp_diag.active, FirstPersonArmsLive(), g_fp_diag.origin.x, g_fp_diag.origin.y, g_fp_diag.origin.z, g_fp_diag.root_translate.x,
@@ -2720,5 +2934,13 @@ namespace body
     bool FirstPersonArmsActive()
     {
         return g_first_person_handled && FirstPersonArmsLive();
+    }
+}
+
+namespace body
+{
+    void OnFrameStart()
+    {
+        third_person_mode::Update();
     }
 }

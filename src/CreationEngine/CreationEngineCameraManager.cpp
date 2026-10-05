@@ -94,6 +94,7 @@ void CreationEngineCameraManager::InstallHooks() {
 
 void CreationEngineCameraManager::SnapshotAimPose() {
     tracking::Snapshot();
+    body::OnFrameStart();
 }
 
 RE::NiAVObject *getCameraRootNode() {

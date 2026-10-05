@@ -115,8 +115,10 @@ VROptions::VROptions()
         "Reload ejects the magazine; take a new one from your left hip and insert it.", on_off, 0);
     add(kRaiseToAim, kCategoryControls, Kind::Toggle, "RaiseToAim", "Raise to Aim",
         "Aim down sights by bringing the weapon's sight up to your eye.", on_off, 0);
+    add(kNativeWeapons, kCategoryControls, Kind::Toggle, "NativeWeapons", "Native Weapon Handling",
+        "Your body holds, fires and reloads weapons with the game's own third-person animations, the weapon on your controller.", on_off, 1);
     add(kFirstPersonArms, kCategoryControls, Kind::Toggle, "FirstPersonArms", "First-Person Arms",
-        "Show the game's first-person arms and weapon on the body, holding the weapon exactly as animated.", on_off, 1);
+        "Show the game's first-person arms and weapon on the body, holding the weapon exactly as animated.", on_off, 0);
     add(kBodyTracking, kCategoryControls, Kind::Toggle, "BodyTracking", "Body Tracking",
         "Use the headset's body tracking for your torso, elbows and legs when available.", on_off, 1);
     add(kHandTracking, kCategoryControls, Kind::Toggle, "HandTracking", "Tracked Fingers",
@@ -219,6 +221,7 @@ void VROptions::apply() const
     s.walkingLegs          = get(kWalkingLegs) != 0;
     s.bodyTracking         = get(kBodyTracking) != 0;
     s.firstPersonArms      = get(kFirstPersonArms) != 0;
+    s.nativeWeapons        = get(kNativeWeapons) != 0;
     s.holsters             = get(kHolsters) != 0;
     s.manualReload         = get(kManualReload) != 0;
     s.raiseToAim           = get(kRaiseToAim) != 0;

@@ -53,6 +53,7 @@ public:
         kWalkingLegs,
         kBodyTracking,
         kFirstPersonArms,
+        kNativeWeapons,
         kHolsters,
         kManualReload,
         kRaiseToAim,

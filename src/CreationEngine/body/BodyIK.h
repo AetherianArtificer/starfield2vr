@@ -18,6 +18,8 @@ namespace body
     bool OnFirstPersonRootUpdated(RE::NiAVObject* root, RE::NiUpdateData* data, int engine_frame);
     // The first-person rig is posed on the body this frame (its meshes must not follow the head).
     bool FirstPersonArmsActive();
+    // Once per frame on the game's main thread, before the scene updates.
+    void OnFrameStart();
     // Muzzle of the weapon held by the shown body, or null when the body is not driving the weapon.
     RE::NiAVObject* GetBodyMuzzle();
     // Aim direction (game world) the held weapon was posed along this frame, if any.
