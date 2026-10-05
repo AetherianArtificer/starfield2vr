@@ -50,6 +50,14 @@ public:
         return Get()->RunUpscalerPass(Pass, pass, render_graph_data, pass_data);
     }
 
+    // Passes that bound the frame's and each eye's GPU work, for timing.
+    static constexpr int kTimingPassCount = 3;
+    template <int Pass>
+    static uintptr_t onTimingPass(void* pass, void* render_graph_data, void* pass_data)
+    {
+        return Get()->RunTimingPass(Pass, pass, render_graph_data, pass_data);
+    }
+
     // The tonemap pass and the post effects that may follow it, each re-capturing the eye image.
     static constexpr int kLatePassCount = 7;
     template <int Pass>
@@ -90,6 +98,10 @@ private:
     uintptr_t RunLatePass(int pass_kind, void* pass, void* render_graph_data, void* pass_data);
     void      CaptureEyeImage(uint32_t eye, int pass_kind, void* render_graph_data, void* pass_data);
     void      CaptureUiLayer(void* render_graph_data, void* pass_data);
+    void      InstallTimingHooks();
+    uintptr_t RunTimingPass(int pass_kind, void* pass, void* render_graph_data, void* pass_data);
+    // Eye a scene graph renders (0 left, 1 right), or -1.
+    [[nodiscard]] int EyeOfGraph(void* render_graph_data) const;
 
     static uintptr_t onSetMultiCameraViewData(void* column, uint32_t graph_index, ViewIdArray* views);
     static uintptr_t onSubmitRenderGraph(void* frame_list, void* record);
@@ -100,6 +112,7 @@ private:
     std::unique_ptr<FunctionHook> m_scaleform_composite_hook{};
     std::unique_ptr<FunctionHook> m_upscaler_hooks[kUpscalerPassCount]{};
     std::unique_ptr<FunctionHook> m_late_hooks[kLatePassCount]{};
+    std::unique_ptr<FunctionHook> m_timing_hooks[kTimingPassCount]{};
 
     // The eye cameras and their camera views.
     RE::NiCamera* m_right_camera{ nullptr };

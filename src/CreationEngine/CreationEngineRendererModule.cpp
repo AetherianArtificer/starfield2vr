@@ -201,6 +201,7 @@ uintptr_t CreationEngineRendererModule::setReflexMarkerInternal(uintptr_t rcx, u
     static bool engine_notified = false;
     static     auto        vr            = VR::get();
     static auto cameraModule = CreationEngineCameraManager::Get();
+    PerfStats::OnReflexMarker(marker, oldFrameIndex);
     if ((marker == 6 || marker == 0 || marker == 1) && !engine_notified) {
         engine_notified = true;
         instance->SetWindowSize(0,0);
