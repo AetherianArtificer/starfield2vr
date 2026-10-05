@@ -344,6 +344,7 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
 
     // In native stereo the world camera is the left eye and the right eye camera shares its parent.
     auto right_camera = vr->is_native_stereo() ? StereoViewModule::Get()->RightCamera() : nullptr;
+    RE::NiMatrix3 world_head_rotation{};
     auto place = [&](RE::NiCamera* camera, const glm::mat4& eye_transform) {
         glm::mat4 local;
         if (!GameFlow::isImmovable() && !GameFlow::isControlledByAI() && GameFlow::isInFirstPerson()) {
@@ -361,6 +362,9 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
             local = head_rotation * eye_transform;
         }
         local = tracking::ToHavokSpace(local);
+        if (camera == worldCamera) {
+            world_head_rotation = *(RE::NiMatrix3*) &local;
+        }
         camera->local.rotate = originalRotation * *(RE::NiMatrix3*) &local;
         camera->local.translate.x = local[3][0];
         camera->local.translate.y = local[3][1];
@@ -375,6 +379,55 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
         }
     } else {
         place(worldCamera, vr->get_current_eye_transform());
+    }
+    if (right_camera) {
+        RotateSkyCameras(world_head_rotation);
+    }
+}
+
+void CreationEngineCameraManager::RotateSkyCameras(const RE::NiMatrix3& head_rotation) {
+    // The stars, planets and galaxy are drawn by the starfield scene's own cameras, which follow the game's view but not
+    // the head; the head rotation is applied on top of whatever orientation the game gives them this frame.
+    struct Tracked {
+        RE::NiMatrix3 base_local{};
+        RE::NiMatrix3 written_local{};
+        RE::NiMatrix3 base_world{};
+        RE::NiMatrix3 written_world{};
+        bool          valid{ false };
+    };
+    static Tracked tracked[2]{};
+    auto root = CreationEngineSingletonManager::GetSceneGraphRoot();
+    if (root == nullptr) {
+        return;
+    }
+    auto same = [](const RE::NiMatrix3& a, const RE::NiMatrix3& b) { return std::memcmp(&a, &b, sizeof(RE::NiMatrix3)) == 0; };
+    RE::NiCamera* cameras[2]{ root->starfieldScene.pStarFieldCamera, root->starfieldScene.pGalaxyCamera };
+    for (int i = 0; i < 2; ++i) {
+        auto camera = cameras[i];
+        if (camera == nullptr) {
+            continue;
+        }
+        auto& t = tracked[i];
+        if (!t.valid || !same(camera->local.rotate, t.written_local)) {
+            t.base_local = camera->local.rotate;
+        }
+        if (!t.valid || !same(camera->world.rotate, t.written_world)) {
+            t.base_world = camera->world.rotate;
+        }
+        t.written_local       = t.base_local * head_rotation;
+        t.written_world       = t.base_world * head_rotation;
+        t.valid               = true;
+        camera->local.rotate  = t.written_local;
+        camera->world.rotate  = t.written_world;
+    }
+
+    static int frames = 0;
+    if (++frames % 600 == 1) {
+        auto forward = [](RE::NiCamera* camera) {
+            return camera ? std::format("({:.2f}, {:.2f}, {:.2f})", camera->world.rotate.entry[0].pt[0], camera->world.rotate.entry[1].pt[0], camera->world.rotate.entry[2].pt[0])
+                          : std::string{ "none" };
+        };
+        spdlog::info("[Sky] Camera forward: world {}, starfield {}, galaxy {}", forward(root->worldCamera), forward(cameras[0]), forward(cameras[1]));
     }
 }
 

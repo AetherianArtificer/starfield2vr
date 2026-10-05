@@ -89,6 +89,7 @@ public:
     }
 
     void                          UpdateWorldCamera();
+    void                          RotateSkyCameras(const RE::NiMatrix3& head_rotation);
     static void                   SnapshotAimPose();
     // Muzzle of the weapon held by the shown body, or null when the body is not driving the weapon.
     static RE::NiAVObject*        GetBodyMuzzle();
