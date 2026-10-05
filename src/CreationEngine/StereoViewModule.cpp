@@ -50,6 +50,9 @@ namespace
     constexpr size_t kDirectionalShadowSize  = 0x3C;
     constexpr size_t kHighlightSize          = 0x14;
     constexpr size_t kCameraViewIdOffset     = 0x4;  // CameraViewData::cameraHandleId
+    constexpr size_t kCameraViewNearOffset   = 0x10; // CameraViewData::near
+    // The game's first-person near plane (0.6) cuts off the player's body and anything within arm's reach in a headset.
+    constexpr float kEyeNearPlane = 0.05f;
     constexpr size_t kAttachChildVtableIndex = 0x2A0 / 8;
 
     constexpr size_t kRootWorldCameraRoot = 0x78;
@@ -353,12 +356,7 @@ void StereoViewModule::InstallHooks()
         m_scaleform_composite_hook = std::make_unique<FunctionHook>(vtable[7], reinterpret_cast<uintptr_t>(&onScaleformComposite));
         m_scaleform_composite_hook->create();
     }
-    if (auto vtable = reinterpret_cast<uintptr_t*>(MemoryScan::VTable("HDRCompositeRenderPass", ".?AVHDRCompositeRenderPass@CreationRendererPrivate@@", 0))) {
-        m_hdr_composite_hook = std::make_unique<FunctionHook>(vtable[7], reinterpret_cast<uintptr_t>(&onHdrComposite));
-        m_hdr_composite_hook->create();
-    } else {
-        spdlog::error("[Stereo] HDRCompositeRenderPass not found; full-frame eyes cannot be captured");
-    }
+    InstallLatePassHooks();
     if (auto vtable = reinterpret_cast<uintptr_t*>(
             MemoryScan::VTable("CopyToRenderGraphOutputRenderPass", ".?AVCopyToRenderGraphOutputRenderPass@CreationRendererPrivate@@", 0))) {
         m_copy_to_output_hook = std::make_unique<FunctionHook>(vtable[7], reinterpret_cast<uintptr_t>(&onCopyToRenderGraphOutput));
@@ -651,6 +649,7 @@ void StereoViewModule::MirrorInto(uint32_t main_view, uint32_t view_id, RE::NiCa
         return;
     }
     At<uint32_t>(current.camera_view_data, kCameraViewIdOffset) = camera->cameraHandleID;
+    At<float>(current.camera_view_data, kCameraViewNearOffset)  = std::min(At<float>(current.camera_view_data, kCameraViewNearOffset), kEyeNearPlane);
 
     const bool first   = !mirrored.valid;
     auto       changed = [&](const void* a, const void* b, size_t size) { return first || std::memcmp(a, b, size) != 0; };
@@ -690,7 +689,7 @@ void StereoViewModule::UpdateRightFrustum()
     }
     auto world_camera = root->worldCamera;
     // The game moves its camera's near plane (much closer in first person than while loading); the eye cameras follow.
-    const float near_plane = world_camera->viewFrustum._near;
+    const float near_plane = std::min(world_camera->viewFrustum._near, kEyeNearPlane);
     const float far_plane  = world_camera->viewFrustum._far;
     if (near_plane != m_eye_near || far_plane != m_eye_far) {
         m_eye_near = near_plane;
@@ -1371,30 +1370,8 @@ uintptr_t StereoViewModule::onCopyToRenderGraphOutput(void* pass, void* render_g
     return result;
 }
 
-uintptr_t StereoViewModule::onHdrComposite(void* pass, void* render_graph_data, void* pass_data)
-{
-    static auto instance = Get();
-    using func_t         = uintptr_t(void*, void*, void*);
-    static auto original = instance->m_hdr_composite_hook->get_original<func_t>();
-    static auto vr       = VR::get();
 
-    const auto result = original(pass, render_graph_data, pass_data);
-    if (!vr->is_native_stereo() || instance->m_double_width || pass_data == nullptr) {
-        return result;
-    }
-    const auto scene = instance->SceneOf(render_graph_data) & 0xFFFFFF;
-    if (scene == (instance->m_left_view_id & 0xFFFFFF)) {
-        instance->CaptureEyeImage(0, render_graph_data, pass_data);
-    } else if (scene == (instance->m_right_view_id & 0xFFFFFF)) {
-        instance->CaptureEyeImage(1, render_graph_data, pass_data);
-    } else if (instance->m_capture_logs.load() < 24) {
-        ++instance->m_capture_logs;
-        spdlog::info("[Stereo] Tonemap pass for scene {:x} belongs to no eye (left {:x}, right {:x})", scene, instance->m_left_view_id, instance->m_right_view_id);
-    }
-    return result;
-}
-
-void StereoViewModule::CaptureEyeImage(uint32_t eye, void* render_graph_data, void* pass_data)
+void StereoViewModule::CaptureEyeImage(uint32_t eye, int pass_kind, void* render_graph_data, void* pass_data)
 {
     static auto vr    = VR::get();
     auto        data  = static_cast<RE::CreationRendererPrivate::RenderPassData*>(pass_data);
@@ -1408,8 +1385,9 @@ void StereoViewModule::CaptureEyeImage(uint32_t eye, void* render_graph_data, vo
     }
     auto command_list = context->pID3D12CommandList;
 
-    // The tonemapped scene is the largest texture the pass writes.
-    const bool     log   = m_capture_logs.fetch_add(1) < 8;
+    // The tonemap pass writes the eye image (its largest written texture); each later pass is captured again when it
+    // writes a texture of that size and format, so the last post effect of the chain is what the eye shows.
+    const bool     log   = m_late_logs[pass_kind].fetch_add(1) < 4;
     const uint32_t count = (uint32_t)data->renderPassItems->_size;
     ID3D12Resource*       output{ nullptr };
     D3D12_RESOURCE_STATES output_state{};
@@ -1429,6 +1407,10 @@ void StereoViewModule::CaptureEyeImage(uint32_t eye, void* render_graph_data, vo
         if (!written || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 || desc.Width < 256) {
             continue;
         }
+        const auto& expected = m_eye_output_desc[eye];
+        if (pass_kind != 0 && (desc.Width != expected.Width || desc.Height != expected.Height || desc.Format != expected.Format)) {
+            continue;
+        }
         if (output == nullptr || desc.Width * desc.Height > output->GetDesc().Width * output->GetDesc().Height) {
             output       = resource;
             output_state = state;
@@ -1436,12 +1418,18 @@ void StereoViewModule::CaptureEyeImage(uint32_t eye, void* render_graph_data, vo
     }
     if (output == nullptr) {
         if (log) {
-            spdlog::warn("[Stereo] Tonemap pass ({} eye) wrote no texture to capture", eye == 0 ? "left" : "right");
+            spdlog::info("[Stereo] Late pass {} ({} eye) wrote no eye image", pass_kind, eye == 0 ? "left" : "right");
         }
         return;
     }
+    if (log) {
+        spdlog::info("[Stereo] Late pass {} ({} eye) captured {:p}", pass_kind, eye == 0 ? "left" : "right", (void*)output);
+    }
 
     const auto desc    = output->GetDesc();
+    if (pass_kind == 0) {
+        m_eye_output_desc[eye] = desc;
+    }
     auto&      capture = m_eye_capture[eye];
     if (capture == nullptr || capture->GetDesc().Width != desc.Width || capture->GetDesc().Height != desc.Height || capture->GetDesc().Format != desc.Format) {
         capture.Reset();
@@ -1453,7 +1441,7 @@ void StereoViewModule::CaptureEyeImage(uint32_t eye, void* render_graph_data, vo
             return;
         }
         capture->SetName(eye == 0 ? L"Native stereo left eye capture" : L"Native stereo right eye capture");
-        spdlog::info("[Stereo] {} eye captured from the tonemap output {}x{} format {}", eye == 0 ? "Left" : "Right", desc.Width, desc.Height, (uint32_t)desc.Format);
+        spdlog::info("[Stereo] {} eye image {}x{} format {}", eye == 0 ? "Left" : "Right", desc.Width, desc.Height, (uint32_t)desc.Format);
     }
 
     D3D12_RESOURCE_BARRIER to_copy[]{
@@ -1540,4 +1528,69 @@ void StereoViewModule::CaptureUiLayer(void* render_graph_data, void* pass_data)
     };
     command_list->ResourceBarrier(2, restore);
     vr->set_native_ui_source(m_ui_capture.Get());
+}
+
+namespace
+{
+    struct LatePassInfo
+    {
+        const char* label;
+        const char* rtti;
+    };
+
+    // The tonemap pass first; the rest are post effects that may follow it.
+    constexpr LatePassInfo kLatePasses[]{
+        { "HDRCompositeRenderPass", ".?AVHDRCompositeRenderPass@CreationRendererPrivate@@" },
+        { "ContrastAdaptiveSharpeningRenderPass", ".?AVContrastAdaptiveSharpeningRenderPass@CreationRendererPrivate@@" },
+        { "PostSharpenRenderPass", ".?AVPostSharpenRenderPass@CreationRendererPrivate@@" },
+        { "FilmGrainRenderPass", ".?AVFilmGrainRenderPass@CreationRendererPrivate@@" },
+        { "VignetteRenderPass", ".?AVVignetteRenderPass@CreationRendererPrivate@@" },
+        { "LensFlare_AlphaBlendRenderPass", ".?AVLensFlare_AlphaBlendRenderPass@CreationRendererPrivate@@" },
+        { "LensFlareDrawRenderPass", ".?AVLensFlareDrawRenderPass@CreationRendererPrivate@@" },
+        { "CopyToRenderGraphOutputRenderPass", ".?AVCopyToRenderGraphOutputRenderPass@CreationRendererPrivate@@" },
+    };
+
+    template <int... Pass>
+    constexpr std::array<uintptr_t, sizeof...(Pass)> LateDetours(std::integer_sequence<int, Pass...>)
+    {
+        return { reinterpret_cast<uintptr_t>(&StereoViewModule::onLatePass<Pass>)... };
+    }
+} // namespace
+
+void StereoViewModule::InstallLatePassHooks()
+{
+    static_assert(std::size(kLatePasses) == kLatePassCount);
+    static const auto detours = LateDetours(std::make_integer_sequence<int, kLatePassCount>{});
+    for (int i = 0; i < kLatePassCount; ++i) {
+        // The output copy pass already has its own hook.
+        if (i == kLatePassCount - 1) {
+            continue;
+        }
+        auto vtable = reinterpret_cast<uintptr_t*>(MemoryScan::VTable(kLatePasses[i].label, kLatePasses[i].rtti, 0));
+        if (vtable == nullptr) {
+            spdlog::warn("[Stereo] {} not found", kLatePasses[i].label);
+            continue;
+        }
+        m_late_hooks[i] = std::make_unique<FunctionHook>(vtable[7], detours[i]);
+        m_late_hooks[i]->create();
+    }
+}
+
+uintptr_t StereoViewModule::RunLatePass(int pass_kind, void* pass, void* render_graph_data, void* pass_data)
+{
+    using func_t     = uintptr_t(void*, void*, void*);
+    auto        original = m_late_hooks[pass_kind]->get_original<func_t>();
+    static auto vr       = VR::get();
+
+    const auto result = original(pass, render_graph_data, pass_data);
+    if (!vr->is_native_stereo() || m_double_width || pass_data == nullptr) {
+        return result;
+    }
+    const auto scene = SceneOf(render_graph_data) & 0xFFFFFF;
+    if (scene == (m_left_view_id & 0xFFFFFF)) {
+        CaptureEyeImage(0, pass_kind, render_graph_data, pass_data);
+    } else if (scene == (m_right_view_id & 0xFFFFFF)) {
+        CaptureEyeImage(1, pass_kind, render_graph_data, pass_data);
+    }
+    return result;
 }

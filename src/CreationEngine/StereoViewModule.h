@@ -111,8 +111,15 @@ public:
     static uintptr_t onExecuteChildPass(void* graph, void* render_graph_data, void* container);
     static uintptr_t onScaleformComposite(void* pass, void* render_graph_data, void* pass_data);
     static uintptr_t onCopyToRenderGraphOutput(void* pass, void* render_graph_data, void* pass_data);
-    static uintptr_t onHdrComposite(void* pass, void* render_graph_data, void* pass_data);
-    void             CaptureEyeImage(uint32_t eye, void* render_graph_data, void* pass_data);
+    static constexpr int kLatePassCount = 8;
+    template <int Pass>
+    static uintptr_t onLatePass(void* pass, void* render_graph_data, void* pass_data)
+    {
+        return Get()->RunLatePass(Pass, pass, render_graph_data, pass_data);
+    }
+    uintptr_t RunLatePass(int pass_kind, void* pass, void* render_graph_data, void* pass_data);
+    void      InstallLatePassHooks();
+    void      CaptureEyeImage(uint32_t eye, int pass_kind, void* render_graph_data, void* pass_data);
     static bool      onIsPrimarySceneView(void* view);
     static uintptr_t onSubmitRenderGraph(void* frame_list, void* record);
     bool             RegisterRightGraph();
@@ -126,7 +133,9 @@ private:
     std::unique_ptr<FunctionHook> m_execute_child_hook{};
     std::unique_ptr<FunctionHook> m_scaleform_composite_hook{};
     std::unique_ptr<FunctionHook> m_copy_to_output_hook{};
-    std::unique_ptr<FunctionHook> m_hdr_composite_hook{};
+    std::unique_ptr<FunctionHook> m_late_hooks[kLatePassCount]{};
+    std::array<D3D12_RESOURCE_DESC, 2> m_eye_output_desc{};
+    std::array<std::atomic<int>, kLatePassCount> m_late_logs{};
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> m_eye_capture{};
     std::array<bool, 2>                                   m_eye_capture_ready{};
     std::atomic<int>                                      m_capture_logs{ 0 };
