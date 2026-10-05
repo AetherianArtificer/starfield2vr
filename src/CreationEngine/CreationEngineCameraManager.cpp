@@ -308,15 +308,24 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
         camera->local.translate.z = local[3][2];
     };
 
+    auto left_camera = right_camera ? StereoViewModule::Get()->LeftCamera() : nullptr;
     if (right_camera) {
         place(worldCamera, vr->get_eye_transform(VRRuntime::Eye::LEFT));
         place(right_camera, vr->get_eye_transform(VRRuntime::Eye::RIGHT));
-        if (auto left_camera = StereoViewModule::Get()->LeftCamera()) {
+        if (left_camera) {
             left_camera->local = worldCamera->local;
         }
     } else {
         // Before the eye views exist both eyes show the world camera's view.
         place(worldCamera, vr->get_eye_transform(VRRuntime::Eye::LEFT));
+    }
+
+    // The cameras' world transforms follow at once, as the game skips its scene update while paused.
+    for (auto camera : { worldCamera, right_camera, left_camera }) {
+        if (camera != nullptr && camera->parent != nullptr) {
+            RE::NiUpdateData data{};
+            camera->UpdateWorldData(&data);
+        }
     }
 }
 
