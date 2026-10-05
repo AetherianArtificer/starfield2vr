@@ -79,37 +79,11 @@ namespace GameFlow
 
     namespace
     {
-        // The UI singleton: the global pointing at the object whose vtable is UI's.
+        // The global holding the UI singleton, from a load of it in the game's code.
         uint8_t** FindUiSingleton()
         {
-            const auto vtable = MemoryScan::VTable("UI", ".?AVUI@@", 0);
-            if (vtable == 0) {
-                return nullptr;
-            }
-            const auto base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
-            const auto nt   = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
-            auto       sec  = IMAGE_FIRST_SECTION(nt);
-            for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
-                if (std::strncmp(reinterpret_cast<const char*>(sec->Name), ".data", 8) != 0) {
-                    continue;
-                }
-                auto slots = reinterpret_cast<uint8_t**>(base + sec->VirtualAddress);
-                for (size_t n = 0; n < sec->Misc.VirtualSize / sizeof(void*); ++n) {
-                    auto candidate = slots[n];
-                    if (candidate == nullptr || (reinterpret_cast<uintptr_t>(candidate) & 7) != 0 ||
-                        (candidate >= base && candidate < base + nt->OptionalHeader.SizeOfImage)) {
-                        continue;
-                    }
-                    MEMORY_BASIC_INFORMATION info{};
-                    if (VirtualQuery(candidate, &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_READWRITE | PAGE_READONLY)) == 0) {
-                        continue;
-                    }
-                    if (*reinterpret_cast<uintptr_t*>(candidate) == vtable) {
-                        return &slots[n];
-                    }
-                }
-            }
-            return nullptr;
+            const auto slot = MemoryScan::InstructionRelocation("48 8B 0D ? ? ? ? E8 ? ? ? ? 44 0F B6 F8 48 8B 7C", 3, 7, 0x5fd9b80);
+            return reinterpret_cast<uint8_t**>(slot);
         }
 
         // The open menus' names, read under a fault guard; false when the stack does not hold menus (a layout mismatch).
