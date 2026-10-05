@@ -42,33 +42,16 @@ namespace RenderPassProfiler
         std::atomic<uint32_t>                 g_skipped{ 0 };
         std::atomic<bool>                     g_ready{ false };
 
-        // Shadow map work that does not depend on the eye: clears, culling for the shadow views, the shadow draws and
-        // the pyramids built from the maps. The per-eye passes that sample the maps keep running.
+        // Shadow map work whose only output is the shadow maps on the GPU: the clears, the shadow draws and the depth
+        // pyramids built from the maps. Culling and draw preparation keep running, as later passes read their data on the CPU.
         constexpr const char* kShadowMapPasses[]{
             "ClearShadowMapsRenderPass",
             "ClearShadowMapGroupRenderPass",
             "ShadowMapInstanceRenderPass",
             "GroupedDynamicShadowMapRenderPass",
-            "DynamicShadowGeometryCullingRenderPass",
-            "DynamicShadowMeshletCullingRenderPass",
-            "DynamicShadowMeshletCullingFalseNegativesRenderPass",
-            "DynamicShadowMeshletListBuildRenderPass",
-            "DynamicShadowMeshletListBuildFalseNegativesRenderPass",
-            "DynamicShadowTriangleCullingRenderPass",
-            "DynamicShadowPrepareDrawParamsRenderPass",
-            "DynamicShadowPrepareGroupedDrawsRenderPass",
-            "DynamicShadowGeometryOffsetsRenderPass",
-            "DynamicShadowMaterialIndexOffsetsRenderPass",
-            "DynamicShadowFilterFocusGeometriesRenderPass",
-            "DynamicShadowsMeshInstancePatchPrepareArgsRenderPass",
             "DynamicShadowDepthPyramidRenderPass",
-            "MeshInstancePatchShadowRenderPass",
-            "MeshInstancePatchPrepareArgsShadowRenderPass",
-            "GeometryCullingShadowsRenderPass",
             "GenerateShadowDepthPyramidRenderPass",
             "GenerateShadowDepthPyramidWithMaskRenderPass",
-            "InitializeMinMaxShadowMapRenderPass",
-            "ComputeMinMaxShadowMapLevelRenderPass",
         };
 
         // Timestamps per frame slot.
