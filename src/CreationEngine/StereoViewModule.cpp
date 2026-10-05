@@ -1,7 +1,6 @@
 #include "StereoViewModule.h"
 
 #include "CreationEngineRendererModule.h"
-#include "CreationEngineSettings.h"
 #include <_deps/directxtk12-src/Src/d3dx12.h>
 #include <intrin.h>
 #include <safetyhook/easy.hpp>
@@ -464,7 +463,6 @@ void StereoViewModule::OnFrameStart()
 
     const bool native = vr->is_native_stereo();
     ApplyViewports(native);
-    ApplyRenderGraphOrdering(native);
     if (!native) {
         m_missed_appends = 0;
         vr->set_native_mono_frame(false);
@@ -485,12 +483,22 @@ void StereoViewModule::OnFrameStart()
         ClearCrashGuard();
         spdlog::info("[Stereo] Native stereo stable for {} frames", kFramesUntilStable);
     }
-    // Snapshot once both views have been rendering in first-person gameplay for a while.
+    if (m_renew_right_camera.exchange(false)) {
+        RenewRightCamera();
+    }
+
+    // Snapshot once both views have been rendering in first-person gameplay for a while, again after any test switch.
+    const auto variant = Variant();
+    if (variant != m_last_variant) {
+        m_last_variant  = variant;
+        m_stereo_frames = 0;
+        spdlog::info("[Stereo] Test variant: {}", variant);
+    }
     const bool gameplay = m_missed_appends == 0 && !GameFlow::isShowingMenu() && GameFlow::isInFirstPerson();
     if (gameplay && ++m_stereo_frames == kFramesUntilSnapshot) {
         LogRenderSizes();
         StartCensus();
-        vr->request_backbuffer_dump(Framework::get_persistent_dir(m_double_width ? "vr_native_stereo_double_width.png" : "vr_native_stereo_window_width.png").wstring());
+        vr->request_backbuffer_dump(Framework::get_persistent_dir(std::format("vr_native_stereo_{}.png", variant)).wstring());
     }
 }
 
@@ -1146,6 +1154,11 @@ uintptr_t StereoViewModule::onSubmitRenderGraph(void* frame_list, void* record)
     if (instance->m_right_graph_ready && vr->is_native_stereo() && root && record == reinterpret_cast<uint8_t*>(root) + kRootMainGraphRecord &&
         At<uint32_t>(root, kRootMainView) != kInvalidId) {
         instance->PrepareRightGraph();
+        if (GameFlow::gStore.internalSettings.nativeLeftGraphFirst) {
+            const auto result = original(frame_list, record);
+            original(frame_list, instance->m_right_graph_record);
+            return result;
+        }
         original(frame_list, instance->m_right_graph_record);
         if (instance->m_right_graph_submits++ == 0) {
             spdlog::info("[Stereo] Right eye render graph submitted ahead of the main graph");
@@ -1154,19 +1167,28 @@ uintptr_t StereoViewModule::onSubmitRenderGraph(void* frame_list, void* record)
     return original(frame_list, record);
 }
 
-void StereoViewModule::ApplyRenderGraphOrdering(bool native)
+
+std::string StereoViewModule::Variant() const
 {
-    // Both eyes' graphs draw from one pool of transient textures; overlapping their GPU work lets one eye overwrite
-    // the other's depth and colour copies (soft particles, forward-blended effects), so native stereo runs them in order.
-    if (native == m_ordering_applied) {
-        return;
+    return std::format("{}_{}_camera{}", m_double_width ? "double" : "window", GameFlow::gStore.internalSettings.nativeLeftGraphFirst ? "leftfirst" : "rightfirst",
+                       m_right_camera_generation);
+}
+
+bool StereoViewModule::RenewRightCamera()
+{
+    auto root = CreationEngineSingletonManager::GetSceneGraphRoot();
+    if (!m_registered || root == nullptr || root->worldCamera == nullptr) {
+        return false;
     }
-    m_ordering_applied = native;
-    auto settings      = CreationEngineSettings::Get();
-    using Type         = CreationEngineSettings::SettingType;
-    const bool sequential = settings->set_setting("bForceSequencialQueueExecution:RenderGraph", Type::kINISetting, native);
-    const bool async      = settings->set_setting("bEnableMultiFrameAsyncCompute:Display", Type::kINISetting, !native);
-    spdlog::info("[Stereo] Render graph ordering {}: sequential queue {} ({}), multi-frame async compute {} ({})", native ? "serialized" : "restored",
-                 settings->get_setting("bForceSequencialQueueExecution:RenderGraph", Type::kINISetting, false), sequential ? "set" : "not found",
-                 settings->get_setting("bEnableMultiFrameAsyncCompute:Display", Type::kINISetting, false), async ? "set" : "not found");
+    RegisterContext ctx{ root, root->worldCamera, nullptr, kInvalidId, 0, "VR Right Eye Camera" };
+    if (!RegisterEngineObjectsGuarded(&ctx)) {
+        spdlog::error("[Stereo] Renewing the right eye camera failed at step {}", ctx.step);
+        return false;
+    }
+    m_right_camera  = ctx.camera;
+    m_right_view_id = ctx.view_id;
+    m_mirrored      = {};
+    ++m_right_camera_generation;
+    spdlog::info("[Stereo] Right eye now uses camera {:x}, view {:x} (generation {})", m_right_camera->cameraHandleID, m_right_view_id, m_right_camera_generation);
+    return true;
 }

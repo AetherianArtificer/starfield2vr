@@ -35,6 +35,7 @@ namespace GameFlow
             bool nativeStereo{true};
             bool stereoHudBothEyes{true};
             bool stereoDoubleWidth{true};
+            bool nativeLeftGraphFirst{false};
             int   turnMode{0}; // 0 = snap, 1 = smooth (game's own stick look)
             float snapTurnDegrees{45.0f};
             bool  turnFade{false};

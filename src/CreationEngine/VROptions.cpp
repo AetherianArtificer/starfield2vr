@@ -1,6 +1,7 @@
 #include "VROptions.h"
 
 #include "CreationEngineConstants.h"
+#include "StereoViewModule.h"
 #include "Framework.hpp"
 #include <CreationEngine/models/ModSettingsStore.h>
 #include <mods/VR.hpp>
@@ -86,6 +87,10 @@ VROptions::VROptions()
     add(kStereoLayout, kCategoryDisplay, Kind::Choice, "NativeEyeLayout", "Native Eye Layout",
         "How Native stereo rendering fits both eyes into the game window. Double Width is sharper; Window Width works when the game cannot use a wider window.",
         { "Window Width", "Double Width" }, 1);
+    add(kNativeGraphOrder, kCategoryDisplay, Kind::Choice, "NativeGraphOrder", "Native Eye Order (Test)",
+        "Which eye's render graph runs first with Native stereo rendering.", { "Right Eye First", "Left Eye First" }, 0);
+    add(kNativeRenewRightCamera, kCategoryDisplay, Kind::Action, "", "Renew Right Eye Camera (Test)",
+        "Give the right eye a newly registered camera.", {}, 0);
     add(kHudSize, kCategoryDisplay, Kind::Choice, "HudSize", "HUD Size", "Size of the in-game HUD.", { "Small", "Medium", "Large" }, 1);
     add(kHudDepth, kCategoryDisplay, Kind::Choice, "HudDepth", "HUD Depth", "How far away the in-game HUD appears.", { "Near", "Medium", "Far" }, 1);
     add(kMenuDistance, kCategoryDisplay, Kind::Choice, "MenuDistance", "Menu Distance", "How far away full-screen menus appear.",
@@ -168,6 +173,10 @@ void VROptions::set(std::uint32_t id, int value)
         VR::get()->recenter_view();
         return;
     }
+    if (id == kNativeRenewRightCamera) {
+        StereoViewModule::Get()->RequestRenewRightCamera();
+        return;
+    }
     if (id == kComfortPreset) {
         if (value >= 0 && value < kCustomPreset) {
             apply_preset(value);
@@ -206,6 +215,7 @@ void VROptions::apply() const
     s.nativeStereo         = s.stereoMode == 1;
     s.stereoHudBothEyes    = get(kStereoHud) == 0;
     s.stereoDoubleWidth    = get(kStereoLayout) == 1;
+    s.nativeLeftGraphFirst = get(kNativeGraphOrder) == 1;
 
     auto& hud       = GameFlow::gStore.hudSettings;
     hud.hudScale    = Pick(kHudSizes, get(kHudSize));

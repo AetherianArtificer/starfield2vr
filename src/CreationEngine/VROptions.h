@@ -55,6 +55,8 @@ public:
         kStereoRendering,
         kStereoHud,
         kStereoLayout,
+        kNativeGraphOrder,
+        kNativeRenewRightCamera,
 
         kFirstId = 8600,
         kLastId  = 8699,

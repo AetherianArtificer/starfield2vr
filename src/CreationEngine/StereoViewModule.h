@@ -40,6 +40,9 @@ public:
     // Eye a camera renders in native stereo: 0 left, 1 right, -1 not an eye camera.
     [[nodiscard]] int EyeOf(const RE::NiCamera* camera) const;
 
+    // Test switch: registers a fresh camera and view for the right eye.
+    void RequestRenewRightCamera() { m_renew_right_camera.store(true); }
+
 private:
     StereoViewModule() = default;
 
@@ -47,8 +50,11 @@ private:
 
     bool TryRegister();
     void ApplyViewports(bool side_by_side);
-    void ApplyRenderGraphOrdering(bool native);
-    bool m_ordering_applied{ false };
+    bool RenewRightCamera();
+    [[nodiscard]] std::string Variant() const;
+    std::atomic<bool> m_renew_right_camera{ false };
+    int               m_right_camera_generation{ 0 };
+    std::string       m_last_variant{};
     void MirrorMainView();
     struct MirroredRows;
     void MirrorInto(uint32_t main_view, uint32_t view_id, RE::NiCamera* camera, MirroredRows& mirrored);
