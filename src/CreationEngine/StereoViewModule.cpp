@@ -462,21 +462,24 @@ void StereoViewModule::OnFrameStart()
     m_missed_appends = m_appended.exchange(false) ? 0 : m_missed_appends + 1;
     vr->set_native_mono_frame(m_menu_fallback.load() || m_missed_appends > 1);
 
-    // Requested screenshots are taken after a second of gameplay with both eyes. Asked for in a fullscreen menu, the
-    // menu's UI layer and scene are saved at once as well.
-    static bool menu_dumped = false;
+    // A fullscreen menu's UI layer, scene and finished image are saved a moment after it opens, for the first few
+    // menus of a session.
+    static int menu_frames = 0;
+    static int menus_saved = 0;
+    menu_frames = m_menu_fallback.load() ? menu_frames + 1 : 0;
+    if (menu_frames == 90 && menus_saved < 5) {
+        ++menus_saved;
+        const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        vr->request_menu_dump(Framework::get_persistent_dir(std::format("vr_menu_{}.png", stamp)).wstring());
+    }
+
+    // Requested screenshots are taken after a second of gameplay with both eyes, so a menu is never captured.
     if (m_screenshot_requested.load()) {
-        if (m_menu_fallback.load() && !menu_dumped) {
-            menu_dumped      = true;
-            const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-            vr->request_menu_dump(Framework::get_persistent_dir(std::format("vr_menu_{}.png", stamp)).wstring());
-        }
         const bool gameplay = !m_menu_fallback.load() && m_missed_appends == 0;
         m_screenshot_frames  = gameplay ? m_screenshot_frames + 1 : 0;
         if (m_screenshot_frames >= 90) {
             m_screenshot_requested = false;
             m_screenshot_frames    = 0;
-            menu_dumped            = false;
             const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
             vr->request_backbuffer_dump(Framework::get_persistent_dir(std::format("vr_eyes_{}.png", stamp)).wstring());
             spdlog::info("[Stereo] Eye screenshots saved");
