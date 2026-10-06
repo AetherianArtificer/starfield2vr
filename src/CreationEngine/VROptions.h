@@ -20,6 +20,7 @@ public:
         kCategoryComfort  = 86,
         kCategoryDisplay  = 87,
         kCategoryControls = 88,
+        kCategoryBody     = 89,
     };
 
     enum Id : std::uint32_t
@@ -52,12 +53,6 @@ public:
         kFingerPoses,
         kWalkingLegs,
         kBodyTracking,
-        kFirstPersonArms,
-        kNativeWeapons,
-        kHolsters,
-        kManualReload,
-        kRaiseToAim,
-        kHandTracking,
         kMatchBodyHeight,
         kHudPlacement,
         kEyeScreenshots,
@@ -99,7 +94,7 @@ public:
     void on_config_load(const utility::Config& cfg, bool set_defaults) override;
     void on_config_save(utility::Config& cfg) override;
 
-    [[nodiscard]] static const std::array<CategoryInfo, 3>& categories();
+    [[nodiscard]] static const std::array<CategoryInfo, 4>& categories();
     [[nodiscard]] const std::vector<Option>&                options() const { return m_options; }
     [[nodiscard]] int                                       get(std::uint32_t id) const;
     void                                                    set(std::uint32_t id, int value);

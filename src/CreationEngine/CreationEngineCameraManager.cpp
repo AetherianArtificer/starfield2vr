@@ -150,16 +150,10 @@ void CreationEngineCameraManager::onNiAVObjectUpdateWorld(RE::NiAVObject *obj, R
         body::OnUpdateWorld(obj, vr->m_engine_frame_count);
 
         auto camera_root = getCameraRootNode();
-        if (camera_root && obj == camera_root) {
-            original_func(obj, a_data);
-            body::OnFirstPersonRootUpdated(obj, a_data, vr->m_engine_frame_count);
-            return;
-        }
         if (obj->parent && camera_root && camera_root == obj->parent) {
             const bool is_mesh = !std::strstr(obj->name.c_str(), "Camera");
-            body::OnFirstPersonRootUpdated(camera_root, a_data, vr->m_engine_frame_count);
             original_func(obj, a_data);
-            if (is_mesh && !body::FirstPersonArmsActive()) {
+            if (is_mesh) {
                 UpdateMesh(obj);
             }
             return;
@@ -404,7 +398,3 @@ bool CreationEngineCameraManager::GetBodyAimForward(float out[3])
     return body::GetBodyAimForward(out);
 }
 
-void CreationEngineCameraManager::NotifyPlayerFired()
-{
-    body::NotifyPlayerFired();
-}

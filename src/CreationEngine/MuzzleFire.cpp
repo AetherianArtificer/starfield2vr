@@ -42,7 +42,6 @@ namespace MuzzleFire
                             aim  = true;
                         }
                     }
-                    CreationEngineCameraManager::NotifyPlayerFired();
                 }
             }
             const bool result = g_compute_launch_origin_hook.call<bool>(launch_data);

@@ -3,27 +3,19 @@
 namespace RE
 {
     class NiAVObject;
-    class NiUpdateData;
 }
 
 // Third-person body shown in first person with arm, leg and weapon IK.
 namespace body
 {
-    // Hooks BSModelNode::UpdateTransforms, where the IK is applied to the body's pose buffer.
+    // Hooks BSModelNode::UpdateTransforms and the body's animation graph, where the body is posed.
     void InstallModelNodeHook();
     // Called for each object as it updates its world transform; toggles the body at its 3P root.
     void OnUpdateWorld(RE::NiAVObject* obj, int engine_frame);
-    // The first-person rig's root has updated, its children have not: poses the rig's arms and weapon on the body.
-    // Runs once per engine frame (from the root, or its first child if the root is not seen).
-    bool OnFirstPersonRootUpdated(RE::NiAVObject* root, RE::NiUpdateData* data, int engine_frame);
-    // The first-person rig is posed on the body this frame (its meshes must not follow the head).
-    bool FirstPersonArmsActive();
     // Once per frame on the game's main thread, before the scene updates.
     void OnFrameStart();
     // Muzzle of the weapon held by the shown body, or null when the body is not driving the weapon.
     RE::NiAVObject* GetBodyMuzzle();
     // Aim direction (game world) the held weapon was posed along this frame, if any.
     bool GetBodyAimForward(float out[3]);
-    // The player fired: the weapon's pose in the first-person rig is sampled as its firing grip.
-    void NotifyPlayerFired();
 }

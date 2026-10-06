@@ -26,12 +26,13 @@ namespace
     }
 }
 
-const std::array<VROptions::CategoryInfo, 3>& VROptions::categories()
+const std::array<VROptions::CategoryInfo, 4>& VROptions::categories()
 {
-    static const std::array<CategoryInfo, 3> list{ {
+    static const std::array<CategoryInfo, 4> list{ {
         { kCategoryComfort, "VR Comfort" },
         { kCategoryDisplay, "VR Display" },
         { kCategoryControls, "VR Controls" },
+        { kCategoryBody, "VR Body" },
     } };
     return list;
 }
@@ -77,8 +78,6 @@ VROptions::VROptions()
         { "70%", "80%", "90%", "100%", "110%", "120%", "130%", "150%" }, 3);
     add(kWorldScale, kCategoryDisplay, Kind::Choice, "WorldScale", "World Scale", "Make the world feel larger or smaller around you.",
         { "90%", "95%", "100%", "105%", "110%" }, 2);
-    add(kMatchBodyHeight, kCategoryDisplay, Kind::Toggle, "MatchBodyHeight", "Match Body Height",
-        "Scale your movement so your eyes and reach match your character's body. Measured when the view recenters.", on_off, 1);
     add(kHudPlacement, kCategoryDisplay, Kind::Choice, "HudPlacement", "HUD Placement",
         "Floating Panel shows the HUD on a panel in front of you that recentres when you turn away. Head Locked keeps it fixed in your view.",
         { "Floating Panel", "Head Locked" }, 0);
@@ -101,30 +100,25 @@ VROptions::VROptions()
         { "Head", "Left Hand" }, 1);
     add(kAimWith, kCategoryControls, Kind::Choice, "AimWith", "Aim With", "Aim with your head, or point your weapon with your right hand.",
         { "Head when aiming", "Free", "Always head", "Right Hand" }, 0);
-    add(kBodyLean, kCategoryControls, Kind::Toggle, "BodyLean", "Body Lean",
-        "Bend the body's spine when you lean, keeping the hips in place.", on_off, 1);
-    add(kBodyFacing, kCategoryControls, Kind::Toggle, "BodyFacing", "Body Faces Hands",
+
+    // VR Body
+    add(kWeaponFollowsHand, kCategoryBody, Kind::Toggle, "WeaponFollowsHand", "Full Body (Experimental)",
+        "Show your character's body in first person. Your hands follow the controllers and hold your weapon the way the game animates it.",
+        on_off, 0);
+    add(kMatchBodyHeight, kCategoryBody, Kind::Toggle, "MatchBodyHeight", "Match Body Height",
+        "Scale your movement so your eyes and reach match your character's body. Measured when the view recenters.", on_off, 1);
+    add(kBodyFacing, kCategoryBody, Kind::Toggle, "BodyFacing", "Body Faces Hands",
         "Turn the torso partly toward your hands instead of only following your head.", on_off, 1);
-    add(kSupportHand, kCategoryControls, Kind::Toggle, "SupportHand", "Two-Handed Grip",
-        "Your left hand holds the weapon's foregrip when you bring it close.", on_off, 1);
-    add(kFingerPoses, kCategoryControls, Kind::Toggle, "FingerPoses", "Finger Tracking",
-        "Fingers follow the controller's trigger, grip and thumb touch, or your real fingers when the headset tracks your hands.", on_off, 1);
-    add(kHolsters, kCategoryControls, Kind::Toggle, "Holsters", "Holsters",
-        "Draw by gripping at your hip, chest or shoulder; rest the weapon there to holster it.", on_off, 0);
-    add(kManualReload, kCategoryControls, Kind::Toggle, "ManualReload", "Manual Reload",
-        "Reload ejects the magazine; take a new one from your left hip and insert it.", on_off, 0);
-    add(kRaiseToAim, kCategoryControls, Kind::Toggle, "RaiseToAim", "Raise to Aim",
-        "Aim down sights by bringing the weapon's sight up to your eye.", on_off, 0);
-    add(kNativeWeapons, kCategoryControls, Kind::Toggle, "NativeWeapons", "Native Weapon Handling",
-        "Your body holds, fires and reloads weapons with the game's own third-person animations, the weapon on your controller.", on_off, 1);
-    add(kFirstPersonArms, kCategoryControls, Kind::Toggle, "FirstPersonArms", "First-Person Arms",
-        "Show the game's first-person arms and weapon on the body, holding the weapon exactly as animated.", on_off, 0);
-    add(kBodyTracking, kCategoryControls, Kind::Toggle, "BodyTracking", "Body Tracking",
-        "Use the headset's body tracking for your torso, elbows and legs when available.", on_off, 1);
-    add(kWalkingLegs, kCategoryControls, Kind::Toggle, "WalkingLegs", "Walking Legs",
+    add(kBodyLean, kCategoryBody, Kind::Toggle, "BodyLean", "Body Lean",
+        "Bend the body's spine when you lean, keeping the hips in place.", on_off, 1);
+    add(kWalkingLegs, kCategoryBody, Kind::Toggle, "WalkingLegs", "Walking Legs",
         "The body's legs step whenever you move.", on_off, 1);
-    add(kWeaponFollowsHand, kCategoryControls, Kind::Toggle, "WeaponFollowsHand", "Full Body (Experimental)",
-        "Show your character's body in first person. With Aim With set to Right Hand, your right hand and weapon follow the controller.", on_off, 0);
+    add(kSupportHand, kCategoryBody, Kind::Toggle, "SupportHand", "Two-Handed Grip",
+        "Your left hand holds the weapon's foregrip when you bring it close.", on_off, 1);
+    add(kFingerPoses, kCategoryBody, Kind::Toggle, "FingerPoses", "Finger Tracking",
+        "Fingers follow the controller's trigger, grip and thumb touch, or your real fingers when the headset tracks your hands.", on_off, 1);
+    add(kBodyTracking, kCategoryBody, Kind::Toggle, "BodyTracking", "Body Tracking",
+        "Use the headset's body tracking for your torso, elbows and legs when available.", on_off, 1);
 }
 
 const VROptions::Option* VROptions::find(std::uint32_t id) const
@@ -218,12 +212,6 @@ void VROptions::apply() const
     s.fingerPoses          = get(kFingerPoses) != 0;
     s.walkingLegs          = get(kWalkingLegs) != 0;
     s.bodyTracking         = get(kBodyTracking) != 0;
-    s.firstPersonArms      = get(kFirstPersonArms) != 0;
-    s.nativeWeapons        = get(kNativeWeapons) != 0;
-    s.holsters             = get(kHolsters) != 0;
-    s.manualReload         = get(kManualReload) != 0;
-    s.raiseToAim           = get(kRaiseToAim) != 0;
-    s.handTracking         = s.fingerPoses;
     s.hudPanel             = get(kHudPlacement) == 0;
 
     auto& hud       = GameFlow::gStore.hudSettings;

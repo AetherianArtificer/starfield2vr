@@ -24,14 +24,15 @@
 #include <CreationEngine/models/GameFlow.h>
 #include <CreationEngine/models/ModSettingsStore.h>
 #include <CreationEngine/vr/TrackingSpace.h>
-#include <CreationEngine/input/InputRequests.h>
-#include <CreationEngine/StereoViewModule.h>
 
 #include "BodyMath.h"
 #include "SceneGraph.h"
 
-// Third-person body shown in first person, as the game does for furniture that uses the 3P rig in first
-// person; arms are posed with IK on the skeleton's pose buffer.
+// Third-person body shown in first person. Each frame has two passes over the body's skeleton:
+//  - the animation stage, at the end of the body's animation graph (before its pose is copied into the model):
+//    body placement under the head, facing, crouch, lean, legs, and the weapon placed on the controller;
+//  - the frame build, at BSModelNode::UpdateTransforms: the arms solved onto the hands' targets.
+// Both read one capture of the headset, controllers and camera taken on the main thread at the frame's start.
 namespace body
 {
     namespace
@@ -49,18 +50,11 @@ namespace body
             int             frame{ -1 };
         };
         State g_state;
-        // The weapon was placed on the controller this frame.
-        std::atomic<bool> g_weapon_placed{ false };
 
-        // The first-person pass stamps the frame it last ran (diagnostics).
-        std::atomic<int> g_fp_last_frame{ -1000 };
-        int              g_frame_counter{ 0 };
-
-        bool FirstPersonArmsLive()
-        {
-            return GameFlow::gStore.internalSettings.firstPersonArms;
-        }
         std::atomic<RE::NiAVObject*> g_body_muzzle{ nullptr };
+
+        // Body passes (animation stage, frame build) run one at a time; they may run on different threads.
+        std::mutex g_body_mutex;
 
         RE::NiAVObject* ThirdPersonRoot(RE::PlayerCharacter* player)
         {
@@ -107,10 +101,11 @@ namespace body
         // the game's SetFirstPerson; Use3PRig is detoured so the camera is not moved onto the third-person skeleton.
         namespace third_person_mode
         {
-            constexpr std::size_t kLiveBodyFlags = 0x112A;  // bit 3: third-person body live
-            constexpr std::size_t kRigModeFlags  = 0x112F;  // bit 3: third-person rig in first person
+            constexpr std::size_t  kLiveBodyFlags = 0x112A;  // bit 3: third-person body live
+            constexpr std::size_t  kRigModeFlags  = 0x112F;  // bit 3: third-person rig in first person
+            constexpr std::uint8_t kModeBit       = 8;
 
-            std::atomic<bool> g_wanted{ false };
+            bool                   g_wanted{ false };  // main thread
             safetyhook::InlineHook g_use_3p_rig_hook;
             void*                  g_save_original{ nullptr };
 
@@ -121,7 +116,7 @@ namespace body
 
             bool Active(RE::PlayerCharacter* player)
             {
-                return player && (Flags(player, kRigModeFlags) & 8) != 0;
+                return player && (Flags(player, kRigModeFlags) & kModeBit) != 0;
             }
 
             // Game 1.16.244 addresses without a unique signature.
@@ -154,16 +149,15 @@ namespace body
                 static auto hide_helmet = Resolve<hide_helmet_t>("48 89 5C 24 10 48 89 74 24 18 57 48 83 EC 30 41 8B F8 0F", 0xb71430);
                 static auto refresh     = Resolve<refresh_t>("48 89 5C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 D9 48 81 EC A0 00 00 00 48 8B F1", 0x1a34a50);
                 static auto blend       = reinterpret_cast<blend_t>(GameAddress(0x1a3ce80));
-                static auto mask_addr   = GameAddress(0x5F46750);
-                const auto  mask        = *reinterpret_cast<std::uint32_t*>(mask_addr);
+                const auto  mask        = *reinterpret_cast<std::uint32_t*>(GameAddress(0x5F46750));
 
-                Flags(player, kLiveBodyFlags) |= 8;
+                Flags(player, kLiveBodyFlags) |= kModeBit;
                 hide_slots(*reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(player) + 0xC8), mask, true);
                 hide_helmet(player, true, mask);
                 SetAppCulled(ThirdPersonRoot(player), false);
                 SetAppCulled(FirstPersonRoot(player), true);
                 SetAppCulled(FaceNode(player), true);
-                Flags(player, kRigModeFlags) |= 8;
+                Flags(player, kRigModeFlags) |= kModeBit;
                 refresh(player);
                 blend(player, 0.01f);
                 spdlog::info("[Body] third-person rig in first person: on");
@@ -177,18 +171,20 @@ namespace body
                 fn(player, true);
             }
 
-            // Saves never record the mode (the game would restore a third-person camera from it).
-            void SaveWithoutMode(RE::PlayerCharacter* player, void* a2, void* a3, void* a4)
+            // Saves never record the mode (loading it would put the camera in third person).
+            std::uintptr_t SaveWithoutMode(RE::PlayerCharacter* player, void* buffer)
             {
-                const auto live = Flags(player, kLiveBodyFlags);
-                const auto rig  = Flags(player, kRigModeFlags);
-                if (rig & 8) {
-                    Flags(player, kLiveBodyFlags) &= ~8;
-                    Flags(player, kRigModeFlags) &= ~8;
+                const bool mode = (Flags(player, kRigModeFlags) & kModeBit) != 0;
+                if (mode) {
+                    Flags(player, kLiveBodyFlags) &= ~kModeBit;
+                    Flags(player, kRigModeFlags) &= ~kModeBit;
                 }
-                reinterpret_cast<void (*)(RE::PlayerCharacter*, void*, void*, void*)>(g_save_original)(player, a2, a3, a4);
-                Flags(player, kLiveBodyFlags) = live;
-                Flags(player, kRigModeFlags)  = rig;
+                const auto result = reinterpret_cast<std::uintptr_t (*)(RE::PlayerCharacter*, void*)>(g_save_original)(player, buffer);
+                if (mode) {
+                    Flags(player, kLiveBodyFlags) |= kModeBit;
+                    Flags(player, kRigModeFlags) |= kModeBit;
+                }
+                return result;
             }
 
             void Install()
@@ -198,22 +194,24 @@ namespace body
                 spdlog::info("[Body] Use3PRig hook: {}", static_cast<bool>(g_use_3p_rig_hook));
             }
 
+            // Player vtable slot 0xD0: save (player, buffer).
             void HookSave(RE::PlayerCharacter* player)
             {
                 if (g_save_original || !player) {
                     return;
                 }
-                auto vtable = *reinterpret_cast<void***>(player);
+                auto  vtable = *reinterpret_cast<void***>(player);
                 DWORD old{};
                 if (VirtualProtect(&vtable[0xD0 / 8], sizeof(void*), PAGE_READWRITE, &old)) {
-                    g_save_original      = vtable[0xD0 / 8];
-                    vtable[0xD0 / 8]     = reinterpret_cast<void*>(&SaveWithoutMode);
+                    g_save_original  = vtable[0xD0 / 8];
+                    vtable[0xD0 / 8] = reinterpret_cast<void*>(&SaveWithoutMode);
                     VirtualProtect(&vtable[0xD0 / 8], sizeof(void*), old, &old);
                     spdlog::info("[Body] save hook installed");
                 }
             }
 
-            // Main-thread, once per frame: keep the mode in step with the VR body and first-person camera.
+            // Main thread, once per frame: the mode follows the shown body while the camera is first-person. One
+            // attempt per entry; if the game does not take it, that is logged once.
             void Update()
             {
                 auto player = CreationEngineSingletonManager::GetPlayerRef();
@@ -222,31 +220,29 @@ namespace body
                     return;
                 }
                 HookSave(player);
-                const bool want = g_state.active && GameFlow::gStore.internalSettings.nativeWeapons;
-                const bool fps  = camera->IsInFirstPerson();
-                if (want != g_wanted.load()) {
-                    g_wanted = want;
-                    if (fps) {
-                        SetFirstPerson(player);  // enters the mode, or (wanted off) runs the game's own exit
-                    }
-                    spdlog::info("[Body] third-person rig in first person wanted: {}", want);
-                } else if (want && fps && !Active(player)) {
-                    SetFirstPerson(player);  // the game left the mode (furniture exit, camera change)
+                static bool attempted{ false };
+                static bool reported{ false };
+                const bool  want = g_state.active;
+                const bool  fps  = camera->IsInFirstPerson();
+                if (!fps || Active(player)) {
+                    attempted = false;
+                    reported  = false;
                 }
-
-                // One pair of eye screenshots a few seconds into each of the first holds, for checking the grip.
-                static std::chrono::steady_clock::time_point drawn_since{};
-                static bool taken_this_draw{ false };
-                static int  taken{ 0 };
-                const auto  now = std::chrono::steady_clock::now();
-                if (!g_weapon_placed) {
-                    drawn_since     = now;
-                    taken_this_draw = false;
-                } else if (!taken_this_draw && taken < 3 && now - drawn_since > std::chrono::seconds(3)) {
-                    taken_this_draw = true;
-                    ++taken;
-                    StereoViewModule::Get()->RequestEyeScreenshots();
-                    spdlog::info("[Body] eye screenshots requested with the weapon drawn");
+                if (want != g_wanted) {
+                    g_wanted = want;
+                    spdlog::info("[Body] third-person rig in first person wanted: {}", want);
+                    if (fps) {
+                        SetFirstPerson(player);  // enters the mode, or (no longer wanted) runs the game's own exit
+                        attempted = want;
+                    }
+                } else if (want && fps && !Active(player)) {
+                    if (!attempted) {
+                        SetFirstPerson(player);  // the game left the mode (furniture exit, camera change)
+                        attempted = true;
+                    } else if (!reported) {
+                        reported = true;
+                        spdlog::error("[Body] the third-person rig mode did not turn on; the body keeps its first-person animations");
+                    }
                 }
             }
         }
@@ -254,21 +250,20 @@ namespace body
         // Called when the 3P root updates, before its skeleton.
         void UpdateVisibility(RE::PlayerCharacter* player, RE::NiAVObject* root)
         {
-            auto first_person = FirstPersonRoot(player);
             if (Wanted()) {
                 if (g_state.root != root) {
                     g_state.root = root;
                     spdlog::info("[Body] 3P root '{}'", root->name.c_str());
                 }
                 SetAppCulled(root, false);
-                SetAppCulled(first_person, !FirstPersonArmsLive());
+                SetAppCulled(FirstPersonRoot(player), true);
                 SetAppCulled(FaceNode(player), true);
                 g_state.active = true;
             } else if (g_state.active) {
                 g_body_muzzle = nullptr;
                 if (GameFlow::isInFirstPerson()) {
                     SetAppCulled(root, true);
-                    SetAppCulled(first_person, false);
+                    SetAppCulled(FirstPersonRoot(player), false);
                 }
                 SetAppCulled(FaceNode(player), false);
                 g_state.active = false;
@@ -284,26 +279,6 @@ namespace body
             glm::vec3 up;
         };
 
-        std::optional<HandTarget> HandWorld(const glm::mat4& pose)
-        {
-            auto world_camera = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
-            const auto room   = tracking::RoomRotation();
-            if (!world_camera || !world_camera->parent || !room) {
-                return std::nullopt;
-            }
-            const auto& anchor = world_camera->parent->world;
-            const auto  offset = *room * tracking::ToHavokVector((glm::vec3{ pose[3] } - tracking::StandingOriginPosition()) * tracking::TrackingScale()) * anchor.scale;
-            const auto  rot    = glm::mat3{ pose };
-            return HandTarget{ glm::vec3{ anchor.translate.x, anchor.translate.y, anchor.translate.z } + offset,
-                glm::normalize(*room * tracking::ToHavokVector(rot * glm::vec3{ 0.0f, 0.0f, -1.0f })),
-                glm::normalize(*room * tracking::ToHavokVector(rot * glm::vec3{ 0.0f, 1.0f, 0.0f })) };
-        }
-
-        // Headset body and hand tracking for this frame, mapped into the game through the same tracking space as
-        // the head and controllers.
-        VR::BodyTrackingState g_tracked_body;
-        VR::HandTrackingState g_tracked_hands[2];
-
         namespace joint
         {
             constexpr int kHips = 1, kNeck = 6;
@@ -311,62 +286,129 @@ namespace body
             constexpr int kUpperLeg[2] = { 70, 77 }, kLowerLeg[2] = { 71, 78 }, kAnkle[2] = { 73, 80 };
         }
 
+        // Everything the body reads from the headset, controllers and camera for one frame.
+        struct Inputs
+        {
+            bool                     valid{ false };
+            std::uint64_t            frame{ 0 };
+            Xf                       anchor{};  // camera parent (tracking space origin)
+            glm::vec3                eye{};
+            std::optional<glm::mat3> room;
+            glm::mat4                grip_pose[2]{};  // left, right; stage space
+            glm::mat4                aim_pose[2]{};
+            glm::vec3                stage_origin{};
+            float                    tracking_scale{ 1.0f };
+            float                    floor_eye_height{ -1.0f };
+            VR::BodyTrackingState    body;
+            VR::HandTrackingState    hands[2];
+        };
+        std::mutex g_inputs_mutex;
+        Inputs     g_published;  // latest capture (main thread)
+        Inputs     g_in;         // the inputs of the body pass running now (under g_body_mutex)
+
+        // Main thread, at the frame's start.
+        void CaptureInputs()
+        {
+            static auto vr = VR::get();
+            Inputs      in;
+            auto        world_camera = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
+            in.room                  = tracking::RoomRotation();
+            if (world_camera && world_camera->parent && in.room) {
+                in.anchor = FromNi(world_camera->parent->world);
+                in.eye    = ToVec(world_camera->world.translate);
+                for (int side = 0; side < 2; ++side) {
+                    in.grip_pose[side] = tracking::GripPose(side == 0);
+                    in.aim_pose[side]  = tracking::AimPose(side == 0);
+                }
+                in.stage_origin   = tracking::StandingOriginPosition();
+                in.tracking_scale = tracking::TrackingScale();
+                in.valid          = true;
+            }
+            in.floor_eye_height = vr->get_floor_eye_height();
+            vr->get_body_tracking(in.body);
+            vr->get_hand_tracking(true, in.hands[0]);
+            vr->get_hand_tracking(false, in.hands[1]);
+            std::lock_guard lock(g_inputs_mutex);
+            in.frame    = g_published.frame + 1;
+            g_published = std::move(in);
+        }
+
+        Inputs PublishedInputs()
+        {
+            std::lock_guard lock(g_inputs_mutex);
+            return g_published;
+        }
+
+        std::optional<HandTarget> HandWorld(const glm::mat4& stage_pose)
+        {
+            if (!g_in.valid) {
+                return std::nullopt;
+            }
+            const auto& room   = *g_in.room;
+            const auto  offset = room * tracking::ToHavokVector((glm::vec3{ stage_pose[3] } - g_in.stage_origin) * g_in.tracking_scale) * g_in.anchor.s;
+            const auto  rot    = glm::mat3{ stage_pose };
+            return HandTarget{ g_in.anchor.t + offset, glm::normalize(room * tracking::ToHavokVector(rot * glm::vec3{ 0.0f, 0.0f, -1.0f })),
+                glm::normalize(room * tracking::ToHavokVector(rot * glm::vec3{ 0.0f, 1.0f, 0.0f })) };
+        }
+
+        std::optional<HandTarget> Grip(bool left)
+        {
+            return HandWorld(g_in.grip_pose[left ? 0 : 1]);
+        }
+
+        std::optional<HandTarget> Aim(bool left)
+        {
+            return HandWorld(g_in.aim_pose[left ? 0 : 1]);
+        }
+
         struct TrackingDiag
         {
-            bool supported{ false };
-            bool active{ false };
-            int  valid{ 0 };
-            bool torso{ false };
-            bool elbow[2]{};
-            bool legs{ false };
+            bool  supported{ false };
+            bool  active{ false };
+            int   valid{ 0 };
+            bool  torso{ false };
+            bool  elbow[2]{};
+            bool  legs{ false };
             bool  fingers[2]{};
             int   hand_source[2]{};
             float index_bend[2]{ -1.0f, -1.0f };
         };
         TrackingDiag g_track_diag;
 
-        void SnapshotTracking()
+        void ResetTrackingDiag()
         {
-            static auto vr = VR::get();
-            g_tracked_body = {};
-            vr->get_body_tracking(g_tracked_body);
-            for (int side = 0; side < 2; ++side) {
-                g_tracked_hands[side] = {};
-                vr->get_hand_tracking(side == 0, g_tracked_hands[side]);
-            }
             g_track_diag           = {};
-            g_track_diag.supported = g_tracked_body.supported;
-            g_track_diag.active    = g_tracked_body.active;
-            for (std::uint32_t i = 0; i < g_tracked_body.joint_count && i < g_tracked_body.joints.size(); ++i) {
-                g_track_diag.valid += g_tracked_body.joints[i].position_valid ? 1 : 0;
+            g_track_diag.supported = g_in.body.supported;
+            g_track_diag.active    = g_in.body.active;
+            for (std::uint32_t i = 0; i < g_in.body.joint_count && i < g_in.body.joints.size(); ++i) {
+                g_track_diag.valid += g_in.body.joints[i].position_valid ? 1 : 0;
             }
             for (int side = 0; side < 2; ++side) {
-                g_track_diag.hand_source[side] = g_tracked_hands[side].active ? g_tracked_hands[side].data_source : -1;
+                g_track_diag.hand_source[side] = g_in.hands[side].active ? g_in.hands[side].data_source : -1;
             }
         }
 
         bool BodyTrackingOn()
         {
-            return GameFlow::gStore.internalSettings.bodyTracking && g_tracked_body.active;
+            return GameFlow::gStore.internalSettings.bodyTracking && g_in.body.active;
         }
 
         std::optional<glm::vec3> TrackedJoint(int index)
         {
-            if (!BodyTrackingOn() || index < 0 || index >= static_cast<int>(g_tracked_body.joint_count) ||
-                !g_tracked_body.joints[index].position_valid) {
+            if (!BodyTrackingOn() || index < 0 || index >= static_cast<int>(g_in.body.joint_count) ||
+                !g_in.body.joints[index].position_valid) {
                 return std::nullopt;
             }
-            return glm::vec3{ g_tracked_body.joints[index].position };
+            return glm::vec3{ g_in.body.joints[index].position };
         }
 
         // A stage-space direction in game world space.
         std::optional<glm::vec3> StageDirection(const glm::vec3& d)
         {
-            const auto room = tracking::RoomRotation();
-            if (!room || glm::length(d) < 1e-5f) {
+            if (!g_in.room || glm::length(d) < 1e-5f) {
                 return std::nullopt;
             }
-            return glm::normalize(*room * tracking::ToHavokVector(d));
+            return glm::normalize(*g_in.room * tracking::ToHavokVector(d));
         }
 
         // Direction between two tracked joints, in game world space.
@@ -403,8 +445,7 @@ namespace body
 
         bool PlayerSeated()
         {
-            static auto vr     = VR::get();
-            const float height = vr->get_floor_eye_height();
+            const float height = g_in.floor_eye_height;
             return height >= 0.0f && height < 1.3f;
         }
 
@@ -416,10 +457,9 @@ namespace body
             RE::NiTransform animated{};
             RE::NiTransform written{};
         };
-        // Per skeleton (body, first-person rig): bones written this frame and their animated values.
-        std::unordered_map<int, WrittenBone>  g_written_body;
-        std::unordered_map<int, WrittenBone>  g_written_first;
-        std::unordered_map<int, WrittenBone>* g_written_active{ &g_written_body };
+        using WriteLog = std::unordered_map<int, WrittenBone>;
+        // Bones the frame build wrote, with their animated values.
+        WriteLog g_written;
 
         struct Pose
         {
@@ -431,6 +471,7 @@ namespace body
             std::uint16_t    top{ 0 };
             Xf               root{};      // the root transform top-level entries are relative to
             Xf               to_world{};  // pose space -> game world
+            WriteLog*        written{ &g_written };  // where this pose's writes are logged
 
             Xf World(int i, int depth = 0) const
             {
@@ -444,7 +485,7 @@ namespace body
 
             void SetLocalRotation(int i, const RE::NiMatrix3& rotation) const
             {
-                auto [entry, first] = (*g_written_active).try_emplace(i);
+                auto [entry, first] = written->try_emplace(i);
                 if (first) {
                     entry->second.animated = local[i];
                 }
@@ -454,7 +495,7 @@ namespace body
 
             void ScaleTranslation(int i, float k) const
             {
-                auto [entry, first] = (*g_written_active).try_emplace(i);
+                auto [entry, first] = written->try_emplace(i);
                 if (first) {
                     entry->second.animated = local[i];
                 }
@@ -480,7 +521,7 @@ namespace body
                     return;
                 }
                 {
-                    auto [entry, first] = (*g_written_active).try_emplace(i);
+                    auto [entry, first] = written->try_emplace(i);
                     if (first) {
                         entry->second.animated = local[i];
                     }
@@ -530,17 +571,14 @@ namespace body
             // Legacy accessors used by diagnostics.
             int r_biceps{ -1 }, r_forearm{ -1 }, r_wrist{ -1 }, l_wrist{ -1 };
         };
-        // The skeleton being posed: the body or the first-person rig.
-        Bones  g_body_bones;
-        Bones  g_first_bones;
-        Bones* g_active_bones{ &g_body_bones };
+        Bones g_bones;
 
         // Bones by name. Pose-buffer skeletons list their nodes in the model's sync list; a flattened node tree
         // passes its nodes directly.
         void FindBones(const Pose& pose, const void* storage, const std::vector<std::pair<int, RE::NiAVObject*>>* nodes = nullptr)
         {
-            (*g_active_bones)         = {};
-            (*g_active_bones).storage = storage;
+            g_bones         = {};
+            g_bones.storage = storage;
             std::vector<std::pair<int, std::string>> named;
             std::vector<std::pair<int, RE::NiAVObject*>> listed;
             if (nodes) {
@@ -558,31 +596,31 @@ namespace body
                 }
                 const std::string_view name{ node->name.c_str() };
                 named.emplace_back(idx, std::string{ name });
-                if (name == "R_Biceps") (*g_active_bones).right.biceps = idx;
-                else if (name == "R_Forearm") (*g_active_bones).right.forearm = idx;
+                if (name == "R_Biceps") g_bones.right.biceps = idx;
+                else if (name == "R_Forearm") g_bones.right.forearm = idx;
                 else if (name == "R_Wrist") {
-                    (*g_active_bones).right.wrist  = idx;
-                    (*g_active_bones).r_wrist_node = node;
+                    g_bones.right.wrist  = idx;
+                    g_bones.r_wrist_node = node;
                 }
-                else if (name == "L_Biceps") (*g_active_bones).left.biceps = idx;
-                else if (name == "L_Forearm") (*g_active_bones).left.forearm = idx;
-                else if (name == "L_Wrist") (*g_active_bones).left.wrist = idx;
-                else if (name == "C_Head") (*g_active_bones).head = idx;
-                else if (name == "C_Neck") (*g_active_bones).neck = idx;
-                else if (name == "L_Thigh") (*g_active_bones).left_leg.thigh = idx;
-                else if (name == "L_Calf") (*g_active_bones).left_leg.calf = idx;
-                else if (name == "L_Foot") (*g_active_bones).left_leg.foot = idx;
-                else if (name == "R_Thigh") (*g_active_bones).right_leg.thigh = idx;
-                else if (name == "R_Calf") (*g_active_bones).right_leg.calf = idx;
-                else if (name == "R_Foot") (*g_active_bones).right_leg.foot = idx;
-                else if (name == "C_Chest") (*g_active_bones).chest = idx;
+                else if (name == "L_Biceps") g_bones.left.biceps = idx;
+                else if (name == "L_Forearm") g_bones.left.forearm = idx;
+                else if (name == "L_Wrist") g_bones.left.wrist = idx;
+                else if (name == "C_Head") g_bones.head = idx;
+                else if (name == "C_Neck") g_bones.neck = idx;
+                else if (name == "L_Thigh") g_bones.left_leg.thigh = idx;
+                else if (name == "L_Calf") g_bones.left_leg.calf = idx;
+                else if (name == "L_Foot") g_bones.left_leg.foot = idx;
+                else if (name == "R_Thigh") g_bones.right_leg.thigh = idx;
+                else if (name == "R_Calf") g_bones.right_leg.calf = idx;
+                else if (name == "R_Foot") g_bones.right_leg.foot = idx;
+                else if (name == "C_Chest") g_bones.chest = idx;
                 else if (name == "Weapon") {
-                    (*g_active_bones).weapon      = idx;
-                    (*g_active_bones).weapon_node = node;
+                    g_bones.weapon      = idx;
+                    g_bones.weapon_node = node;
                 }
             }
             // Finger bases are the wrist's direct children.
-            for (auto* arm : { &(*g_active_bones).right, &(*g_active_bones).left }) {
+            for (auto* arm : { &g_bones.right, &g_bones.left }) {
                 std::string names;
                 for (const auto& [idx, name] : named) {
                     if (arm->wrist < 0 || idx < pose.top || pose.parent[idx] != arm->wrist) {
@@ -629,15 +667,15 @@ namespace body
                         names += " (thumb by geometry)";
                     }
                 }
-                spdlog::info("[BodyIK] {} wrist children:{}", arm == &(*g_active_bones).right ? "right" : "left", names);
+                spdlog::info("[BodyIK] {} wrist children:{}", arm == &g_bones.right ? "right" : "left", names);
             }
-            for (auto* arm : { &(*g_active_bones).right, &(*g_active_bones).left }) {
+            for (auto* arm : { &g_bones.right, &g_bones.left }) {
                 if (arm->biceps >= pose.top) {
                     arm->clavicle = pose.parent[arm->biceps];
                 }
             }
             for (const auto& [idx, name] : named) {
-                (*g_active_bones).by_name[name] = idx;
+                g_bones.by_name[name] = idx;
             }
             {
                 static constexpr const char* kFingerNames[5][3] = { { "thumb", "Thumb1", "Thumb2" }, { "Index", "Index1", "Index2" },
@@ -646,8 +684,8 @@ namespace body
                     const std::string prefix = side == 0 ? "L_" : "R_";
                     for (int f = 0; f < 5; ++f) {
                         for (int j = 0; j < 3; ++j) {
-                            const auto it                = (*g_active_bones).by_name.find(prefix + kFingerNames[f][j]);
-                            (*g_active_bones).fingers[side][f][j] = it != (*g_active_bones).by_name.end() ? it->second : -1;
+                            const auto it                = g_bones.by_name.find(prefix + kFingerNames[f][j]);
+                            g_bones.fingers[side][f][j] = it != g_bones.by_name.end() ? it->second : -1;
                         }
                     }
                 }
@@ -665,35 +703,35 @@ namespace body
                     }
                 }
             };
-            find_leg((*g_active_bones).left_leg.thigh, "L_", "Thigh");
-            find_leg((*g_active_bones).left_leg.calf, "L_", "Calf");
-            find_leg((*g_active_bones).left_leg.foot, "L_", "Foot");
-            find_leg((*g_active_bones).right_leg.thigh, "R_", "Thigh");
-            find_leg((*g_active_bones).right_leg.calf, "R_", "Calf");
-            find_leg((*g_active_bones).right_leg.foot, "R_", "Foot");
+            find_leg(g_bones.left_leg.thigh, "L_", "Thigh");
+            find_leg(g_bones.left_leg.calf, "L_", "Calf");
+            find_leg(g_bones.left_leg.foot, "L_", "Foot");
+            find_leg(g_bones.right_leg.thigh, "R_", "Thigh");
+            find_leg(g_bones.right_leg.calf, "R_", "Calf");
+            find_leg(g_bones.right_leg.foot, "R_", "Foot");
 
             // Pelvis: the lowest common ancestor of a thigh and the neck.
-            if ((*g_active_bones).left_leg.thigh >= 0 && (*g_active_bones).neck >= 0) {
+            if (g_bones.left_leg.thigh >= 0 && g_bones.neck >= 0) {
                 std::vector<int> neck_chain;
-                for (int i = (*g_active_bones).neck, guard = 0; i >= 0 && guard < 64; ++guard) {
+                for (int i = g_bones.neck, guard = 0; i >= 0 && guard < 64; ++guard) {
                     neck_chain.push_back(i);
                     i = i < pose.top ? -1 : pose.parent[i];
                 }
-                for (int i = (*g_active_bones).left_leg.thigh, guard = 0; i >= 0 && guard < 64; ++guard) {
+                for (int i = g_bones.left_leg.thigh, guard = 0; i >= 0 && guard < 64; ++guard) {
                     if (std::find(neck_chain.begin(), neck_chain.end(), i) != neck_chain.end()) {
-                        (*g_active_bones).pelvis = i;
+                        g_bones.pelvis = i;
                         break;
                     }
                     i = i < pose.top ? -1 : pose.parent[i];
                 }
             }
             // Spine: from the neck down to (not including) the pelvis, then reversed.
-            if ((*g_active_bones).neck >= 0 && (*g_active_bones).pelvis >= 0) {
-                for (int i = (*g_active_bones).neck >= pose.top ? pose.parent[(*g_active_bones).neck] : -1, guard = 0; i >= 0 && i != (*g_active_bones).pelvis && guard < 16; ++guard) {
-                    (*g_active_bones).spine.push_back(i);
+            if (g_bones.neck >= 0 && g_bones.pelvis >= 0) {
+                for (int i = g_bones.neck >= pose.top ? pose.parent[g_bones.neck] : -1, guard = 0; i >= 0 && i != g_bones.pelvis && guard < 16; ++guard) {
+                    g_bones.spine.push_back(i);
                     i = i < pose.top ? -1 : pose.parent[i];
                 }
-                std::reverse((*g_active_bones).spine.begin(), (*g_active_bones).spine.end());
+                std::reverse(g_bones.spine.begin(), g_bones.spine.end());
             }
             {
                 std::string all;
@@ -701,19 +739,19 @@ namespace body
                     all += " " + std::to_string(idx) + ":" + name;
                 }
                 spdlog::info("[BodyIK] bones:{}", all);
-                const auto pelvis_name = std::find_if(named.begin(), named.end(), [](const auto& n) { return n.first == (*g_active_bones).pelvis; });
-                spdlog::info("[BodyIK] legs L {} {} {} R {} {} {} | pelvis {} '{}'", (*g_active_bones).left_leg.thigh, (*g_active_bones).left_leg.calf, (*g_active_bones).left_leg.foot,
-                    (*g_active_bones).right_leg.thigh, (*g_active_bones).right_leg.calf, (*g_active_bones).right_leg.foot, (*g_active_bones).pelvis,
+                const auto pelvis_name = std::find_if(named.begin(), named.end(), [](const auto& n) { return n.first == g_bones.pelvis; });
+                spdlog::info("[BodyIK] legs L {} {} {} R {} {} {} | pelvis {} '{}'", g_bones.left_leg.thigh, g_bones.left_leg.calf, g_bones.left_leg.foot,
+                    g_bones.right_leg.thigh, g_bones.right_leg.calf, g_bones.right_leg.foot, g_bones.pelvis,
                     pelvis_name != named.end() ? pelvis_name->second : "");
             }
-            (*g_active_bones).r_biceps  = (*g_active_bones).right.biceps;
-            (*g_active_bones).r_forearm = (*g_active_bones).right.forearm;
-            (*g_active_bones).r_wrist   = (*g_active_bones).right.wrist;
-            (*g_active_bones).l_wrist   = (*g_active_bones).left.wrist;
+            g_bones.r_biceps  = g_bones.right.biceps;
+            g_bones.r_forearm = g_bones.right.forearm;
+            g_bones.r_wrist   = g_bones.right.wrist;
+            g_bones.l_wrist   = g_bones.left.wrist;
             spdlog::info("[BodyIK] {} pose bones (top {}): R {} {} {} thumb {} fingers {} | L {} {} {} thumb {} fingers {} | head {} neck {} weapon {}",
-                pose.count, pose.top, (*g_active_bones).right.biceps, (*g_active_bones).right.forearm, (*g_active_bones).right.wrist, (*g_active_bones).right.thumb,
-                (*g_active_bones).right.fingers.size(), (*g_active_bones).left.biceps, (*g_active_bones).left.forearm, (*g_active_bones).left.wrist, (*g_active_bones).left.thumb,
-                (*g_active_bones).left.fingers.size(), (*g_active_bones).head, (*g_active_bones).neck, (*g_active_bones).weapon);
+                pose.count, pose.top, g_bones.right.biceps, g_bones.right.forearm, g_bones.right.wrist, g_bones.right.thumb,
+                g_bones.right.fingers.size(), g_bones.left.biceps, g_bones.left.forearm, g_bones.left.wrist, g_bones.left.thumb,
+                g_bones.left.fingers.size(), g_bones.head, g_bones.neck, g_bones.weapon);
         }
 
         // Port of FRIK's solveArmToHandWorldTarget (Fallout 4 VR Body, GPL-3.0): shoulder reach, elbow flexion floor
@@ -803,7 +841,7 @@ namespace body
             const float plane_d     = -(plane_dir.x * shoulder_bone.x + plane_dir.y * shoulder_bone.y) + 16.0f * kUnit;
             const float cross_amount = std::clamp((hand_pos.x * plane_dir.x + hand_pos.y * plane_dir.y + plane_d) / (20.0f * kUnit), 0.0f, 1.0f);
 
-            const float chest_z     = (*g_active_bones).chest >= 0 ? pose.GameWorld((*g_active_bones).chest).t.z : shoulder_bone.z;
+            const float chest_z     = g_bones.chest >= 0 ? pose.GameWorld(g_bones.chest).t.z : shoulder_bone.z;
             const float lift_thresh = 60.0f * kUnit;
             const float lift_limit  = std::clamp((chest_z + lift_thresh - hand_pos.z) / lift_thresh, 0.0f, 1.0f);
             const float up_limit    = std::clamp((1.0f - lift_limit) * 1.4f, 0.0f, 1.0f);
@@ -936,10 +974,9 @@ namespace body
         // legs bend to keep the feet where the animation planted them.
         void ApplyCrouch(const Pose& pose)
         {
-            auto world_camera = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
-            const auto& l = (*g_active_bones).left_leg;
-            const auto& r = (*g_active_bones).right_leg;
-            if (!world_camera || !world_camera->parent || (*g_active_bones).pelvis < 0 || l.thigh < 0 || l.calf < 0 || l.foot < 0 || r.thigh < 0 ||
+            const auto& l = g_bones.left_leg;
+            const auto& r = g_bones.right_leg;
+            if (!g_in.valid || g_bones.pelvis < 0 || l.thigh < 0 || l.calf < 0 || l.foot < 0 || r.thigh < 0 ||
                 r.calf < 0 || r.foot < 0) {
                 return;
             }
@@ -947,25 +984,25 @@ namespace body
             // above the feet). Real and button crouches then share one rule.
             static float standing_eye{ 0.0f };
             static float neck_below_eye{ -1.0f };
-            const float  game_eye   = world_camera->parent->world.translate.z - pose.root.t.z;
-            const float  neck_z     = pose.GameWorld((*g_active_bones).neck).t.z;
+            const float  game_eye   = g_in.anchor.t.z - pose.root.t.z;
+            const float  neck_z     = pose.GameWorld(g_bones.neck).t.z;
             if (game_eye > standing_eye) {
                 standing_eye = game_eye;
             }
             if (game_eye >= standing_eye - 0.02f) {
-                const float measured = world_camera->parent->world.translate.z - neck_z;
+                const float measured = g_in.anchor.t.z - neck_z;
                 neck_below_eye       = neck_below_eye < 0.0f ? measured : neck_below_eye + (measured - neck_below_eye) * 0.05f;
             }
             if (neck_below_eye < 0.0f) {
                 return;
             }
-            const float drop = std::clamp(world_camera->world.translate.z - neck_below_eye - neck_z, -1.2f, 0.0f);
+            const float drop = std::clamp(g_in.eye.z - neck_below_eye - neck_z, -1.2f, 0.0f);
             if (drop > -0.005f) {
                 return;
             }
-            auto pelvis = pose.GameWorld((*g_active_bones).pelvis);
+            auto pelvis = pose.GameWorld(g_bones.pelvis);
             pelvis.t.z += drop;
-            pose.SetGameWorld((*g_active_bones).pelvis, pelvis);
+            pose.SetGameWorld(g_bones.pelvis, pelvis);
         }
 
         // Procedural walking, after FRIK's walk(): when the body moves, the feet step in turn, each lifting along an
@@ -1118,8 +1155,8 @@ namespace body
         // Legs every frame: feet at their animated place when standing, stepping when the body moves.
         void ApplyLegs(const Pose& pose, const Xf& left_anim, const Xf& right_anim)
         {
-            const auto& l = (*g_active_bones).left_leg;
-            const auto& r = (*g_active_bones).right_leg;
+            const auto& l = g_bones.left_leg;
+            const auto& r = g_bones.right_leg;
             if (l.thigh < 0 || l.calf < 0 || l.foot < 0 || r.thigh < 0 || r.calf < 0 || r.foot < 0) {
                 return;
             }
@@ -1133,11 +1170,11 @@ namespace body
             if (GameFlow::gStore.internalSettings.walkingLegs && g_walk.state == 1) {
                 left.t  = g_walk.l_pos;
                 right.t = g_walk.r_pos;
-            } else if (g_tracked_body.full_body && !PlayerSeated() && (*g_active_bones).pelvis >= 0) {
+            } else if (g_in.body.full_body && !PlayerSeated() && g_bones.pelvis >= 0) {
                 // Standing in place: feet placed where the tracked ankles are relative to the tracked hips, on the
                 // animated ground height; knees bend toward the tracked knees.
                 const auto hips = TrackedJoint(joint::kHips);
-                const auto pelvis = pose.GameWorld((*g_active_bones).pelvis).t;
+                const auto pelvis = pose.GameWorld(g_bones.pelvis).t;
                 Xf* feet[2] = { &left, &right };
                 bool placed = false;
                 for (int side = 0; side < 2; ++side) {
@@ -1168,8 +1205,8 @@ namespace body
 
         float FacingYaw(const Pose& pose, const glm::vec3& eye)
         {
-            const auto left  = HandWorld(tracking::GripPose(true));
-            const auto right = HandWorld(tracking::GripPose(false));
+            const auto left  = Grip(true);
+            const auto right = Grip(false);
             auto       forward = pose.root.r[1];
             forward.z          = 0.0f;
             float      target  = 0.0f;
@@ -1194,33 +1231,10 @@ namespace body
             return g_facing_yaw;
         }
 
-        // Where the drawn hand and weapon ended up against where they were placed (read from the scene next frame).
-        struct HandCheck
-        {
-            bool      placed{ false };
-            Xf        wrist_target{};
-            Xf        weapon_target{};
-            float     wrist_error{ 0.0f };
-            float     wrist_angle{ 0.0f };
-            float     weapon_error{ 0.0f };
-            glm::vec3 drawn_hand_in_weapon{};
-            glm::vec3 model_offset{};
-            std::string model_name;
-        };
-        HandCheck g_hand_check;
-
-        // Support hand on the held weapon this frame.
-        struct Support
-        {
-            bool held{ false };
-            Xf   target{};
-        };
-        Support g_support;
-
         // Body yaw from the tracked hips: their forward (from the hip line, or the shoulder line without legs).
         std::optional<float> TrackedFacingYaw(const Pose& pose)
         {
-            auto side = g_tracked_body.full_body ? TrackedDirection(joint::kUpperLeg[0], joint::kUpperLeg[1]) : std::nullopt;
+            auto side = g_in.body.full_body ? TrackedDirection(joint::kUpperLeg[0], joint::kUpperLeg[1]) : std::nullopt;
             if (!side) {
                 side = TrackedDirection(joint::kArmUpper[0], joint::kArmUpper[1]);
             }
@@ -1236,7 +1250,8 @@ namespace body
             }
             forward             = glm::normalize(forward);
             tracked             = glm::normalize(tracked);
-            const float target  = std::atan2(forward.x * tracked.y - forward.y * tracked.x, glm::dot(forward, tracked));
+            const float target  = std::clamp(std::atan2(forward.x * tracked.y - forward.y * tracked.x, glm::dot(forward, tracked)), glm::radians(-50.0f),
+                 glm::radians(50.0f));
             g_facing_yaw += (target - g_facing_yaw) * 0.25f;
             return g_facing_yaw;
         }
@@ -1250,15 +1265,15 @@ namespace body
         void ApplyLean(const Pose& pose)
         {
             g_lean_applied = 0.0f;
-            if (!GameFlow::gStore.internalSettings.bodyLean || (*g_active_bones).spine.empty() || (*g_active_bones).neck < 0 || glm::length(g_lean) < 0.005f) {
+            if (!GameFlow::gStore.internalSettings.bodyLean || g_bones.spine.empty() || g_bones.neck < 0 || glm::length(g_lean) < 0.005f) {
                 return;
             }
-            const auto target = pose.GameWorld((*g_active_bones).neck).t + g_lean;
-            const auto count  = static_cast<int>((*g_active_bones).spine.size());
+            const auto target = pose.GameWorld(g_bones.neck).t + g_lean;
+            const auto count  = static_cast<int>(g_bones.spine.size());
             for (int k = 0; k < count; ++k) {
-                const int  bone   = (*g_active_bones).spine[k];
+                const int  bone   = g_bones.spine[k];
                 const auto world  = pose.GameWorld(bone);
-                const auto neck   = pose.GameWorld((*g_active_bones).neck).t;
+                const auto neck   = pose.GameWorld(g_bones.neck).t;
                 const auto turn   = glm::quat_cast(RotationBetween(neck - world.t, target - world.t));
                 const auto share  = glm::slerp(glm::quat{ 1.0f, 0.0f, 0.0f, 0.0f }, turn, 1.0f / static_cast<float>(count - k));
                 auto       bent   = world;
@@ -1272,7 +1287,7 @@ namespace body
         // shoulder line onto the tracked ones.
         bool ApplyTrackedTorso(const Pose& pose)
         {
-            if ((*g_active_bones).spine.empty() || (*g_active_bones).neck < 0 || (*g_active_bones).pelvis < 0 || (*g_active_bones).right.biceps < 0 || (*g_active_bones).left.biceps < 0) {
+            if (g_bones.spine.empty() || g_bones.neck < 0 || g_bones.pelvis < 0 || g_bones.right.biceps < 0 || g_bones.left.biceps < 0) {
                 return false;
             }
             const auto up_t   = TrackedDirection(joint::kHips, joint::kNeck);
@@ -1280,13 +1295,13 @@ namespace body
             if (!up_t || !side_t) {
                 return false;
             }
-            const auto up_g   = glm::normalize(pose.GameWorld((*g_active_bones).neck).t - pose.GameWorld((*g_active_bones).pelvis).t);
-            const auto side_g = glm::normalize(pose.GameWorld((*g_active_bones).right.biceps).t - pose.GameWorld((*g_active_bones).left.biceps).t);
+            const auto up_g   = glm::normalize(pose.GameWorld(g_bones.neck).t - pose.GameWorld(g_bones.pelvis).t);
+            const auto side_g = glm::normalize(pose.GameWorld(g_bones.right.biceps).t - pose.GameWorld(g_bones.left.biceps).t);
             auto frame = [](const glm::vec3& up, const glm::vec3& side) { return FrameOf(glm::cross(up, side), up); };
             const auto turn  = glm::quat_cast(frame(*up_t, *side_t) * glm::transpose(frame(up_g, side_g)));
-            const auto count = static_cast<int>((*g_active_bones).spine.size());
+            const auto count = static_cast<int>(g_bones.spine.size());
             const auto share = glm::mat3_cast(glm::slerp(glm::quat{ 1.0f, 0.0f, 0.0f, 0.0f }, turn, 1.0f / static_cast<float>(count)));
-            for (const int bone : (*g_active_bones).spine) {
+            for (const int bone : g_bones.spine) {
                 auto bent = pose.GameWorld(bone);
                 bent.r    = share * bent.r;
                 pose.SetGameWorld(bone, bent);
@@ -1301,9 +1316,7 @@ namespace body
             bool      valid{ false };
             glm::vec3 palm{};  // wrist space
         };
-        FingerPalm  g_finger_palm_body[2];
-        FingerPalm  g_finger_palm_first[2];
-        FingerPalm* g_finger_palm{ g_finger_palm_body };
+        FingerPalm g_finger_palm[2];
 
         void MeasurePalmSide(const Pose& pose, int side, const HandShape& shape, int wrist)
         {
@@ -1315,7 +1328,7 @@ namespace body
             const auto normal = glm::normalize(glm::cross(shape.forward, shape.up));  // wrist space, one of the palm/back sides
             float      score  = 0.0f;
             for (int f = 1; f < 5; ++f) {
-                const auto& chain = (*g_active_bones).fingers[side][f];
+                const auto& chain = g_bones.fingers[side][f];
                 if (chain[0] < 0 || chain[2] < 0) {
                     continue;
                 }
@@ -1450,7 +1463,6 @@ namespace body
         {
             float right_gap{ 0.0f };
             float left_gap{ 0.0f };
-            bool  weapon_aligned{ false };
             float support_distance{ -1.0f };
             bool  support_held{ false };
         };
@@ -1460,7 +1472,7 @@ namespace body
         // weapon is read from the engine's final worlds after each update and used to aim the weapon exactly.
         struct Barrel
         {
-            RE::NiAVObject* weapon{ nullptr };
+            RE::NiAVObject* model{ nullptr };  // the weapon model under the weapon bone
             RE::NiAVObject* muzzle{ nullptr };
             bool            has_relation{ false };
             glm::vec3       shot_in_weapon{ 0.0f, 1.0f, 0.0f };
@@ -1472,179 +1484,44 @@ namespace body
         };
         Barrel g_barrel;
 
-        // How the game holds the weapon in first person: its barrel at the crosshair and level with the view. The
-        // view's forward and up in the weapon's space give the weapon's basis (ROCK derives its controller-to-weapon
-        // basis from the game's own hold the same way). Sampled when the player fires; a slow estimate before that.
-        // The camera parent frame is havok-space: +Y forward, +Z up.
-        struct WeaponBasis
+        // The weapon model hangs under the skeleton's weapon bone; per-weapon measurements are keyed on it.
+        RE::NiAVObject* WeaponModel(RE::NiAVObject* weapon_bone)
         {
-            RE::NiAVObject* weapon{ nullptr };
-            bool            has{ false };
-            bool            fired{ false };
-            glm::vec3       forward{ 0.0f, 1.0f, 0.0f };
-            glm::vec3       up{ 0.0f, 0.0f, 1.0f };
-        };
-        WeaponBasis       g_basis;
-        std::atomic<bool> g_fire_sample{ false };
-
-        // The first-person hand's anatomical frame (fingers forward, thumb up, palm centre) in its wrist's space, so a
-        // grip held by that hand can be transferred onto the body's hand whatever the two skeletons' bone axes.
-        struct FirstPersonHand
-        {
-            RE::NiAVObject* wrist{ nullptr };
-            HandShape       shape;
-        };
-        FirstPersonHand g_first_hands[2];  // left, right
-
-        void MeasureFirstPersonHand(RE::NiAVObject* wrist, bool left)
-        {
-            auto& g_first_hand = g_first_hands[left ? 0 : 1];
-            if (!wrist || (g_first_hand.wrist == wrist && g_first_hand.shape.valid)) {
-                return;
-            }
-            g_first_hand = {};
-            g_first_hand.wrist = wrist;
-            RE::NiAVObject* children[32]{};
-            const auto      count = ReadChildren(wrist, children, 32);
-            const auto      w     = FromNi(wrist->world);
-            glm::vec3       bases{ 0.0f };
-            int             fingers = 0;
-            std::optional<glm::vec3> thumb;
+            RE::NiAVObject* children[8]{};
+            const auto      count = weapon_bone ? ReadChildren(weapon_bone, children, 8) : 0;
             for (std::uint16_t i = 0; i < count; ++i) {
-                if (!children[i]) {
-                    continue;
-                }
-                const std::string_view name{ children[i]->name.c_str() };
-                const auto pos = ToVec(children[i]->world.translate);
-                if (Contains(name, "Thumb")) {
-                    thumb = pos;
-                } else if (Contains(name, "Index") || Contains(name, "Middle") || Contains(name, "Ring") || Contains(name, "Pinky") || Contains(name, "Little")) {
-                    bases += pos;
-                    ++fingers;
+                if (children[i] && std::strcmp(children[i]->name.c_str(), "R_HandIk") && std::strcmp(children[i]->name.c_str(), "L_HandIk")) {
+                    return children[i];
                 }
             }
-            if (!thumb || fingers == 0) {
-                spdlog::info("[BodyIK] 1P hand: fingers {} thumb {}", fingers, thumb.has_value());
-                return;
-            }
-            bases /= static_cast<float>(fingers);
-            const auto to_bases = bases - w.t;
-            const auto to_thumb = *thumb - w.t;
-            if (glm::length(to_bases) < 0.02f * w.s) {
-                return;
-            }
-            const auto forward = glm::normalize(to_bases);
-            auto       up      = to_thumb - glm::dot(to_thumb, forward) * forward;
-            if (glm::length(up) < 1e-4f) {
-                return;
-            }
-            up = glm::normalize(up);
-            const auto to_l             = glm::transpose(w.r);
-            g_first_hand.shape.forward  = glm::normalize(to_l * forward);
-            g_first_hand.shape.up       = glm::normalize(to_l * up);
-            g_first_hand.shape.palm     = 0.5f * glm::length(to_bases) / w.s;
-            g_first_hand.shape.valid    = true;
-            spdlog::info("[BodyIK] 1P {} hand measured: forward ({:.2f},{:.2f},{:.2f}) up ({:.2f},{:.2f},{:.2f}) palm {:.3f}", left ? "left" : "right", g_first_hand.shape.forward.x,
-                g_first_hand.shape.forward.y, g_first_hand.shape.forward.z, g_first_hand.shape.up.x, g_first_hand.shape.up.y, g_first_hand.shape.up.z,
-                g_first_hand.shape.palm);
+            return nullptr;
         }
 
-        // The body's wrist transform equivalent to the first-person wrist: same anatomical frame, same palm centre.
-        Xf BodyWristFromFirstPerson(const Xf& first_wrist, const HandShape& body, bool left)
-        {
-            const auto& f    = g_first_hands[left ? 0 : 1].shape;
-            Xf          out  = first_wrist;
-            out.r            = first_wrist.r * FrameOf(f.forward, f.up) * glm::transpose(FrameOf(body.forward, body.up));
-            const auto palm  = first_wrist.t + first_wrist.r * (f.forward * f.palm) * first_wrist.s;
-            out.t            = palm - out.r * (body.forward * body.palm) * out.s;
-            return out;
-        }
-
-        void SampleWeaponBasis(RE::NiAVObject* first_weapon)
-        {
-            auto world_camera = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
-            if (!first_weapon || !world_camera || !world_camera->parent) {
-                return;
-            }
-            if (g_basis.weapon != (*g_active_bones).weapon_node) {
-                g_basis = {};
-                g_basis.weapon = (*g_active_bones).weapon_node;
-            }
-            const auto to_weapon = glm::transpose(FromNi(first_weapon->world).r);
-            const auto view_r    = FromNi(world_camera->parent->world).r;
-            const auto forward   = glm::normalize(to_weapon * view_r[1]);
-            const auto up        = glm::normalize(to_weapon * view_r[2]);
-            const bool fired     = g_fire_sample.exchange(false);
-            if (fired || !g_basis.has) {
-                g_basis.forward = forward;
-                g_basis.up      = up;
-            } else if (!g_basis.fired) {
-                g_basis.forward = glm::normalize(glm::mix(g_basis.forward, forward, 0.02f));
-                g_basis.up      = glm::normalize(glm::mix(g_basis.up, up, 0.02f));
-            }
-            if (fired && !g_basis.fired) {
-                spdlog::info("[BodyIK] firing grip sampled: barrel ({:.2f},{:.2f},{:.2f}) up ({:.2f},{:.2f},{:.2f}) in weapon space", forward.x,
-                    forward.y, forward.z, up.x, up.y, up.z);
-            }
-            g_basis.fired = g_basis.fired || fired;
-            g_basis.has   = true;
-
-            // Check of the view-axis assumption: with hand aiming the view forward is the aim ray.
-            static std::chrono::steady_clock::time_point last_log{};
-            if (const auto now = std::chrono::steady_clock::now(); now - last_log > std::chrono::seconds(2)) {
-                last_log = now;
-                spdlog::info("[BodyIK] view forward vs aim ray: {:.1f} deg | basis from {}", glm::degrees(std::acos(std::clamp(
-                    glm::dot(glm::normalize(view_r[1]), g_barrel.aim_forward), -1.0f, 1.0f))), g_basis.fired ? "firing grip" : "estimate");
-            }
-        }
-
+        // The shot direction in the weapon bone's space, from the final worlds of the last frame.
         void MeasureBarrel()
         {
-            auto muzzle = g_body_muzzle.load();
-            auto weapon = (*g_active_bones).weapon_node;
+            auto muzzle           = g_body_muzzle.load();
+            auto weapon           = g_bones.weapon_node;
+            g_barrel.has_relation = false;
             if (!muzzle || !weapon) {
-                g_barrel.has_relation = false;
-                g_barrel.placed       = false;
                 return;
             }
             const auto weapon_world = FromNi(weapon->world);
             const auto shot_world   = glm::normalize(FromNi(muzzle->world).r[1]);
-            if (g_hand_check.placed && (*g_active_bones).r_wrist_node) {
-                const auto wrist_world            = FromNi((*g_active_bones).r_wrist_node->world);
-                g_hand_check.wrist_error          = glm::length(wrist_world.t - g_hand_check.wrist_target.t);
-                const auto relative               = glm::transpose(g_hand_check.wrist_target.r) * wrist_world.r;
-                g_hand_check.wrist_angle          = glm::degrees(std::acos(std::clamp((relative[0][0] + relative[1][1] + relative[2][2] - 1.0f) * 0.5f, -1.0f, 1.0f)));
-                g_hand_check.weapon_error         = glm::length(weapon_world.t - g_hand_check.weapon_target.t);
-                g_hand_check.drawn_hand_in_weapon = Compose(Inverse(weapon_world), wrist_world).t;
-                // The weapon model hangs under the weapon bone; its own offset there moves the grip.
-                RE::NiAVObject* children[8]{};
-                const auto      count = ReadChildren(weapon, children, 8);
-                for (std::uint16_t i = 0; i < count; ++i) {
-                    if (children[i] && children[i] != muzzle && std::strcmp(children[i]->name.c_str(), "R_HandIk") && std::strcmp(children[i]->name.c_str(), "L_HandIk")) {
-                        g_hand_check.model_offset = Compose(Inverse(weapon_world), FromNi(children[i]->world)).t;
-                        g_hand_check.model_name   = children[i]->name.c_str();
-                        break;
-                    }
-                }
-                g_hand_check.placed = false;
-            }
             if (g_barrel.placed) {
-                g_barrel.error_deg       = glm::degrees(std::acos(std::clamp(glm::dot(shot_world, g_barrel.aim_forward), -1.0f, 1.0f)));
-                g_barrel.placement_error = glm::length(weapon_world.t - g_barrel.placed_weapon.t);
+                g_barrel.error_deg = glm::degrees(std::acos(std::clamp(glm::dot(shot_world, g_barrel.aim_forward), -1.0f, 1.0f)));
             }
-            g_barrel.weapon         = weapon;
+            g_barrel.model          = WeaponModel(weapon);
             g_barrel.muzzle         = muzzle;
             g_barrel.shot_in_weapon = glm::normalize(glm::transpose(weapon_world.r) * shot_world);
-            g_barrel.has_relation   = true;
-            g_barrel.placed         = false;
+            g_barrel.has_relation   = g_barrel.model != nullptr;
         }
 
         // Fingers from the controller: index from the trigger (extended off the trigger), the other three from the
-        // grip, the thumb from touch. A hand holding the weapon keeps the first-person grip's finger pose and only
-        // the index finger follows the trigger.
+        // grip, the thumb from touch.
         bool ApplyTrackedFingers(const Pose& pose, int side, int wrist);
 
-        void ApplyFingers(const Pose& pose, int side, int wrist, RE::NiAVObject* first_wrist)
+        void ApplyFingers(const Pose& pose, int side, int wrist)
         {
             if (!GameFlow::gStore.internalSettings.fingerPoses || wrist < 0) {
                 return;
@@ -1673,68 +1550,24 @@ namespace body
             const float grip  = spring(state.grip, input.grip);
             const float thumb = spring(state.thumb, input.thumb_touch ? 1.0f : 0.0f);
 
-            const auto& chains = (*g_active_bones).fingers[side];
-            if (first_wrist) {
-                // A hand holding the weapon takes the first-person grip's finger directions, transferred through the
-                // hands' anatomical frames so the rigs' bone axes do not matter.
-                const auto& first_shape = g_first_hands[side].shape;
-                const auto& body_shape  = side == 0 ? (*g_active_bones).left.shape : (*g_active_bones).right.shape;
-                if (first_shape.valid && body_shape.valid) {
-                    static constexpr const char* kFingerNames[5][3] = { { "thumb", "Thumb1", "Thumb2" }, { "Index", "Index1", "Index2" },
-                        { "Middle", "Middle1", "Middle2" }, { "Ring", "Ring1", "Ring2" }, { "Pinky", "Pinky1", "Pinky2" } };
-                    const auto first_frame = FromNi(first_wrist->world).r * FrameOf(first_shape.forward, first_shape.up);
-                    const auto body_frame  = pose.GameWorld(wrist).r * FrameOf(body_shape.forward, body_shape.up);
-                    const auto to_body     = body_frame * glm::transpose(first_frame);
-                    const std::string prefix = side == 0 ? "L_" : "R_";
-                    for (int f = 0; f < 5; ++f) {
-                        if (f == 1) {
-                            continue;  // the index finger follows the trigger
-                        }
-                        for (int j = 0; j < 2; ++j) {
-                            const int bone  = chains[f][j];
-                            const int child = chains[f][j + 1];
-                            if (bone < 0 || child < 0) {
-                                continue;
-                            }
-                            auto first_joint = FindDescendant(first_wrist, prefix + kFingerNames[f][j]);
-                            auto first_child = first_joint ? FindDescendant(first_joint, prefix + kFingerNames[f][j + 1]) : nullptr;
-                            if (!first_child) {
-                                continue;
-                            }
-                            const auto wanted = to_body * (ToVec(first_child->world.translate) - ToVec(first_joint->world.translate));
-                            const auto joint  = pose.GameWorld(bone);
-                            const auto dir    = pose.GameWorld(child).t - joint.t;
-                            if (glm::length(wanted) < 1e-5f || glm::length(dir) < 1e-5f) {
-                                continue;
-                            }
-                            auto posed = joint;
-                            posed.r    = RotationBetween(dir, wanted) * joint.r;
-                            pose.SetGameWorld(bone, posed);
-                            ++diag.copied;
-                        }
-                    }
-                }
-            }
-
+            const auto& chains = g_bones.fingers[side];
             if (!g_finger_palm[side].valid) {
                 return;
             }
             const auto& palm = g_finger_palm[side].palm;
             CurlFinger(pose, chains[1], wrist, palm, 10.0f + 50.0f * index, 10.0f + 70.0f * index);
-            if (!first_wrist) {
-                CurlFinger(pose, chains[2], wrist, palm, 10.0f + 65.0f * grip, 10.0f + 85.0f * grip);
-                CurlFinger(pose, chains[3], wrist, palm, 10.0f + 65.0f * grip, 10.0f + 85.0f * grip);
-                CurlFinger(pose, chains[4], wrist, palm, 10.0f + 65.0f * grip, 10.0f + 85.0f * grip);
-                CurlFinger(pose, chains[0], wrist, palm, 5.0f + 20.0f * thumb, 5.0f + 25.0f * thumb);
-            }
+            CurlFinger(pose, chains[2], wrist, palm, 10.0f + 65.0f * grip, 10.0f + 85.0f * grip);
+            CurlFinger(pose, chains[3], wrist, palm, 10.0f + 65.0f * grip, 10.0f + 85.0f * grip);
+            CurlFinger(pose, chains[4], wrist, palm, 10.0f + 65.0f * grip, 10.0f + 85.0f * grip);
+            CurlFinger(pose, chains[0], wrist, palm, 5.0f + 20.0f * thumb, 5.0f + 25.0f * thumb);
         }
 
         // Fingers from hand tracking: each finger joint points where the tracked joint does, through the hands'
         // anatomical frames (tracked: wrist to middle knuckle forward, thumb side up).
         bool ApplyTrackedFingers(const Pose& pose, int side, int wrist)
         {
-            const auto& hand = g_tracked_hands[side];
-            const auto& body = side == 0 ? (*g_active_bones).left.shape : (*g_active_bones).right.shape;
+            const auto& hand = g_in.hands[side];
+            const auto& body = side == 0 ? g_bones.left.shape : g_bones.right.shape;
             auto at = [&](int i) { return glm::vec3{ hand.joints[i].position }; };
             // Index bend of the tracked hand (intermediate joint), for comparing a controller-derived hand with the trigger.
             g_track_diag.index_bend[side] = -1.0f;
@@ -1745,7 +1578,7 @@ namespace body
             }
             // Only an optically tracked hand adds information; with a controller held, the controller's own touch and
             // analog inputs drive the fingers and a held weapon keeps its grip.
-            if (!GameFlow::gStore.internalSettings.handTracking || !hand.active || hand.data_source != 1 || !body.valid) {
+            if (!GameFlow::gStore.internalSettings.fingerPoses || !hand.active || hand.data_source != 1 || !body.valid) {
                 return false;
             }
             for (const int i : { 1, 3, 12 }) {
@@ -1762,7 +1595,7 @@ namespace body
             if (glm::length(up) < 1e-4f) {
                 return false;
             }
-            const auto room = tracking::RoomRotation();
+            const auto& room = g_in.room;
             if (!room) {
                 return false;
             }
@@ -1773,7 +1606,7 @@ namespace body
 
             // XrHandJointEXT: thumb metacarpal 2..tip 5; fingers proximal..tip at 7, 12, 17, 22 (+0..3).
             static constexpr int kTracked[5][3] = { { 2, 3, 4 }, { 7, 8, 9 }, { 12, 13, 14 }, { 17, 18, 19 }, { 22, 23, 24 } };
-            const auto& chains = (*g_active_bones).fingers[side];
+            const auto& chains = g_bones.fingers[side];
             for (int f = 0; f < 5; ++f) {
                 for (int j = 0; j < 2; ++j) {
                     const int bone  = chains[f][j];
@@ -1799,737 +1632,12 @@ namespace body
 
         void RestoreAnimated(const Pose& pose)
         {
-            for (auto it = (*g_written_active).begin(); it != (*g_written_active).end();) {
+            for (auto it = pose.written->begin(); it != pose.written->end();) {
                 if (it->first < pose.count && std::memcmp(&pose.local[it->first], &it->second.written, sizeof(RE::NiTransform)) == 0) {
                     pose.local[it->first] = it->second.animated;
                 }
-                it = (*g_written_active).erase(it);
+                it = pose.written->erase(it);
             }
-        }
-
-        void UpdateWeaponActions(const Pose& pose, const std::optional<Xf>& weapon, bool drawn);
-
-        // Crouch, torso and legs: everything that moves the chest, which the weapon and arms hang from.
-        void ApplyTorsoAndLegs(const Pose& pose)
-        {
-            // Animated feet, captured before the pelvis moves (the feet hang below it).
-            std::optional<std::pair<Xf, Xf>> feet;
-            if ((*g_active_bones).left_leg.foot >= 0 && (*g_active_bones).right_leg.foot >= 0) {
-                feet = std::make_pair(pose.GameWorld((*g_active_bones).left_leg.foot), pose.GameWorld((*g_active_bones).right_leg.foot));
-            }
-            ApplyCrouch(pose);
-            if (!ApplyTrackedTorso(pose)) {
-                ApplyLean(pose);
-            }
-            if (feet) {
-                ApplyLegs(pose, feet->first, feet->second);
-            }
-        }
-
-        // The weapon placed in the animation graph this frame, before the game's arm IK (see graph_stage).
-        struct StagedWeapon
-        {
-            bool held{ false };
-            Xf   weapon{};
-            bool support_held{ false };
-        };
-        StagedWeapon g_staged_weapon;
-
-        void ApplyIK(const Pose& pose, bool staged)
-        {
-            if ((*g_active_bones).head >= 0) {
-                pose.local[(*g_active_bones).head].scale = 0.0f;
-            }
-            MeasureHand(pose, (*g_active_bones).right, "right");
-            MeasureHand(pose, (*g_active_bones).left, "left");
-            MeasureElbow(pose, (*g_active_bones).right, "right");
-            MeasureElbow(pose, (*g_active_bones).left, "left");
-            if (!staged) {
-                ApplyTorsoAndLegs(pose);
-            }
-            MeasurePalmSide(pose, 0, (*g_active_bones).left.shape, (*g_active_bones).left.wrist);
-            MeasurePalmSide(pose, 1, (*g_active_bones).right.shape, (*g_active_bones).right.wrist);
-
-            const auto room = tracking::RoomRotation();
-            if (!room) {
-                return;
-            }
-            ++g_frame_counter;
-            if (FirstPersonArmsLive()) {
-                // The first-person rig supplies the arms and weapon; this body's are collapsed.
-                for (const int bone : { (*g_active_bones).right.biceps, (*g_active_bones).left.biceps, (*g_active_bones).weapon,
-                         (*g_active_bones).by_name.contains("WeaponLeft") ? (*g_active_bones).by_name["WeaponLeft"] : -1 }) {
-                    if (bone >= 0) {
-                        auto [entry, first] = (*g_written_active).try_emplace(bone);
-                        if (first) {
-                            entry->second.animated = pose.local[bone];
-                        }
-                        pose.local[bone].scale = 0.0f;
-                        entry->second.written  = pose.local[bone];
-                    }
-                }
-                return;
-            }
-            const std::optional<Xf> held_weapon = staged && g_staged_weapon.held ? std::optional<Xf>{ g_staged_weapon.weapon } : std::nullopt;
-            g_support      = {};
-            g_support.held = held_weapon && g_staged_weapon.support_held;
-            auto& r = (*g_active_bones).right;
-            {
-                auto       player = CreationEngineSingletonManager::GetPlayerRef();
-                const bool drawn  = player && player->IsWeaponDrawn();
-                g_body_muzzle     = drawn && (*g_active_bones).weapon_node ? FindDescendant((*g_active_bones).weapon_node, "ProjectileNode") : nullptr;
-                g_diag.weapon_aligned = held_weapon.has_value();
-                if (drawn && !held_weapon) {
-                    static std::chrono::steady_clock::time_point last{};
-                    if (const auto now = std::chrono::steady_clock::now(); now - last > std::chrono::seconds(1)) {
-                        last = now;
-                        spdlog::error("[Body] weapon drawn but not placed in the animation graph this frame (staged {})", staged);
-                    }
-                }
-            }
-            // A hand on the weapon goes exactly onto the game's grip target (R_HandIk / L_HandIk, animated with the
-            // weapon); the game's own IK cannot stretch the arm when the weapon is held at full reach.
-            auto ik_target = [&](const char* name) -> std::optional<Xf> {
-                const auto it = (*g_active_bones).by_name.find(name);
-                return it == (*g_active_bones).by_name.end() ? std::nullopt : std::optional<Xf>{ pose.GameWorld(it->second) };
-            };
-            if (held_weapon && r.biceps >= 0 && r.forearm >= 0 && r.wrist >= 0) {
-                if (const auto target = ik_target("R_HandIk")) {
-                    g_diag.right_gap = SolveArm(pose, r, false, *target, std::nullopt);
-                }
-            }
-            if (!held_weapon && r.biceps >= 0 && r.forearm >= 0 && r.wrist >= 0 && r.shape.valid) {
-                const auto grip = HandWorld(tracking::GripPose(false));
-                const auto aim  = HandWorld(tracking::AimPose(false));
-                if (grip && aim) {
-                    const auto bend = TrackedBend(joint::kArmUpper[1], joint::kArmLower[1], joint::kWrist[1]);
-                    g_track_diag.elbow[1] = bend.has_value();
-                    g_diag.right_gap      = SolveArm(pose, r, false, WristTarget(pose, r, *aim, *grip), bend);
-                    ApplyFingers(pose, 1, r.wrist, nullptr);
-                }
-            }
-
-            auto& l = (*g_active_bones).left;
-            if (l.biceps >= 0 && l.forearm >= 0 && l.wrist >= 0 && l.shape.valid) {
-                const auto grip = HandWorld(tracking::GripPose(true));
-                const auto aim  = HandWorld(tracking::AimPose(true));
-                if (grip && aim) {
-                    const bool on_grip  = g_support.held;
-                    g_diag.support_held = on_grip;
-                    if (on_grip) {
-                        if (const auto target = ik_target("L_HandIk")) {
-                            g_diag.left_gap = SolveArm(pose, l, true, *target, std::nullopt);
-                        }
-                    } else {
-                        const auto bend       = TrackedBend(joint::kArmUpper[0], joint::kArmLower[0], joint::kWrist[0]);
-                        g_track_diag.elbow[0] = bend.has_value();
-                        g_diag.left_gap       = SolveArm(pose, l, true, WristTarget(pose, l, *aim, *grip), bend);
-                        ApplyFingers(pose, 0, l.wrist, nullptr);
-                    }
-                }
-            }
-            {
-                auto player = CreationEngineSingletonManager::GetPlayerRef();
-                UpdateWeaponActions(pose, held_weapon, player && player->IsWeaponDrawn());
-            }
-        }
-
-        // Where the body's shoulders ended up this frame, for attaching the first-person arms.
-        struct BodyShoulders
-        {
-            bool      valid{ false };
-            glm::vec3 left{};
-            glm::vec3 right{};
-            glm::vec3 up{ 0.0f, 0.0f, 1.0f };
-            glm::vec3 pelvis{};
-            glm::vec3 chest{};
-            glm::vec3 forward{ 0.0f, 1.0f, 0.0f };
-        };
-        BodyShoulders g_body_shoulders;
-
-        struct FirstPersonDiag
-        {
-            bool      active{ false };
-            glm::vec3 origin{};
-            float     attach_offset{ 0.0f };
-            float     attach_error{ -1.0f };
-            float     attach_angle{ 0.0f };
-            int       branch{ -1 };
-            glm::vec3 root_translate{};
-            bool      weapon{ false };
-            bool      support{ false };
-        };
-        FirstPersonDiag g_fp_diag;
-
-        // Weapon interactions on the body: holster slots, manual reload, raise to aim. They act through the game's own
-        // inputs (draw/holster/reload on X, aim on the left trigger) so the game's weapon state stays authoritative.
-        struct WeaponActions
-        {
-            enum class Mag { Loaded, Ejected, InHand } mag{ Mag::Loaded };
-            bool        grip_was[2]{};
-            float       holster_dwell{ 0.0f };
-            float       cooldown{ 0.0f };
-            bool        aiming{ false };
-            int         slot[2]{ -1, -1 };
-            const char* last{ "" };
-            std::chrono::steady_clock::time_point time{};
-            bool        has_time{ false };
-        };
-        WeaponActions g_actions;
-
-        void Pulse(int side, float seconds, float amplitude)
-        {
-            static auto vr = VR::get();
-            vr->trigger_haptic_vibration(0.0f, seconds, 160.0f, amplitude, side == 0 ? vr->get_left_joystick() : vr->get_right_joystick());
-        }
-
-        // Slots on the body: 0 right hip, 1 left hip, 2 chest, 3 behind the right shoulder, 4 behind the left
-        // shoulder, 5 magazine pouch (left hip, front).
-        int SlotAt(const glm::vec3& p)
-        {
-            const auto& b = g_body_shoulders;
-            if (!b.valid) {
-                return -1;
-            }
-            const auto up    = glm::vec3{ 0.0f, 0.0f, 1.0f };
-            const auto right = glm::normalize(glm::cross(b.forward, up));
-            const glm::vec3 slots[6] = {
-                b.pelvis + right * 0.22f + b.forward * 0.02f - up * 0.05f,
-                b.pelvis - right * 0.22f + b.forward * 0.02f - up * 0.05f,
-                b.chest + b.forward * 0.16f,
-                b.right + up * 0.10f - b.forward * 0.15f,
-                b.left + up * 0.10f - b.forward * 0.15f,
-                b.pelvis - right * 0.15f + b.forward * 0.14f,
-            };
-            int   best = -1;
-            float best_d = 0.17f;
-            for (int i = 0; i < 6; ++i) {
-                const float d = glm::length(p - slots[i]);
-                if (d < best_d) {
-                    best   = i;
-                    best_d = d;
-                }
-            }
-            return best;
-        }
-
-        void UpdateWeaponActions(const Pose& pose, const std::optional<Xf>& weapon, bool drawn)
-        {
-            auto& a = g_actions;
-            const auto& settings = GameFlow::gStore.internalSettings;
-            const auto now = std::chrono::steady_clock::now();
-            const float dt = a.has_time ? std::clamp(std::chrono::duration<float>(now - a.time).count(), 0.0f, 0.1f) : 0.0f;
-            a.time     = now;
-            a.has_time = true;
-            a.cooldown = std::max(0.0f, a.cooldown - dt);
-
-            static auto vr = VR::get();
-            std::optional<HandTarget> hands[2] = { HandWorld(tracking::GripPose(true)), HandWorld(tracking::GripPose(false)) };
-            bool grip[2]{}, pressed[2]{};
-            for (int side = 0; side < 2; ++side) {
-                grip[side]       = vr->get_finger_state(side == 0).grip > 0.6f;
-                pressed[side]    = grip[side] && !a.grip_was[side];
-                a.grip_was[side] = grip[side];
-                a.slot[side]     = hands[side] ? SlotAt(hands[side]->position) : -1;
-            }
-
-            // Holsters.
-            bool right_in_slot = false;
-            if (settings.holsters) {
-                if (!drawn) {
-                    for (int side = 0; side < 2; ++side) {
-                        const bool in_slot = a.slot[side] >= 0 && a.slot[side] <= 4;
-                        right_in_slot      = right_in_slot || (side == 1 && in_slot);
-                        if (in_slot && pressed[side] && a.cooldown <= 0.0f) {
-                            input_requests::Press(input_requests::kX, 120);
-                            Pulse(side, 0.05f, 0.6f);
-                            a.cooldown = 1.0f;
-                            a.last     = "draw";
-                            spdlog::info("[Weapon] draw from slot {}", a.slot[side]);
-                        }
-                    }
-                } else if (weapon) {
-                    const bool in_slot = a.slot[1] >= 0 && a.slot[1] <= 4;
-                    a.holster_dwell    = in_slot && !a.aiming ? a.holster_dwell + dt : 0.0f;
-                    if (a.holster_dwell > 0.45f && a.cooldown <= 0.0f) {
-                        input_requests::Press(input_requests::kX, 900);
-                        Pulse(1, 0.08f, 0.7f);
-                        a.cooldown      = 1.5f;
-                        a.holster_dwell = 0.0f;
-                        a.last          = "holster";
-                        spdlog::info("[Weapon] holster at slot {}", a.slot[1]);
-                    }
-                }
-            }
-            input_requests::Suppress(input_requests::kRightShoulder, right_in_slot || a.slot[1] == 5);
-
-            // Manual reload: the gun's magazine part is hidden, carried in the left hand, or seated.
-            const auto& bones = *g_active_bones;
-            int mag = -1;
-            if (auto it = bones.by_name.find("Magazine"); it != bones.by_name.end()) {
-                mag = it->second;
-            } else if (auto it2 = bones.by_name.find("P-Mag"); it2 != bones.by_name.end()) {
-                mag = it2->second;
-            }
-            input_requests::Suppress(input_requests::kX, settings.manualReload && drawn);
-            if (settings.manualReload && drawn && weapon) {
-                const auto seated = mag >= 0 ? std::optional<Xf>{ pose.GameWorld(mag) } : std::nullopt;
-                if (input_requests::TakeReloadPress() && a.mag == WeaponActions::Mag::Loaded) {
-                    a.mag  = WeaponActions::Mag::Ejected;
-                    a.last = "eject";
-                    Pulse(1, 0.06f, 0.8f);
-                    spdlog::info("[Weapon] magazine ejected");
-                }
-                if (a.mag == WeaponActions::Mag::Ejected && pressed[0] && a.slot[0] == 5) {
-                    a.mag  = WeaponActions::Mag::InHand;
-                    a.last = "grab";
-                    Pulse(0, 0.04f, 0.5f);
-                    spdlog::info("[Weapon] magazine taken");
-                }
-                if (a.mag == WeaponActions::Mag::InHand) {
-                    if (!grip[0]) {
-                        a.mag  = WeaponActions::Mag::Ejected;
-                        a.last = "drop";
-                        spdlog::info("[Weapon] magazine dropped");
-                    } else if (seated && hands[0] && glm::length(hands[0]->position - seated->t) < 0.08f) {
-                        a.mag  = WeaponActions::Mag::Loaded;
-                        a.last = "insert";
-                        input_requests::Press(input_requests::kX, 120);
-                        Pulse(0, 0.08f, 1.0f);
-                        Pulse(1, 0.08f, 1.0f);
-                        spdlog::info("[Weapon] magazine inserted, reloading");
-                    }
-                }
-                if (seated) {
-                    if (a.mag == WeaponActions::Mag::Ejected) {
-                        auto hidden = *seated;
-                        hidden.s    = 1e-4f;
-                        pose.SetGameWorld(mag, hidden);
-                    } else if (a.mag == WeaponActions::Mag::InHand && hands[0]) {
-                        auto held = *seated;
-                        held.t    = hands[0]->position;
-                        pose.SetGameWorld(mag, held);
-                    }
-                }
-            } else if (!drawn) {
-                input_requests::TakeReloadPress();
-            }
-
-            // Raise to aim: the sight (above the grip along the weapon's up) on the line from the eye along the barrel.
-            bool aim = false;
-            if (settings.raiseToAim && drawn && weapon && g_basis.has) {
-                auto world_camera = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
-                if (world_camera) {
-                    const auto eye    = ToVec(world_camera->world.translate);
-                    const auto barrel = glm::normalize(weapon->r * g_basis.forward);
-                    const auto up     = glm::normalize(weapon->r * g_basis.up);
-                    const auto sight  = (hands[1] ? hands[1]->position : weapon->t) + up * 0.08f;
-                    const auto to_eye = eye - sight;
-                    const float along = glm::dot(to_eye, -barrel);
-                    const float off   = glm::length(to_eye + barrel * along);
-                    const float limit = a.aiming ? 0.07f : 0.045f;
-                    aim               = along > 0.03f && along < 0.35f && off < limit;
-                }
-            }
-            if (aim != a.aiming) {
-                spdlog::info("[Weapon] raise to aim {}", aim ? "on" : "off");
-            }
-            a.aiming = aim;
-            input_requests::SetHeld(input_requests::kLeftTrigger, aim);
-        }
-
-        // Moving parts of a weapon model by node name (receiver rig nodes and attach points), with a provisional
-        // mechanical class. Logged when the held weapon changes.
-        void LogWeaponParts(RE::NiAVObject* weapon)
-        {
-            static RE::NiAVObject* logged{ nullptr };
-            if (!weapon || weapon == logged) {
-                return;
-            }
-            logged = weapon;
-            int magazine = 0, bolt = 0;
-            bool p_mag = false, p_slide = false, p_foregrip = false, pump = false, battery = false, trigger = false, muzzle = false;
-            std::string names;
-            std::vector<RE::NiAVObject*> stack{ weapon };
-            RE::NiAVObject* children[96]{};
-            while (!stack.empty() && names.size() < 6000) {
-                auto node = stack.back();
-                stack.pop_back();
-                const std::string_view name{ node->name.c_str() };
-                if (!name.empty()) {
-                    names += " ";
-                    names += name;
-                }
-                if (Contains(name, "Magazine")) ++magazine;
-                if (name.size() >= 4 && Contains(name.substr(0, 4), "Bolt")) ++bolt;
-                p_mag      = p_mag || Contains(name, "P-Mag");
-                p_slide    = p_slide || Contains(name, "P-Slide");
-                p_foregrip = p_foregrip || Contains(name, "P-Foregrip");
-                pump       = pump || Contains(name, "Pump_Grip");
-                battery    = battery || Contains(name, "P-Battery");
-                trigger    = trigger || Contains(name, "Trigger");
-                muzzle     = muzzle || name == "ProjectileNode";
-                const auto count = ReadChildren(node, children, 96);
-                for (std::uint16_t i = 0; i < count; ++i) {
-                    if (children[i]) {
-                        stack.push_back(children[i]);
-                    }
-                }
-            }
-            const char* kind = pump ? "pump" : (!p_mag && magazine >= 5) ? "revolver/sequential" : battery ? "cell" : (p_slide || bolt > 0) && p_mag ? "magazine + slide/bolt"
-                             : p_mag ? "magazine" : "unknown";
-            spdlog::info("[Weapon] parts: magazine nodes {} bolt nodes {} P-Mag {} P-Slide {} P-Foregrip {} Pump_Grip {} P-Battery {} trigger {} muzzle {} -> {}",
-                magazine, bolt, p_mag, p_slide, p_foregrip, pump, battery, trigger, muzzle, kind);
-            spdlog::info("[Weapon] nodes:{}", names);
-        }
-
-        // Frame at the collarbones: origin between them, forward from up x (left to right), up.
-        Xf ShoulderFrame(const glm::vec3& left, const glm::vec3& right, const glm::vec3& up)
-        {
-            Xf frame;
-            const auto side    = glm::normalize(right - left);
-            auto       upright = up - glm::dot(up, side) * side;
-            upright            = glm::length(upright) > 1e-4f ? glm::normalize(upright) : glm::vec3{ 0.0f, 0.0f, 1.0f };
-            frame.r            = FrameOf(glm::cross(upright, side), upright);
-            frame.t            = (left + right) * 0.5f;
-            return frame;
-        }
-
-        // First-person arms (FRIK's arrangement): the game's first-person rig, which animates its own hands on its own
-        // weapon, is attached at the body's shoulders. The weapon follows the aim ray, the hands come from the
-        // weapon through the rig's own animated grip (the same hands that are shown), and the arms are solved with
-        // the IK. The pose buffer is origin-relative; the origin the engine adds back is in the update data.
-        void ApplyFirstPerson(Pose& pose, const glm::vec3& origin, RE::NiTransform& root_out)
-        {
-            auto& b = *g_active_bones;
-            g_fp_diag        = {};
-            g_fp_diag.origin = origin;
-            pose.to_world    = Xf{ glm::mat3{ 1.0f }, origin, 1.0f };
-            if (b.right.clavicle < 0 || b.left.clavicle < 0 || !g_body_shoulders.valid) {
-                return;
-            }
-            MeasureHand(pose, b.right, "first-person right");
-            MeasureHand(pose, b.left, "first-person left");
-            MeasureElbow(pose, b.right, "first-person right");
-            MeasureElbow(pose, b.left, "first-person left");
-            MeasurePalmSide(pose, 0, b.left.shape, b.left.wrist);
-            MeasurePalmSide(pose, 1, b.right.shape, b.right.wrist);
-
-            // Animated relations, read before anything moves.
-            std::optional<Xf> hand_in_weapon, support_in_weapon;
-            std::optional<Xf> weapon_anim;
-            if (b.weapon >= 0) {
-                weapon_anim = pose.GameWorld(b.weapon);
-                if (b.right.wrist >= 0) {
-                    hand_in_weapon = Compose(Inverse(*weapon_anim), pose.GameWorld(b.right.wrist));
-                }
-                if (b.left.wrist >= 0) {
-                    support_in_weapon = Compose(Inverse(*weapon_anim), pose.GameWorld(b.left.wrist));
-                }
-            }
-
-            // Attach: the branch carrying the arms (not the root, which also carries the camera) is moved so the rig's
-            // collarbones sit on the body's.
-            const auto rig  = ShoulderFrame(pose.GameWorld(b.left.clavicle).t, pose.GameWorld(b.right.clavicle).t, pose.root.r[2]);
-            const auto body = ShoulderFrame(g_body_shoulders.left, g_body_shoulders.right, g_body_shoulders.up);
-            g_fp_diag.attach_offset = glm::length(body.t - rig.t);
-            g_fp_diag.attach_angle  = glm::degrees(glm::angle(glm::quat_cast(body.r * glm::transpose(rig.r))));
-            int branch = b.right.clavicle;
-            for (int guard = 0; branch >= pose.top && guard < 64; ++guard) {
-                branch = pose.parent[branch];
-            }
-            if (branch < 0 || branch >= pose.top) {
-                spdlog::error("[BodyIK] first-person rig: no top-level branch above R_Clavicle");
-                return;
-            }
-            const auto move = Compose(body, Inverse(rig));
-            pose.SetGameWorld(branch, Compose(move, pose.GameWorld(branch)));
-            g_fp_diag.branch = branch;
-            g_fp_diag.active = true;
-            g_fp_last_frame  = g_frame_counter;
-
-            auto player = CreationEngineSingletonManager::GetPlayerRef();
-            const bool drawn = player && player->IsWeaponDrawn() && weapon_anim && hand_in_weapon;
-            auto& r = b.right;
-            auto& l = b.left;
-            std::optional<Xf> weapon_xf;
-            g_support = {};
-
-            if (r.biceps >= 0 && r.forearm >= 0 && r.wrist >= 0 && r.shape.valid) {
-                const auto grip = HandWorld(tracking::GripPose(false));
-                const auto aim  = HandWorld(tracking::AimPose(false));
-                if (grip && aim) {
-                    auto wrist_target = WristTarget(pose, r, *aim, *grip);
-                    if (drawn) {
-                        LogWeaponParts(b.weapon_node);
-                        auto muzzle   = b.weapon_node ? FindDescendant(b.weapon_node, "ProjectileNode") : nullptr;
-                        g_body_muzzle = muzzle;
-
-                        // How the animation holds the weapon against the view (its barrel and up), sampled when firing.
-                        if (auto world_camera = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera; world_camera && world_camera->parent) {
-                            const auto to_weapon = glm::transpose(weapon_anim->r);
-                            const auto view_r    = FromNi(world_camera->parent->world).r;
-                            const auto forward   = glm::normalize(to_weapon * view_r[1]);
-                            const auto up        = glm::normalize(to_weapon * view_r[2]);
-                            if (g_basis.weapon != b.weapon_node) {
-                                g_basis        = {};
-                                g_basis.weapon = b.weapon_node;
-                            }
-                            const bool fired = g_fire_sample.exchange(false);
-                            if (fired || !g_basis.has) {
-                                g_basis.forward = forward;
-                                g_basis.up      = up;
-                            } else if (!g_basis.fired) {
-                                g_basis.forward = glm::normalize(glm::mix(g_basis.forward, forward, 0.02f));
-                                g_basis.up      = glm::normalize(glm::mix(g_basis.up, up, 0.02f));
-                            }
-                            g_basis.fired = g_basis.fired || fired;
-                            g_basis.has   = true;
-                        }
-
-                        // Weapon from the aim ray; the hand from the weapon; both seated so the palm is on the grip.
-                        Xf weapon = *weapon_anim;
-                        weapon.r  = FrameOf(aim->forward, aim->up) * glm::transpose(FrameOf(g_basis.forward, g_basis.up));
-                        wrist_target           = Compose(weapon, *hand_in_weapon);
-                        const auto palm_world  = wrist_target.t + wrist_target.r * (r.shape.forward * r.shape.palm) * wrist_target.s;
-                        const auto seat        = grip->position - palm_world;
-                        weapon.t += seat;
-                        wrist_target.t += seat;
-                        g_barrel.aim_forward = aim->forward;
-
-                        // Two hands: the support grip is taken when the left hand comes near it; the weapon then turns
-                        // about the right grip toward the left hand.
-                        const auto left_grip = HandWorld(tracking::GripPose(true));
-                        if (GameFlow::gStore.internalSettings.supportHand && support_in_weapon && l.shape.valid && left_grip) {
-                            auto support = Compose(weapon, *support_in_weapon);
-                            auto palm    = support.t + support.r * (l.shape.forward * l.shape.palm) * support.s;
-                            const float distance    = glm::length(palm - left_grip->position);
-                            static bool held        = false;
-                            held                    = distance < (held ? 0.25f : 0.12f);
-                            g_diag.support_distance = distance;
-                            if (held) {
-                                const auto pivot = grip->position;
-                                const auto turn  = RotationBetween(palm - pivot, left_grip->position - pivot);
-                                weapon.r         = turn * weapon.r;
-                                weapon.t         = pivot + turn * (weapon.t - pivot);
-                                wrist_target.r   = turn * wrist_target.r;
-                                wrist_target.t   = pivot + turn * (wrist_target.t - pivot);
-                                g_support.held   = true;
-                                g_support.target = Compose(weapon, *support_in_weapon);
-                                if (g_basis.has) {
-                                    g_barrel.aim_forward = glm::normalize(weapon.r * g_basis.forward);
-                                }
-                            }
-                        }
-                        pose.SetGameWorld(b.weapon, weapon);
-                        g_barrel.placed        = true;
-                        g_barrel.placed_weapon = weapon;
-                        weapon_xf              = weapon;
-                        g_fp_diag.weapon       = true;
-                    } else {
-                        g_body_muzzle = nullptr;
-                    }
-                    const auto bend = TrackedBend(joint::kArmUpper[1], joint::kArmLower[1], joint::kWrist[1]);
-                    g_diag.right_gap = SolveArm(pose, r, false, wrist_target, bend);
-                    if (weapon_xf) {
-                        // The animated grip keeps its fingers; the index finger follows the trigger.
-                        static auto vr    = VR::get();
-                        const auto  input = vr->get_finger_state(false);
-                        if (g_finger_palm[1].valid) {
-                            const float index = input.trigger_touch ? 0.3f + 0.7f * input.trigger : 0.0f;
-                            CurlFinger(pose, b.fingers[1][1], r.wrist, g_finger_palm[1].palm, 10.0f + 50.0f * index, 10.0f + 70.0f * index);
-                        }
-                    } else {
-                        ApplyFingers(pose, 1, r.wrist, nullptr);
-                    }
-                }
-            }
-
-            if (l.biceps >= 0 && l.forearm >= 0 && l.wrist >= 0 && l.shape.valid) {
-                const auto grip = HandWorld(tracking::GripPose(true));
-                const auto aim  = HandWorld(tracking::AimPose(true));
-                if (grip && aim) {
-                    auto       target  = WristTarget(pose, l, *aim, *grip);
-                    const bool on_grip = weapon_xf && g_support.held;
-                    if (on_grip) {
-                        target = g_support.target;
-                    }
-                    g_diag.support_held = on_grip;
-                    g_fp_diag.support   = on_grip;
-                    const auto bend = TrackedBend(joint::kArmUpper[0], joint::kArmLower[0], joint::kWrist[0]);
-                    g_diag.left_gap = SolveArm(pose, l, true, target, bend);
-                    if (!on_grip) {
-                        ApplyFingers(pose, 0, l.wrist, nullptr);
-                    }
-                }
-            }
-            UpdateWeaponActions(pose, weapon_xf, drawn);
-        }
-
-        // The first-person rig updates node by node (no pose buffer: only the third-person root gets a model node),
-        // parents before children, and its meshes capture their bones as they update. When its root has updated,
-        // its tree is flattened into the pose layout the IK uses, solved, and the changed locals are written back
-        // before any child updates.
-        struct FlatRig
-        {
-            std::vector<RE::NiAVObject*> nodes;
-            std::vector<std::uint16_t>   parent;
-            std::vector<RE::NiTransform> local;
-            std::vector<RE::NiTransform> world;
-            std::uint16_t                top{ 0 };
-            std::size_t                  signature{ 0 };
-        };
-        FlatRig g_flat;
-
-        void FlattenRig(RE::NiAVObject* root)
-        {
-            auto& f = g_flat;
-            f.nodes.clear();
-            f.parent.clear();
-            RE::NiAVObject* children[96]{};
-            auto count = ReadChildren(root, children, 96);
-            for (std::uint16_t i = 0; i < count; ++i) {
-                if (children[i]) {
-                    f.nodes.push_back(children[i]);
-                    f.parent.push_back(0);
-                }
-            }
-            f.top = static_cast<std::uint16_t>(f.nodes.size());
-            for (std::size_t i = 0; i < f.nodes.size() && f.nodes.size() < 1024; ++i) {
-                count = ReadChildren(f.nodes[i], children, 96);
-                for (std::uint16_t c = 0; c < count; ++c) {
-                    if (children[c]) {
-                        f.nodes.push_back(children[c]);
-                        f.parent.push_back(static_cast<std::uint16_t>(i));
-                    }
-                }
-            }
-            std::size_t signature = f.nodes.size();
-            for (auto* node : f.nodes) {
-                signature = signature * 1315423911u ^ reinterpret_cast<std::uintptr_t>(node);
-            }
-            f.signature = signature;
-        }
-
-        bool g_first_person_handled{ false };
-
-        std::atomic<int> g_fp_root_hits{ 0 };
-
-        bool HandleFirstPersonRoot(RE::NiAVObject* root, RE::NiUpdateData* data)
-        {
-            ++g_fp_root_hits;
-            g_first_person_handled = false;
-            if (!g_state.active || !GameFlow::gStore.internalSettings.firstPersonArms || !root) {
-                return false;
-            }
-            const auto previous = g_flat.signature;
-            FlattenRig(root);
-            auto& f = g_flat;
-            if (f.nodes.empty()) {
-                return false;
-            }
-            const bool rebuilt = previous != f.signature;
-            if (rebuilt) {
-                g_written_first.clear();
-            }
-            // Writes the animation did not replace are put back to their animated value before reading.
-            for (const auto& [index, entry] : g_written_first) {
-                if (index < static_cast<int>(f.nodes.size()) && std::memcmp(&f.nodes[index]->local, &entry.written, sizeof(RE::NiTransform)) == 0) {
-                    f.nodes[index]->local = entry.animated;
-                }
-            }
-            g_written_first.clear();
-            f.local.resize(f.nodes.size());
-            f.world.resize(f.nodes.size());
-            for (std::size_t i = 0; i < f.nodes.size(); ++i) {
-                f.local[i] = f.nodes[i]->local;
-                f.world[i] = f.nodes[i]->local;
-            }
-
-            Pose pose;
-            pose.local  = f.local.data();
-            pose.world  = f.world.data();
-            pose.parent = f.parent.data();
-            pose.count  = static_cast<std::uint16_t>(f.nodes.size());
-            pose.top    = f.top;
-            pose.root   = FromNi(root->world);
-
-            g_active_bones   = &g_first_bones;
-            g_written_active = &g_written_first;
-            g_finger_palm    = g_finger_palm_first;
-            if (rebuilt || g_first_bones.storage == nullptr) {
-                std::vector<std::pair<int, RE::NiAVObject*>> listed;
-                for (std::size_t i = 0; i < f.nodes.size(); ++i) {
-                    listed.emplace_back(static_cast<int>(i), f.nodes[i]);
-                }
-                FindBones(pose, reinterpret_cast<const void*>(f.signature), &listed);
-                spdlog::info("[BodyIK] first-person rig: {} nodes under '{}' (top {})", f.nodes.size(), root->name.c_str(), f.top);
-            }
-
-            glm::vec3 origin{ 0.0f };
-            if (data) {
-                if (auto saved = *reinterpret_cast<RE::NiPoint3**>(reinterpret_cast<std::uint8_t*>(data) + 0x28)) {
-                    origin = ToVec(*saved);
-                }
-            }
-            RE::NiTransform root_world = root->world;
-            ApplyFirstPerson(pose, origin, root_world);
-            g_fp_diag.root_translate = ToVec(root->world.translate);
-            if (g_fp_diag.active && g_first_bones.right.clavicle >= 0) {
-                g_fp_diag.attach_error = glm::length(pose.GameWorld(g_first_bones.right.clavicle).t - g_body_shoulders.right);
-            }
-            if (g_fp_diag.active) {
-                for (const auto& [index, entry] : g_written_first) {
-                    if (index >= 0 && index < static_cast<int>(f.nodes.size())) {
-                        f.nodes[index]->local = f.local[index];
-                    }
-                }
-                g_first_person_handled = true;
-            }
-            g_active_bones   = &g_body_bones;
-            g_written_active = &g_written_body;
-            g_finger_palm    = g_finger_palm_body;
-            return g_first_person_handled;
-        }
-
-        safetyhook::InlineHook g_model_update_hook;
-
-        // The pose-buffer conventions are measured against the engine before any write.
-        struct Calibration
-        {
-            enum class Status { Measuring, Ready, Failed } status{ Status::Ready };
-            int  world_variant{ 3 };  // pose worlds are game world (synced verbatim to the nodes)
-            int  good_frames{ 0 };
-            int  frames{ 0 };
-            bool has_measured{ false };
-            Xf   measured{};  // pose -> game world measured from the engine's last update
-        };
-        Calibration g_calibration;
-        constexpr int kWorldVariants = 5;
-        constexpr const char* kWorldVariantNames[kWorldVariants] = { "root world", "root translation", "root transposed", "identity", "measured" };
-
-        // Pose space -> game world.
-        Xf ToWorldVariant(int variant)
-        {
-            const auto root = g_state.root ? FromNi(g_state.root->world) : Xf{};
-            switch (variant) {
-            case 0:
-                return root;
-            case 1:
-                return { glm::mat3{ 1.0f }, root.t, root.s };
-            case 2:
-                return { glm::transpose(root.r), root.t, root.s };
-            case 4:
-                return g_calibration.measured;
-            default:
-                return Xf{};
-            }
-        }
-
-        float AngleBetween(const glm::mat3& a, const glm::mat3& b)
-        {
-            const auto d = a * glm::transpose(b);
-            return glm::degrees(std::acos(std::clamp((d[0][0] + d[1][1] + d[2][2] - 1.0f) * 0.5f, -1.0f, 1.0f)));
         }
 
         Pose ReadPose(std::uint8_t* model, const RE::NiTransform* root_local)
@@ -2556,7 +1664,7 @@ namespace body
             pose.count    = *reinterpret_cast<std::uint16_t*>(model + 0x78);
             pose.top      = static_cast<std::uint16_t>(*reinterpret_cast<std::uint16_t*>(model + 0x7c) + *reinterpret_cast<std::uint16_t*>(model + 0x7e));
             pose.root     = FromNi(*root_local);  // top-level entries: world = local * root (0x2be953d)
-            pose.to_world = ToWorldVariant(g_calibration.world_variant);
+            pose.to_world = Xf{};  // pose worlds are game world (synced verbatim to the nodes)
             return pose;
         }
 
@@ -2568,12 +1676,12 @@ namespace body
             constexpr float kLeanReach      = 0.20f;
             RE::NiTransform shifted_root    = root_local;
             g_lean                          = glm::vec3{ 0.0f };
-            auto world_camera               = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
-            if (world_camera && (*g_active_bones).neck >= 0) {
-                const auto eye = ToVec(world_camera->world.translate);
+            if (g_in.valid && g_bones.neck >= 0) {
+                const auto eye = g_in.eye;
                 // Torso partly toward the hands (FRIK: 0.7 of the hands' yaw, within 50 degrees).
                 if (GameFlow::gStore.internalSettings.bodyFacing) {
-                    const auto yaw = TrackedFacingYaw(pose).value_or(FacingYaw(pose, eye));
+                    const auto tracked = TrackedFacingYaw(pose);
+                    const auto yaw     = tracked ? *tracked : FacingYaw(pose, eye);
                     Xf         root = FromNi(shifted_root);
                     const auto turn = glm::mat3_cast(glm::angleAxis(yaw, glm::vec3{ 0.0f, 0.0f, 1.0f }));
                     const auto pivot = glm::vec3{ eye.x, eye.y, root.t.z };
@@ -2588,7 +1696,7 @@ namespace body
                 forward.z    = 0.0f;
                 if (glm::length(forward) > 1e-3f) {
                     forward            = glm::normalize(forward);
-                    const auto neck    = pose.GameWorld((*g_active_bones).neck).t;
+                    const auto neck    = pose.GameWorld(g_bones.neck).t;
                     auto       delta   = eye - forward * kNeckBehindEyes - neck;
                     delta.z            = 0.0f;
                     const float length = glm::length(delta);
@@ -2618,10 +1726,41 @@ namespace body
         }
 
 
-        // The game's animation graph builds the body's pose in its own buffer: clips, then nodes such as the arms'
-        // two-bone IK (targets R_HandIk/L_HandIk, children of the weapon bone), then a copy into the model's locals
-        // that UpdateTransforms turns into worlds. Everything that moves the chest, and the weapon itself, is set
-        // in that buffer just before the arm IK solves, so the game puts the hands on the weapon.
+
+        // Crouch, torso and legs: everything that moves the chest, which the weapon and arms hang from.
+        void ApplyTorsoAndLegs(const Pose& pose)
+        {
+            // Animated feet, captured before the pelvis moves (the feet hang below it).
+            std::optional<std::pair<Xf, Xf>> feet;
+            if (g_bones.left_leg.foot >= 0 && g_bones.right_leg.foot >= 0) {
+                feet = std::make_pair(pose.GameWorld(g_bones.left_leg.foot), pose.GameWorld(g_bones.right_leg.foot));
+            }
+            ApplyCrouch(pose);
+            if (!ApplyTrackedTorso(pose)) {
+                ApplyLean(pose);
+            }
+            if (feet) {
+                ApplyLegs(pose, feet->first, feet->second);
+            }
+        }
+
+        int BoneIndex(const char* name)
+        {
+            const auto it = g_bones.by_name.find(name);
+            return it == g_bones.by_name.end() ? -1 : it->second;
+        }
+
+        std::uint8_t* BodyModel()
+        {
+            if (!g_state.active || !g_state.root) {
+                return nullptr;
+            }
+            return *reinterpret_cast<std::uint8_t**>(reinterpret_cast<std::uint8_t*>(g_state.root) + kModelNodeOffset);
+        }
+
+        // The animation stage. The body's graph builds its pose in its own buffer (clips, then nodes such as the arms'
+        // two-bone IK and an aim twist of the torso after it), then copies it into the model's locals. Just before
+        // that copy the body is placed and the weapon set on the controller, so the frame build starts from them.
         namespace graph_stage
         {
             // Graph pose entry: rotation as a quaternion (w first), position, scale; parent-relative.
@@ -2637,49 +1776,61 @@ namespace body
             enum class Convention { Unknown, Direct, Transposed, Failed };
             Convention g_convention{ Convention::Unknown };
 
-            Xf FromGraph(const Bone32& b, Convention c)
+            Xf FromGraph(const Bone32& b)
             {
                 Xf x;
                 const auto r = glm::mat3_cast(glm::quat{ b.q[0], b.q[1], b.q[2], b.q[3] });
-                x.r          = c == Convention::Transposed ? glm::transpose(r) : r;
+                x.r          = g_convention == Convention::Transposed ? glm::transpose(r) : r;
                 x.t          = { b.t[0], b.t[1], b.t[2] };
                 x.s          = b.s;
                 return x;
             }
 
-            Bone32 ToGraph(const Xf& x, Convention c)
+            Bone32 ToGraph(const Xf& x)
             {
-                const auto q = glm::normalize(glm::quat_cast(c == Convention::Transposed ? glm::transpose(x.r) : x.r));
+                const auto q = glm::normalize(glm::quat_cast(g_convention == Convention::Transposed ? glm::transpose(x.r) : x.r));
                 return Bone32{ { q.w, q.x, q.y, q.z }, { x.t.x, x.t.y, x.t.z }, x.s };
             }
 
-            struct Write
+            struct WeaponPlacement
             {
-                int    graph;
-                int    model;
-                Bone32 value;
+                Xf        weapon{};
+                glm::vec3 forward{};  // barrel, in the weapon bone's space
+                bool      support_held{ false };
             };
 
+            // One run of the stage: what the frame build applies.
             struct Stage
             {
-                std::uint64_t      frame{ ~0ull };
-                bool               ran{ false };
-                RE::NiTransform    root{};
-                Xf                 anchor{};
-                bool               has_anchor{ false };
-                std::vector<Write> writes;
-                std::vector<Write> torso;  // the torso as the arm IK saw it
+                std::uint64_t                       sequence{ 0 };
+                RE::NiTransform                     root{};
+                Inputs                              input;
+                std::optional<WeaponPlacement>      weapon;
+                std::vector<std::pair<int, Bone32>> writes;  // model index, value written into the graph pose
             };
-            Stage                       g_stage;
-            std::mutex                  g_mutex;
-            std::atomic<std::uint64_t>  g_frames{ 0 };
-            RE::NiTransform             g_root_local{};
-            bool                        g_has_root_local{ false };
-            thread_local std::uint8_t*  t_model{ nullptr };
-            safetyhook::MidHook         g_generate_hook;
-            safetyhook::MidHook         g_ik_hook;
+            Stage         g_stage;       // the latest run (under g_body_mutex)
+            std::uint64_t g_applied{ 0 };  // the run the last frame build applied
 
-            // Bones sampled from the graph (no writes yet) and compared with the copied locals to measure the convention.
+            RE::NiTransform g_root_local{};  // the game's root at the last frame build
+            bool            g_has_root_local{ false };
+
+            thread_local std::uint8_t* t_model{ nullptr };
+            thread_local std::uint64_t t_generate{ 0 };
+
+            // The torso (spine, chest, neck) as the arm IK saw it, per graph evaluation; graph nodes after the arm IK
+            // turn it toward the game's aim, and the torso is the player's.
+            struct Torso
+            {
+                std::uint64_t                       generate{ ~0ull };
+                std::vector<std::pair<int, Bone32>> bones;  // graph index, value
+            };
+            thread_local Torso t_torso;
+
+            safetyhook::MidHook g_generate_hook;
+            safetyhook::MidHook g_arm_ik_hook;
+            safetyhook::MidHook g_pose_ready_hook;
+
+            // Bones sampled from the graph and compared with the copied locals to measure the convention.
             struct Sample
             {
                 int         model;
@@ -2691,55 +1842,34 @@ namespace body
 
             struct Diag
             {
-                int   hits_right{ 0 }, hits_left{ 0 }, hits_other{ 0 };
-                float target_weight{ -1.0f }, weapon_weight{ -1.0f }, blend{ -1.0f };
-                int   other_target{ -1 };
-                float copy_error{ -1.0f };       // our writes against the copied locals (later nodes overwriting them)
-                float hand_to_ik{ -1.0f };       // right wrist against R_HandIk after the update (the game's IK)
-                float hand_to_ik_angle{ -1.0f };
-                float support_to_ik{ -1.0f };
-                float weapon_error{ -1.0f };     // weapon bone against its placement
-                float anchor_moved{ 0.0f };      // camera anchor movement between the graph stage and the frame
-                float weapon_moved{ 0.0f };      // weapon placement change between the two
-                float grip_off_controller{ -1.0f };  // drawn grip's palm centre against the controller, when drawn
-                float torso_undone{ 0.0f };          // largest torso turn by graph nodes after the arm IK, undone
-                bool  placed{ false };
+                int         stages{ 0 }, builds{ 0 }, reused{ 0 };
+                float       copy_error{ -1.0f };     // our writes against the locals the game copied
+                float       twist_undone{ 0.0f };    // torso turn by graph nodes after the arm IK
+                float       camera_shift{ 0.0f };    // camera movement between the input capture and the frame build
+                float       hand_to_target{ -1.0f }; // right wrist against R_HandIk after the update
+                float       grip_off{ -1.0f };       // the grip's palm centre against the controller
+                float       weapon_off{ -1.0f };     // the drawn weapon bone against its placement
+                bool        placed{ false };
                 std::string note;
             };
-            Diag g_stage_diag;
+            Diag g_diag;
 
-            std::uint8_t* BodyModel()
+            std::vector<int> TorsoBones()
             {
-                if (!g_state.active || !g_state.root) {
-                    return nullptr;
+                std::vector<int> torso = g_bones.spine;
+                for (const int bone : { g_bones.chest, g_bones.neck }) {
+                    if (bone >= 0 && std::find(torso.begin(), torso.end(), bone) == torso.end()) {
+                        torso.push_back(bone);
+                    }
                 }
-                return *reinterpret_cast<std::uint8_t**>(reinterpret_cast<std::uint8_t*>(g_state.root) + kModelNodeOffset);
+                return torso;
             }
 
-            int Index(const char* name)
-            {
-                const auto it = (*g_active_bones).by_name.find(name);
-                return it == (*g_active_bones).by_name.end() ? -1 : it->second;
-            }
-
-            bool Staged()
-            {
-                std::lock_guard lock(g_mutex);
-                return g_stage.ran && g_stage.frame == g_frames.load();
-            }
-
-            void NoteRootLocal(const RE::NiTransform& root_local)
-            {
-                std::lock_guard lock(g_mutex);
-                g_root_local     = root_local;
-                g_has_root_local = true;
-            }
-
-            // The weapon's up in its bone space, from the game's own (upright) hold in the animation: the measured
-            // up snapped to the nearest bone axis across the barrel, kept per weapon once it holds steady.
+            // The weapon's up in its bone's space, from the game's own upright hold in the animation: the measured up
+            // snapped to the nearest bone axis across the barrel, kept per weapon model once it holds steady.
             struct WeaponUp
             {
-                RE::NiAVObject* weapon{ nullptr };
+                RE::NiAVObject* model{ nullptr };
                 glm::vec3       candidate{};
                 int             steady{ 0 };
                 bool            locked{ false };
@@ -2749,16 +1879,15 @@ namespace body
 
             void MeasureWeaponUp(const Pose& pose)
             {
-                const auto& b = *g_active_bones;
-                if (g_weapon_up.weapon != b.weapon_node) {
-                    g_weapon_up        = {};
-                    g_weapon_up.weapon = b.weapon_node;
+                if (g_weapon_up.model != g_barrel.model) {
+                    g_weapon_up       = {};
+                    g_weapon_up.model = g_barrel.model;
                 }
-                if (g_weapon_up.locked || b.weapon < 0 || !g_barrel.has_relation || g_barrel.weapon != b.weapon_node) {
+                if (g_weapon_up.locked || !g_barrel.has_relation || g_bones.weapon < 0) {
                     return;
                 }
-                const auto forward  = glm::normalize(g_barrel.shot_in_weapon);
-                const auto measured = glm::transpose(pose.GameWorld(b.weapon).r) * glm::vec3{ 0.0f, 0.0f, 1.0f };
+                const auto forward  = g_barrel.shot_in_weapon;
+                const auto measured = glm::transpose(pose.GameWorld(g_bones.weapon).r) * glm::vec3{ 0.0f, 0.0f, 1.0f };
                 glm::vec3  best{};
                 float      best_dot = -2.0f;
                 for (int axis = 0; axis < 3; ++axis) {
@@ -2774,152 +1903,83 @@ namespace body
                         }
                     }
                 }
-                if (best == g_weapon_up.candidate) {
-                    ++g_weapon_up.steady;
-                } else {
-                    g_weapon_up.candidate = best;
-                    g_weapon_up.steady    = 1;
-                }
+                g_weapon_up.steady    = best == g_weapon_up.candidate ? g_weapon_up.steady + 1 : 1;
+                g_weapon_up.candidate = best;
                 if (g_weapon_up.steady >= 90) {
                     g_weapon_up.locked = true;
                     g_weapon_up.up     = best;
-                    spdlog::info("[Body] weapon '{}' axes: barrel ({:.2f},{:.2f},{:.2f}), up ({:.0f},{:.0f},{:.0f}) from the animation (measured ({:.2f},{:.2f},{:.2f}))",
-                        b.weapon_node ? b.weapon_node->name.c_str() : "", forward.x, forward.y, forward.z, best.x, best.y, best.z, measured.x,
-                        measured.y, measured.z);
+                    spdlog::info("[Body] weapon '{}': barrel ({:.2f},{:.2f},{:.2f}), up ({:.0f},{:.0f},{:.0f}) from the animation (measured ({:.2f},{:.2f},{:.2f}))",
+                        g_barrel.model->name.c_str(), forward.x, forward.y, forward.z, best.x, best.y, best.z, measured.x, measured.y, measured.z);
                 }
             }
 
-            struct WeaponPlacement
-            {
-                Xf   weapon;
-                Xf   hand_in_weapon;
-                Xf   support_in_weapon;
-                bool support_held{ false };
-                glm::vec3 forward{};
-            };
+            bool g_support_held{ false };
 
-            // The weapon on the controller: barrel along the aim (measured from the muzzle the game fires from),
-            // its grip (R_HandIk) seated so the palm centre is on the controller's grip point. With
-            // `decide_support` the support grip is taken or released (once per frame); otherwise `support_held` is kept.
-            std::optional<WeaponPlacement> ComputeWeapon(const Pose& pose, bool decide_support, bool support_held)
+            // The weapon on the controller: barrel along the aim (the muzzle the game fires from), its grip (R_HandIk)
+            // seated so the palm centre is on the controller's grip point. Near the left hand the support grip is
+            // taken and the weapon turned about the right grip toward it (ROCK).
+            std::optional<WeaponPlacement> PlaceWeapon(const Pose& pose)
             {
-                auto player = CreationEngineSingletonManager::GetPlayerRef();
-                const auto& b = *g_active_bones;
+                auto        player = CreationEngineSingletonManager::GetPlayerRef();
+                const auto& b      = g_bones;
                 if (!player || !player->IsWeaponDrawn() || b.weapon < 0) {
+                    g_support_held = false;
                     return std::nullopt;
                 }
-                const int r_ik = Index("R_HandIk");
-                const int l_ik = Index("L_HandIk");
+                const int r_ik = BoneIndex("R_HandIk");
+                const int l_ik = BoneIndex("L_HandIk");
                 if (r_ik < 0 || l_ik < 0 || pose.parent[r_ik] != b.weapon || pose.parent[l_ik] != b.weapon) {
-                    g_stage_diag.note = "hand IK targets missing or not under the weapon bone";
+                    g_diag.note = "hand IK targets missing or not under the weapon bone";
                     return std::nullopt;
                 }
-                if (!g_barrel.has_relation || g_barrel.weapon != b.weapon_node || !b.right.shape.valid || !g_weapon_up.locked ||
-                    g_weapon_up.weapon != b.weapon_node) {
-                    g_stage_diag.note = "waiting for the muzzle, hand and weapon-up measurements";
+                if (!g_barrel.has_relation || !b.right.shape.valid || !g_weapon_up.locked || g_weapon_up.model != g_barrel.model) {
+                    g_diag.note = "measuring the weapon";
                     return std::nullopt;
                 }
-                const auto grip = HandWorld(tracking::GripPose(false));
-                const auto aim  = HandWorld(tracking::AimPose(false));
+                const auto grip = Grip(false);
+                const auto aim  = Aim(false);
                 if (!grip || !aim) {
                     return std::nullopt;
                 }
+                const auto hand_in_weapon    = FromNi(pose.local[r_ik]);
+                const auto support_in_weapon = FromNi(pose.local[l_ik]);
                 WeaponPlacement p;
-                p.hand_in_weapon    = FromNi(pose.local[r_ik]);
-                p.support_in_weapon = FromNi(pose.local[l_ik]);
-                p.forward           = glm::normalize(g_barrel.shot_in_weapon);
-                const auto up       = glm::normalize(g_weapon_up.up - p.forward * glm::dot(p.forward, g_weapon_up.up));
+                p.forward     = g_barrel.shot_in_weapon;
+                const auto up = glm::normalize(g_weapon_up.up - p.forward * glm::dot(p.forward, g_weapon_up.up));
 
-                auto& weapon = p.weapon;
-                weapon.s     = pose.GameWorld(b.weapon).s;
-                weapon.r     = FrameOf(aim->forward, aim->up) * glm::transpose(FrameOf(p.forward, up));
-                weapon.t     = glm::vec3{ 0.0f };
+                auto& weapon      = p.weapon;
+                weapon.s          = pose.GameWorld(b.weapon).s;
+                weapon.r          = FrameOf(aim->forward, aim->up) * glm::transpose(FrameOf(p.forward, up));
+                weapon.t          = glm::vec3{ 0.0f };
                 const auto& shape = b.right.shape;
-                const auto  wrist = Compose(weapon, p.hand_in_weapon);
+                const auto  wrist = Compose(weapon, hand_in_weapon);
                 weapon.t          = grip->position - (wrist.t + wrist.r * (shape.forward * shape.palm) * wrist.s);
 
-                // Two hands: the support grip is taken near the left hand, the weapon turned about the right grip
-                // toward it (ROCK).
                 const auto& l_shape   = b.left.shape;
-                const auto  left_grip = HandWorld(tracking::GripPose(true));
-                p.support_held        = false;
+                const auto  left_grip = Grip(true);
                 if (GameFlow::gStore.internalSettings.supportHand && l_shape.valid && left_grip) {
-                    const auto  support  = Compose(weapon, p.support_in_weapon);
+                    const auto  support  = Compose(weapon, support_in_weapon);
                     const auto  palm     = support.t + support.r * (l_shape.forward * l_shape.palm) * support.s;
                     const float distance = glm::length(palm - left_grip->position);
-                    if (decide_support) {
-                        static bool held        = false;
-                        held                    = distance < (held ? 0.25f : 0.12f);
-                        support_held            = held;
-                        g_diag.support_distance = distance;
-                    }
-                    if (support_held) {
+                    g_support_held       = distance < (g_support_held ? 0.25f : 0.12f);
+                    ::body::g_diag.support_distance = distance;
+                    if (g_support_held) {
                         const auto pivot = grip->position;
                         const auto turn  = RotationBetween(palm - pivot, left_grip->position - pivot);
                         weapon.r         = turn * weapon.r;
                         weapon.t         = pivot + turn * (weapon.t - pivot);
                     }
-                    p.support_held = support_held;
+                } else {
+                    g_support_held = false;
                 }
+                p.support_held = g_support_held;
+                pose.SetGameWorld(b.weapon, weapon);
                 return p;
             }
 
-            void PlaceWeapon(const Pose& pose)
+            void Run(std::uint8_t* model, Bone32* bones, float* weights, int graph_bones)
             {
-                g_staged_weapon = {};
-                auto player     = CreationEngineSingletonManager::GetPlayerRef();
-                if (player && player->IsWeaponDrawn()) {
-                    MeasureWeaponUp(pose);
-                }
-                const auto p    = ComputeWeapon(pose, true, false);
-                g_weapon_placed = p.has_value();
-                if (!p) {
-                    return;
-                }
-                pose.SetGameWorld((*g_active_bones).weapon, p->weapon);
-                g_staged_weapon.held         = true;
-                g_staged_weapon.weapon       = p->weapon;
-                g_staged_weapon.support_held = p->support_held;
-                g_stage_diag.placed          = true;
-            }
-
-            // When the frame is built: the camera and controllers as they are now. The body moves with the camera
-            // since the graph stage; the weapon is placed again from the controllers.
-            void Refit(Pose& pose, RE::NiTransform& root)
-            {
-                auto world_camera = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
-                if (world_camera && world_camera->parent && g_stage.has_anchor) {
-                    const auto now   = FromNi(world_camera->parent->world);
-                    const auto delta = Compose(now, Inverse(g_stage.anchor));
-                    g_stage_diag.anchor_moved = std::max(g_stage_diag.anchor_moved, glm::length(now.t - g_stage.anchor.t));
-                    Xf moved = Compose(delta, FromNi(root));
-                    ToNi(moved, root);
-                    pose.root = moved;
-                }
-                if (!g_staged_weapon.held) {
-                    return;
-                }
-                const auto p = ComputeWeapon(pose, false, g_staged_weapon.support_held);
-                if (!p) {
-                    g_staged_weapon.held = false;
-                    return;
-                }
-                g_stage_diag.weapon_moved = std::max(g_stage_diag.weapon_moved, glm::length(p->weapon.t - g_staged_weapon.weapon.t));
-                pose.SetGameWorld((*g_active_bones).weapon, p->weapon);
-                g_staged_weapon.weapon = p->weapon;
-                g_barrel.placed        = true;
-                g_barrel.placed_weapon = p->weapon;
-                g_barrel.aim_forward   = glm::normalize(p->weapon.r * p->forward);
-                g_hand_check.placed        = true;
-                g_hand_check.wrist_target  = Compose(p->weapon, p->hand_in_weapon);
-                g_hand_check.weapon_target = p->weapon;
-            }
-
-            // Once per frame, at the first arm IK of the body's graph.
-            void Run(std::uint8_t* model, Bone32* bones, int graph_bones)
-            {
-                g_stage.writes.clear();
-                if (!g_has_root_local || (*g_active_bones).storage != *reinterpret_cast<void**>(model + 0x10)) {
+                if (!g_has_root_local || g_convention == Convention::Failed) {
                     return;
                 }
                 Pose pose = ReadPose(model, &g_root_local);
@@ -2928,13 +1988,16 @@ namespace body
                 }
                 const int offset = *reinterpret_cast<std::uint16_t*>(model + 0x7e);
                 const int count  = std::min({ static_cast<int>(*reinterpret_cast<std::uint16_t*>(model + 0x7a)), graph_bones, pose.count - offset });
+                if (g_bones.storage != *reinterpret_cast<void**>(model + 0x10)) {
+                    return;  // the frame build finds the bones first
+                }
 
                 if (g_convention == Convention::Unknown) {
                     if (!g_samples_pending) {
                         g_samples.clear();
                         for (const char* name : { "COM", "C_Spine", "C_Spine1", "C_Spine2", "C_Chest", "C_Neck", "L_Clavicle", "R_Clavicle",
-                                 "L_Thigh", "R_Thigh", "L_Calf", "R_Calf" }) {
-                            const int m = Index(name);
+                                 "L_Thigh", "R_Thigh", "L_Calf", "R_Calf", "R_Biceps", "L_Biceps", "R_Forearm", "L_Forearm" }) {
+                            const int m = BoneIndex(name);
                             if (m >= offset && m - offset < count) {
                                 g_samples.push_back({ m, bones[m - offset], name });
                             }
@@ -2943,129 +2006,127 @@ namespace body
                     }
                     return;
                 }
-                if (g_convention == Convention::Failed) {
+
+                g_in = PublishedInputs();
+                if (!g_in.valid) {
+                    g_diag.note = "no camera or room rotation captured";
                     return;
                 }
+                ResetTrackingDiag();
 
-                // The model's pose with this frame's graph values, in the layout the body code works on.
+                // The torso as the arm IK saw it.
+                if (t_torso.generate == t_generate) {
+                    for (const auto& [g, value] : t_torso.bones) {
+                        const auto now    = FromGraph(bones[g]);
+                        const auto before = FromGraph(value);
+                        for (int a = 0; a < 3; ++a) {
+                            g_diag.twist_undone = std::max(g_diag.twist_undone, glm::length(now.r[a] - before.r[a]));
+                        }
+                        bones[g] = value;
+                    }
+                }
+
+                // The model's pose with this evaluation's graph values, in the layout the body code works on.
                 static std::vector<RE::NiTransform> locals;
                 locals.assign(pose.local, pose.local + pose.count);
                 for (int g = 0; g < count; ++g) {
-                    ToNi(FromGraph(bones[g], g_convention), locals[g + offset]);
+                    ToNi(FromGraph(bones[g]), locals[g + offset]);
                 }
                 pose.local = locals.data();
+                WriteLog written;
+                pose.written = &written;
 
-                std::unordered_map<int, WrittenBone> written;
-                auto* const saved_written = g_written_active;
-                g_written_active          = &written;
-                SnapshotTracking();
-                g_stage.root = DecideRoot(pose, g_root_local);
-                if (auto world_camera = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera; world_camera && world_camera->parent) {
-                    g_stage.anchor     = FromNi(world_camera->parent->world);
-                    g_stage.has_anchor = true;
-                } else {
-                    g_stage.has_anchor = false;
+                auto player = CreationEngineSingletonManager::GetPlayerRef();
+                if (player && player->IsWeaponDrawn()) {
+                    MeasureWeaponUp(pose);
                 }
+                Stage stage;
+                stage.root = DecideRoot(pose, g_root_local);
                 ApplyTorsoAndLegs(pose);
-                PlaceWeapon(pose);
-                g_written_active = saved_written;
+                stage.weapon = PlaceWeapon(pose);
 
                 for (const auto& [m, entry] : written) {
                     const int g = m - offset;
                     if (g < 0 || g >= count) {
-                        spdlog::error("[Body] graph stage wrote bone {} outside the graph's pose", m);
+                        spdlog::error("[Body] the animation stage wrote bone {} outside the graph's pose", m);
                         continue;
                     }
-                    g_stage.writes.push_back({ g, m, ToGraph(FromNi(pose.local[m]), g_convention) });
+                    const auto value = ToGraph(FromNi(pose.local[m]));
+                    bones[g]         = value;
+                    weights[g]       = 1.0f;
+                    stage.writes.emplace_back(m, value);
                 }
-                // Graph nodes after the arm IK turn the torso toward the game's aim (C_Chest, the clavicles); the torso
-                // is the player's, so it is put back as the arm IK saw it when the frame is built.
-                g_stage.torso.clear();
-                const auto& b = *g_active_bones;
-                std::vector<int> torso = b.spine;
-                for (const int bone : { b.chest, b.neck, b.right.clavicle, b.left.clavicle, b.pelvis }) {
-                    torso.push_back(bone);
-                }
-                for (const int m : torso) {
-                    if (m >= offset && m - offset < count && std::find_if(g_stage.torso.begin(), g_stage.torso.end(), [m](const Write& w) { return w.model == m; }) == g_stage.torso.end()) {
-                        g_stage.torso.push_back({ m - offset, m, ToGraph(FromNi(pose.local[m]), g_convention) });
-                    }
-                }
-                g_stage.ran = true;
+                stage.input    = g_in;
+                stage.sequence = g_stage.sequence + 1;
+                g_stage        = std::move(stage);
+                g_diag.placed  = g_diag.placed || g_stage.weapon.has_value();
+                ++g_diag.stages;
             }
 
+            // AnimationManager::Generate entry: which model this evaluation is for.
             void OnGenerate(safetyhook::Context& ctx)
             {
                 t_model = *reinterpret_cast<std::uint8_t**>(ctx.rdx + 0x50);
+                ++t_generate;
             }
 
-            // TwoBoneIKNodeInstance::Generate, its input pose fetched and about to solve (0x227e15f).
+            // TwoBoneIKNodeInstance::Generate, its input pose fetched (0x227e15f): the torso before later nodes.
             void OnArmIK(safetyhook::Context& ctx)
             {
                 auto model = t_model;
-                if (!model || model != BodyModel()) {
+                if (!model || t_torso.generate == t_generate || model != BodyModel()) {
                     return;
                 }
-                auto       instance = reinterpret_cast<std::uint8_t*>(ctx.rbx);
-                auto       bones    = reinterpret_cast<Bone32*>(ctx.r8);
-                auto       weights  = *reinterpret_cast<float**>(ctx.r9 + 8);
-                const int  target   = *reinterpret_cast<int*>(instance + 0x3c);
-                const int  offset   = *reinterpret_cast<std::uint16_t*>(model + 0x7e);
-
-                std::lock_guard lock(g_mutex);
-                const auto frame = g_frames.load();
-                if (g_stage.frame != frame) {
-                    g_stage.frame = frame;
-                    g_stage.ran   = false;
-                    Run(model, bones, *reinterpret_cast<int*>(ctx.r9 + 0xcc));
-                }
-                for (const auto& w : g_stage.writes) {
-                    bones[w.graph]   = w.value;
-                    weights[w.graph] = 1.0f;
-                }
-
-                const int r_ik = Index("R_HandIk"), l_ik = Index("L_HandIk");
-                if (target + offset == r_ik) {
-                    ++g_stage_diag.hits_right;
-                } else if (target + offset == l_ik) {
-                    ++g_stage_diag.hits_left;
-                } else {
-                    ++g_stage_diag.hits_other;
-                    g_stage_diag.other_target = target;
-                }
-                if (target + offset == r_ik && (*g_active_bones).weapon >= offset) {
-                    g_stage_diag.target_weight = weights[target];
-                    g_stage_diag.weapon_weight = weights[(*g_active_bones).weapon - offset];
-                    g_stage_diag.blend         = *reinterpret_cast<float*>(instance + 0x44);
+                std::lock_guard lock(g_body_mutex);
+                const int offset = *reinterpret_cast<std::uint16_t*>(model + 0x7e);
+                const int count  = *reinterpret_cast<int*>(ctx.r9 + 0xcc);
+                auto      bones  = reinterpret_cast<const Bone32*>(ctx.r8);
+                t_torso.generate = t_generate;
+                t_torso.bones.clear();
+                for (const int m : TorsoBones()) {
+                    if (m - offset >= 0 && m - offset < count) {
+                        t_torso.bones.emplace_back(m - offset, bones[m - offset]);
+                    }
                 }
             }
 
-            // At UpdateTransforms, before anything is restored or written: the locals are the graph's copy.
+            // AnimationManager::Generate, the final pose about to be copied into the model (0x221ff22).
+            void OnPoseReady(safetyhook::Context& ctx)
+            {
+                auto model = *reinterpret_cast<std::uint8_t**>(ctx.r14 + 0x50);
+                if (!model || model != BodyModel()) {
+                    return;
+                }
+                auto buf = reinterpret_cast<std::uint8_t*>(ctx.r15);
+                std::lock_guard lock(g_body_mutex);
+                Run(model, *reinterpret_cast<Bone32**>(buf), *reinterpret_cast<float**>(buf + 8), *reinterpret_cast<int*>(buf + 0xcc));
+            }
+
+            // At the frame build, before anything is restored or written: the locals are the game's copy of the graph.
             void CheckCopied(const Pose& pose)
             {
-                std::lock_guard lock(g_mutex);
                 if (g_samples_pending) {
                     g_samples_pending = false;
                     int         direct = 0, transposed = 0;
-                    std::string changed;
+                    std::string differ;
                     for (const auto& sample : g_samples) {
                         const auto copied = FromNi(pose.local[sample.model]);
                         auto close = [&](Convention c) {
-                            const auto x = FromGraph(sample.value, c);
-                            float      e = glm::length(x.t - copied.t);
+                            const auto r = glm::mat3_cast(glm::quat{ sample.value.q[0], sample.value.q[1], sample.value.q[2], sample.value.q[3] });
+                            const auto x = c == Convention::Transposed ? glm::transpose(r) : r;
+                            float      e = glm::length(glm::vec3{ sample.value.t[0], sample.value.t[1], sample.value.t[2] } - copied.t);
                             for (int a = 0; a < 3; ++a) {
-                                e = std::max(e, glm::length(x.r[a] - copied.r[a]));
+                                e = std::max(e, glm::length(x[a] - copied.r[a]));
                             }
                             return e < 1e-3f;
                         };
-                        const bool d = close(Convention::Direct), tr = close(Convention::Transposed);
+                        const bool d = close(Convention::Direct), t = close(Convention::Transposed);
                         direct += d ? 1 : 0;
-                        transposed += tr ? 1 : 0;
-                        if (!d && !tr) {
-                            changed += std::string(" ") + sample.name;
+                        transposed += t ? 1 : 0;
+                        if (!d && !t) {
+                            differ += std::string(" ") + sample.name;
                         }
                     }
-                    // Bones that later graph nodes change (foot IK, aiming) match neither; the rest decide.
                     const int n = static_cast<int>(g_samples.size());
                     if (direct >= 3 && direct > transposed * 2) {
                         g_convention = Convention::Direct;
@@ -3074,273 +2135,191 @@ namespace body
                     } else {
                         g_convention = Convention::Failed;
                     }
-                    spdlog::info("[Body] graph pose convention: {} of {} bones match direct, {} transposed -> {} | changed after the arm IK:{}", direct, n,
-                        transposed, g_convention == Convention::Direct ? "direct" : g_convention == Convention::Transposed ? "transposed" : "FAILED", changed);
+                    spdlog::info("[Body] graph pose convention: {} of {} bones match direct, {} transposed -> {} | differing:{}", direct, n, transposed,
+                        g_convention == Convention::Direct ? "direct" : g_convention == Convention::Transposed ? "transposed" : "FAILED", differ);
                     if (g_convention == Convention::Failed) {
-                        spdlog::error("[Body] graph pose does not match the copied locals; the graph stage is disabled");
+                        spdlog::error("[Body] the graph pose does not match the copied locals; the body is not posed");
                     }
                 }
-                if (g_stage.ran && g_stage.frame == g_frames.load()) {
+                if (g_stage.sequence != 0 && g_stage.sequence != g_applied) {
                     float worst = 0.0f;
-                    for (const auto& w : g_stage.writes) {
-                        const auto copied  = FromNi(pose.local[w.model]);
-                        const auto written = FromGraph(w.value, g_convention);
+                    for (const auto& [m, value] : g_stage.writes) {
+                        const auto copied  = FromNi(pose.local[m]);
+                        const auto written = FromGraph(value);
                         worst              = std::max(worst, glm::length(copied.t - written.t));
                         for (int a = 0; a < 3; ++a) {
                             worst = std::max(worst, glm::length(copied.r[a] - written.r[a]));
                         }
                     }
-                    g_stage_diag.copy_error = worst;
-                    float turned = 0.0f;
-                    for (const auto& w : g_stage.torso) {
-                        const auto copied = FromNi(pose.local[w.model]);
-                        const auto staged = FromGraph(w.value, g_convention);
-                        for (int a = 0; a < 3; ++a) {
-                            turned = std::max(turned, glm::length(copied.r[a] - staged.r[a]));
-                        }
-                        ToNi(staged, pose.local[w.model]);
-                    }
-                    g_stage_diag.torso_undone = std::max(g_stage_diag.torso_undone, turned);
+                    g_diag.copy_error = std::max(g_diag.copy_error, worst);
                 }
-            }
-
-            // After UpdateTransforms: where the game's IK put the hands, from the final worlds.
-            void AfterUpdate(const Pose& pose)
-            {
-                const auto& b = *g_active_bones;
-                const int r_ik = Index("R_HandIk"), l_ik = Index("L_HandIk");
-                if (g_staged_weapon.held && r_ik >= 0 && b.right.wrist >= 0 && b.weapon >= 0) {
-                    const auto wrist  = FromNi(pose.world[b.right.wrist]);
-                    const auto target = FromNi(pose.world[r_ik]);
-                    g_stage_diag.hand_to_ik = glm::length(wrist.t - target.t);
-                    const auto d      = glm::transpose(target.r) * wrist.r;
-                    g_stage_diag.hand_to_ik_angle = glm::degrees(std::acos(std::clamp((d[0][0] + d[1][1] + d[2][2] - 1.0f) * 0.5f, -1.0f, 1.0f)));
-                    if (l_ik >= 0 && b.left.wrist >= 0 && g_staged_weapon.support_held) {
-                        g_stage_diag.support_to_ik = glm::length(FromNi(pose.world[b.left.wrist]).t - FromNi(pose.world[l_ik]).t);
-                    }
-                    g_stage_diag.weapon_error = glm::length(FromNi(pose.world[b.weapon]).t - g_staged_weapon.weapon.t);
-                    const auto grip = HandWorld(tracking::GripPose(false));
-                    if (grip && b.right.shape.valid) {
-                        const auto palm = target.t + target.r * (b.right.shape.forward * b.right.shape.palm) * target.s;
-                        g_stage_diag.grip_off_controller = std::max(g_stage_diag.grip_off_controller, glm::length(palm - grip->position));
-                    }
-                }
-                g_frames.fetch_add(1);
             }
 
             void Install()
             {
                 const auto generate = MemoryScan::FuncRelocation(
                     "4C 89 44 24 18 48 89 54 24 10 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 68", 0x221f6e0, 0);
-                const auto ik = MemoryScan::FuncRelocation("48 63 73 3C 4C 8B 9F D8 00 00 00 49", 0x227e15f, 0);
-                g_generate_hook = safetyhook::create_mid(reinterpret_cast<void*>(generate), &OnGenerate);
-                g_ik_hook       = safetyhook::create_mid(reinterpret_cast<void*>(ik), &OnArmIK);
-                spdlog::info("[Body] graph stage hooks: generate {} arm IK {}", static_cast<bool>(g_generate_hook), static_cast<bool>(g_ik_hook));
-            }
-
-            void Log()
-            {
-                std::lock_guard lock(g_mutex);
-                spdlog::info("[Body] graph stage: convention {} | arm IK hits R {} L {} other {} (target {}) | weights target {:.2f} weapon {:.2f} blend {:.2f} | placed {} | copy error {:.4f} | right hand to IK target {:.3f} m {:.1f} deg | support to IK {:.3f} m | weapon off placement {:.3f} m | camera moved since stage {:.3f} m, weapon re-placed by {:.3f} m | grip off controller {:.3f} m | torso turn undone {:.3f} | {}",
-                    static_cast<int>(g_convention), g_stage_diag.hits_right, g_stage_diag.hits_left, g_stage_diag.hits_other, g_stage_diag.other_target, g_stage_diag.target_weight,
-                    g_stage_diag.weapon_weight, g_stage_diag.blend, g_stage_diag.placed, g_stage_diag.copy_error, g_stage_diag.hand_to_ik, g_stage_diag.hand_to_ik_angle, g_stage_diag.support_to_ik,
-                    g_stage_diag.weapon_error, g_stage_diag.anchor_moved, g_stage_diag.weapon_moved, g_stage_diag.grip_off_controller, g_stage_diag.torso_undone, g_stage_diag.note);
-                g_stage_diag = {};
+                const auto arm_ik     = MemoryScan::FuncRelocation("48 63 73 3C 4C 8B 9F D8 00 00 00 49", 0x227e15f, 0);
+                const auto pose_ready = MemoryScan::FuncRelocation("4D 8B 66 50 4D 85 E4 0F 84 6D 0A 00 00 C5 78 2F 86 DC 02 00 00", 0x221ff22, 0);
+                g_generate_hook   = safetyhook::create_mid(reinterpret_cast<void*>(generate), &OnGenerate);
+                g_arm_ik_hook     = safetyhook::create_mid(reinterpret_cast<void*>(arm_ik), &OnArmIK);
+                g_pose_ready_hook = safetyhook::create_mid(reinterpret_cast<void*>(pose_ready), &OnPoseReady);
+                spdlog::info("[Body] animation stage hooks: generate {} arm IK {} pose ready {}", static_cast<bool>(g_generate_hook),
+                    static_cast<bool>(g_arm_ik_hook), static_cast<bool>(g_pose_ready_hook));
             }
         }
 
-        // BSModelNode::UpdateTransforms: pose locals -> worlds -> synced to nodes, skin and geometry.
+        // The frame build's arms: a hand on the weapon goes onto the game's grip target (R_HandIk / L_HandIk, which
+        // the animation moves with the weapon, e.g. during a reload); a free hand follows its controller.
+        void ApplyArms(const Pose& pose, const std::optional<graph_stage::WeaponPlacement>& weapon)
+        {
+            if (g_bones.head >= 0) {
+                pose.local[g_bones.head].scale = 0.0f;
+            }
+            MeasureHand(pose, g_bones.right, "right");
+            MeasureHand(pose, g_bones.left, "left");
+            MeasureElbow(pose, g_bones.right, "right");
+            MeasureElbow(pose, g_bones.left, "left");
+            MeasurePalmSide(pose, 0, g_bones.left.shape, g_bones.left.wrist);
+            MeasurePalmSide(pose, 1, g_bones.right.shape, g_bones.right.wrist);
+
+            auto       player = CreationEngineSingletonManager::GetPlayerRef();
+            const bool drawn  = player && player->IsWeaponDrawn();
+            g_body_muzzle     = drawn && g_bones.weapon_node ? FindDescendant(g_bones.weapon_node, "ProjectileNode") : nullptr;
+            if (weapon) {
+                g_barrel.placed      = true;
+                g_barrel.aim_forward = glm::normalize(weapon->weapon.r * weapon->forward);
+            } else {
+                g_barrel.placed = false;
+            }
+
+            auto target_of = [&](const char* name) -> std::optional<Xf> {
+                const int bone = BoneIndex(name);
+                return bone < 0 ? std::nullopt : std::optional<Xf>{ pose.GameWorld(bone) };
+            };
+            const bool support = weapon && weapon->support_held;
+            g_diag.support_held = support;
+            for (int side = 0; side < 2; ++side) {
+                auto&      arm  = side == 0 ? g_bones.left : g_bones.right;
+                const bool left = side == 0;
+                if (arm.biceps < 0 || arm.forearm < 0 || arm.wrist < 0) {
+                    continue;
+                }
+                float& gap = left ? g_diag.left_gap : g_diag.right_gap;
+                if (weapon && (!left || support)) {
+                    if (const auto target = target_of(left ? "L_HandIk" : "R_HandIk")) {
+                        gap = SolveArm(pose, arm, left, *target, std::nullopt);
+                    }
+                    continue;  // the fingers keep the animation's grip
+                }
+                const auto grip = Grip(left);
+                const auto aim  = Aim(left);
+                if (!arm.shape.valid || !grip || !aim) {
+                    continue;
+                }
+                const auto bend         = TrackedBend(joint::kArmUpper[side], joint::kArmLower[side], joint::kWrist[side]);
+                g_track_diag.elbow[side] = bend.has_value();
+                gap                      = SolveArm(pose, arm, left, WristTarget(pose, arm, *aim, *grip), bend);
+                ApplyFingers(pose, side, arm.wrist);
+            }
+        }
+
+        // After the update, from the final worlds.
+        void CheckHands(const Pose& pose, const std::optional<graph_stage::WeaponPlacement>& weapon, const glm::vec3& shift)
+        {
+            auto&     d    = graph_stage::g_diag;
+            const int r_ik = BoneIndex("R_HandIk");
+            if (!weapon || r_ik < 0 || g_bones.right.wrist < 0 || g_bones.weapon < 0) {
+                return;
+            }
+            const auto wrist  = FromNi(pose.world[g_bones.right.wrist]);
+            const auto target = FromNi(pose.world[r_ik]);
+            d.hand_to_target  = std::max(d.hand_to_target, glm::length(wrist.t - target.t));
+            d.weapon_off      = std::max(d.weapon_off, glm::length(FromNi(pose.world[g_bones.weapon]).t - (weapon->weapon.t + shift)));
+            if (const auto grip = Grip(false); grip && g_bones.right.shape.valid) {
+                const auto palm = target.t + target.r * (g_bones.right.shape.forward * g_bones.right.shape.palm) * target.s;
+                d.grip_off      = std::max(d.grip_off, glm::length(palm - grip->position));
+            }
+        }
+
+        void LogFrame()
+        {
+            static std::chrono::steady_clock::time_point last{};
+            const auto                                   now = std::chrono::steady_clock::now();
+            if (now - last < std::chrono::seconds(1)) {
+                return;
+            }
+            last          = now;
+            auto&       d = graph_stage::g_diag;
+            const char* convention[] = { "unknown", "direct", "transposed", "FAILED" };
+            spdlog::info("[Body] stages {} builds {} reused {} | convention {} copy error {:.4f} | aim twist undone {:.3f} | camera shift {:.3f} m | facing {:.1f} deg lean {:.3f} m walk {} | weapon placed {} support {} ({:.2f} m) | hand to grip target {:.3f} m | grip off controller {:.3f} m | weapon off placement {:.3f} m | {}",
+                d.stages, d.builds, d.reused, convention[static_cast<int>(graph_stage::g_convention)], d.copy_error, d.twist_undone, d.camera_shift,
+                glm::degrees(g_facing_yaw), g_lean_applied, g_walk.state, d.placed, g_diag.support_held, g_diag.support_distance, d.hand_to_target,
+                d.grip_off, d.weapon_off, d.note);
+            spdlog::info("[Body] tracking: body supported {} active {} valid {} | torso {} elbows L {} R {} legs {} | fingers L {} (src {} bend {:.0f}) R {} (src {} bend {:.0f}) | finger input R trig {:.2f} grip {:.2f} thumb {} L trig {:.2f} grip {:.2f} thumb {}",
+                g_track_diag.supported, g_track_diag.active, g_track_diag.valid, g_track_diag.torso, g_track_diag.elbow[0], g_track_diag.elbow[1],
+                g_track_diag.legs, g_track_diag.fingers[0], g_track_diag.hand_source[0], g_track_diag.index_bend[0], g_track_diag.fingers[1],
+                g_track_diag.hand_source[1], g_track_diag.index_bend[1], g_finger_diag[1].trigger, g_finger_diag[1].grip, g_finger_diag[1].thumb,
+                g_finger_diag[0].trigger, g_finger_diag[0].grip, g_finger_diag[0].thumb);
+            d = {};
+        }
+
+        safetyhook::InlineHook g_model_update_hook;
+
+        // BSModelNode::UpdateTransforms: pose locals -> worlds -> synced to nodes, skin and geometry. The frame build.
         void* ModelNodeUpdateTransforms(std::uint8_t* model, const RE::NiTransform* root_local, RE::NiUpdateData* data, void* out)
         {
-            const bool ours = g_state.active && g_calibration.status != Calibration::Status::Failed && g_state.root && root_local &&
-                              model == *reinterpret_cast<std::uint8_t**>(reinterpret_cast<std::uint8_t*>(g_state.root) + kModelNodeOffset);
-            Pose            pose;
-            RE::NiTransform shifted_root{};
-            bool            use_shifted = false;
-            if (ours && !RagdollActive(model)) {
-                pose = ReadPose(model, root_local);
-                if (pose.local) {
-                    const auto storage = *reinterpret_cast<void**>(model + 0x10);
-                    if ((*g_active_bones).storage != storage) {
-                        FindBones(pose, storage);
-                        (*g_written_active).clear();
-                    }
-                    graph_stage::CheckCopied(pose);
-                    RestoreAnimated(pose);
-                    // Both transforms are final from the previous frame here.
-                    MeasureBarrel();
-
-                    const bool staged = graph_stage::Staged();
-                    if (staged) {
-                        shifted_root = graph_stage::g_stage.root;
-                        pose.root    = FromNi(shifted_root);
-                        graph_stage::Refit(pose, shifted_root);
-                    } else {
-                        SnapshotTracking();
-                        shifted_root = DecideRoot(pose, *root_local);
-                    }
-                    use_shifted = true;
-                    if (auto world_camera = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera; world_camera && world_camera->parent) {
-                        tracking::UpdateTrackingScale(world_camera->parent->world.translate.z - root_local->translate.z);
-                    }
-
-                    // Raw arm chain as read before any write, once per second.
-                    static std::chrono::steady_clock::time_point last_dump{};
-                    if (const auto now = std::chrono::steady_clock::now(); (*g_active_bones).r_wrist >= 0 && now - last_dump > std::chrono::seconds(1)) {
-                        last_dump = now;
-                        std::string chain;
-                        int         i = (*g_active_bones).r_wrist;
-                        for (int guard = 0; guard < 16 && i >= 0 && i < pose.count; ++guard) {
-                            const auto& l = pose.local[i];
-                            const auto& w = pose.world[i];
-                            chain += std::format(" [{} p{} lt({:.3f},{:.3f},{:.3f}) ls{:.3f} lr0({:.2f},{:.2f},{:.2f}) wt({:.3f},{:.3f},{:.3f})]", i,
-                                i < pose.top ? -1 : pose.parent[i], l.translate.x, l.translate.y, l.translate.z, l.scale, l.rotate.entry[0].pt[0],
-                                l.rotate.entry[0].pt[1], l.rotate.entry[0].pt[2], w.translate.x, w.translate.y, w.translate.z);
-                            if (i < pose.top) {
-                                break;
-                            }
-                            i = pose.parent[i];
-                        }
-                        spdlog::info("[BodyIK] wrist chain:{}", chain);
-                    }
-                    if (g_calibration.status == Calibration::Status::Ready) {
-                        ApplyIK(pose, staged);
-                    }
-                    graph_stage::NoteRootLocal(*root_local);
-                }
+            if (!root_local || !model || model != BodyModel() || RagdollActive(model)) {
+                return g_model_update_hook.call<void*>(model, root_local, data, out);
             }
-            auto result = g_model_update_hook.call<void*>(model, use_shifted ? &shifted_root : root_local, data, out);
-            if (pose.local) {
-                graph_stage::AfterUpdate(pose);
+            std::unique_lock lock(g_body_mutex);
+            Pose pose = ReadPose(model, root_local);
+            if (!pose.local) {
+                lock.unlock();
+                return g_model_update_hook.call<void*>(model, root_local, data, out);
             }
-            if (pose.local) {
-                // The body's shoulders as rendered this frame (the first-person arms attach there).
-                const auto& b = *g_active_bones;
-                if (b.left.clavicle >= 0 && b.right.clavicle >= 0 && b.neck >= 0 && b.pelvis >= 0) {
-                    g_body_shoulders.left  = FromNi(pose.world[b.left.clavicle]).t;
-                    g_body_shoulders.right = FromNi(pose.world[b.right.clavicle]).t;
-                    g_body_shoulders.up    = glm::normalize(FromNi(pose.world[b.neck]).t - FromNi(pose.world[b.pelvis]).t);
-                    g_body_shoulders.pelvis = FromNi(pose.world[b.pelvis]).t;
-                    g_body_shoulders.chest  = b.chest >= 0 ? FromNi(pose.world[b.chest]).t : (g_body_shoulders.left + g_body_shoulders.right) * 0.5f;
-                    auto forward            = pose.root.r[1];
-                    forward.z               = 0.0f;
-                    if (glm::length(forward) > 1e-3f) {
-                        g_body_shoulders.forward = glm::normalize(forward);
-                    }
-                    g_body_shoulders.valid = true;
-                }
+            if (const auto storage = *reinterpret_cast<void**>(model + 0x10); g_bones.storage != storage) {
+                FindBones(pose, storage);
+                g_written.clear();
+            }
+            graph_stage::CheckCopied(pose);
+            RestoreAnimated(pose);
+            graph_stage::g_root_local     = *root_local;
+            graph_stage::g_has_root_local = true;
+
+            auto& stage = graph_stage::g_stage;
+            if (stage.sequence == 0) {
+                graph_stage::g_diag.note = "waiting for the first animation stage";
+                lock.unlock();
+                return g_model_update_hook.call<void*>(model, root_local, data, out);
+            }
+            auto& d = graph_stage::g_diag;
+            ++d.builds;
+            d.reused += stage.sequence == graph_stage::g_applied ? 1 : 0;
+            graph_stage::g_applied = stage.sequence;
+
+            // The camera may have moved since the inputs were captured; the body and hands move with it.
+            g_in              = stage.input;
+            auto  world_camera = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
+            const glm::vec3 shift = world_camera && world_camera->parent ? ToVec(world_camera->parent->world.translate) - g_in.anchor.t : glm::vec3{ 0.0f };
+            g_in.anchor.t += shift;
+            g_in.eye += shift;
+            d.camera_shift = std::max(d.camera_shift, glm::length(shift));
+            RE::NiTransform root = stage.root;
+            root.translate.x += shift.x;
+            root.translate.y += shift.y;
+            root.translate.z += shift.z;
+            pose.root = FromNi(root);
+            if (world_camera && world_camera->parent) {
+                tracking::UpdateTrackingScale(world_camera->parent->world.translate.z - root_local->translate.z);
             }
 
-            if (pose.local && (*g_active_bones).r_wrist >= 0 && (*g_active_bones).r_wrist_node) {
-                // Exact pose -> world transform from this update: synced node world vs engine pose world.
-                const auto engine_wrist = FromNi(pose.world[(*g_active_bones).r_wrist]);
-                const auto node_wrist   = FromNi((*g_active_bones).r_wrist_node->world);
-                const auto measured     = Compose(node_wrist, Inverse(engine_wrist));
-                // A real bone transform has a proper rotation, unit-ish scale and the wrist within arm's reach of the root.
-                const float det         = glm::determinant(engine_wrist.r);
-                const bool  plausible   = std::abs(det - 1.0f) < 0.05f && engine_wrist.s > 0.5f && engine_wrist.s < 2.0f &&
-                                       glm::length(engine_wrist.t - pose.root.t) > 0.2f && glm::length(engine_wrist.t - pose.root.t) < 3.0f &&
-                                       std::isfinite(measured.t.x) &&
-                                       std::isfinite(measured.t.y) && std::isfinite(measured.t.z);
-
-                if (g_calibration.status == Calibration::Status::Measuring && !plausible) {
-                    ++g_calibration.frames;
-                    if (g_calibration.frames % 30 == 1) {
-                        spdlog::info("[BodyIK] calibration frame {}: wrist pose data implausible (det {:.3f} scale {:.3f} t ({:.3f},{:.3f},{:.3f}))",
-                            g_calibration.frames, det, engine_wrist.s, engine_wrist.t.x, engine_wrist.t.y, engine_wrist.t.z);
-                    }
-                    if (g_calibration.frames > 600) {
-                        g_calibration.status = Calibration::Status::Failed;
-                        spdlog::error("[BodyIK] calibration failed; IK stays off");
-                    }
-                } else if (g_calibration.status == Calibration::Status::Measuring) {
-                    // Nothing was written this frame, so every variant is scored against the engine's own result.
-                    float error[kWorldVariants]{};
-                    for (int variant = 0; variant < kWorldVariants; ++variant) {
-                        error[variant] = variant == 4 && !g_calibration.has_measured
-                                             ? 1e9f
-                                             : glm::length(Compose(ToWorldVariant(variant), engine_wrist).t - node_wrist.t);
-                    }
-                    // Prefer an exact rule; the previous-frame measurement only when no rule fits.
-                    int best = 0;
-                    for (int variant = 1; variant < 4; ++variant) {
-                        if (error[variant] < error[best]) {
-                            best = variant;
-                        }
-                    }
-                    if (error[best] > 0.005f && error[4] < 0.05f) {
-                        best = 4;
-                    }
-                    const bool good = error[best] < (best == 4 ? 0.05f : 0.005f);
-                    g_calibration.good_frames   = good && best == g_calibration.world_variant ? g_calibration.good_frames + 1 : (good ? 1 : 0);
-                    g_calibration.world_variant = best;
-                    ++g_calibration.frames;
-                    if (g_calibration.frames % 30 == 1 || g_calibration.good_frames >= 10) {
-                        const auto root = ToWorldVariant(0);
-                        spdlog::info("[BodyIK] calibration frame {}: errors {:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f} -> {} | measured vs root: "
-                                     "dt ({:.3f},{:.3f},{:.3f}) angle {:.1f} (transposed {:.1f}, identity {:.1f}) scale {:.3f}/{:.3f}",
-                            g_calibration.frames, error[0], error[1], error[2], error[3], error[4], kWorldVariantNames[best], measured.t.x - root.t.x,
-                            measured.t.y - root.t.y, measured.t.z - root.t.z, AngleBetween(measured.r, root.r),
-                            AngleBetween(measured.r, glm::transpose(root.r)), AngleBetween(measured.r, glm::mat3{ 1.0f }), measured.s, root.s);
-                    }
-                    if (g_calibration.good_frames >= 10) {
-                        g_calibration.status = Calibration::Status::Ready;
-                        spdlog::info("[BodyIK] calibrated ({}); IK enabled", kWorldVariantNames[best]);
-                    } else if (g_calibration.frames > 600) {
-                        g_calibration.status = Calibration::Status::Failed;
-                        spdlog::error("[BodyIK] calibration failed; IK stays off");
-                    }
-                }
-                if (plausible) {
-                    g_calibration.measured     = measured;
-                    g_calibration.has_measured = true;
-                }
-            }
-
-            if (pose.local && g_calibration.status == Calibration::Status::Ready && (*g_active_bones).r_wrist >= 0) {
-                const auto mine   = pose.World((*g_active_bones).r_wrist).t;
-                const auto engine = FromNi(pose.world[(*g_active_bones).r_wrist]).t;
-                const float error = glm::length(mine - engine);
-
-
-                static std::chrono::steady_clock::time_point last_log{};
-                const auto                                   now = std::chrono::steady_clock::now();
-                if (now - last_log > std::chrono::seconds(1)) {
-                    last_log          = now;
-                    auto world_camera = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
-                    const auto eye    = world_camera ? ToVec(world_camera->world.translate) : glm::vec3{ 0.0f };
-                    const auto r_sh   = (*g_active_bones).r_biceps >= 0 ? pose.GameWorld((*g_active_bones).r_biceps).t : glm::vec3{ 0.0f };
-                    spdlog::info("[BodyIK] layout error {:.4f} | reach gap R {:.3f} L {:.3f} | weapon aligned {} barrel error {:.2f} deg placement error {:.3f} m | shoulder-eye ({:.2f},{:.2f},{:.2f}) | thread {}",
-                        error, g_diag.right_gap, g_diag.left_gap, g_diag.weapon_aligned, g_barrel.error_deg, g_barrel.placement_error, r_sh.x - eye.x, r_sh.y - eye.y, r_sh.z - eye.z,
-                        GetCurrentThreadId());
-                    spdlog::info("[BodyIK] walk state {} speed {:.2f} m/s | lean {:.3f} m | facing {:.1f} deg | support {} ({:.2f} m) | fingers R trig {:.2f} grip {:.2f} thumb {} copied {} | L trig {:.2f} grip {:.2f} thumb {} copied {}",
-                        g_walk.state, g_walk.speed, g_lean_applied, glm::degrees(g_facing_yaw), g_diag.support_held, g_diag.support_distance, g_finger_diag[1].trigger,
-                        g_finger_diag[1].grip, g_finger_diag[1].thumb, g_finger_diag[1].copied, g_finger_diag[0].trigger, g_finger_diag[0].grip,
-                        g_finger_diag[0].thumb, g_finger_diag[0].copied);
-                    spdlog::info("[BodyIK] tracking: body supported {} active {} valid {} | torso {} elbows L {} R {} legs {} | fingers L {} (src {} bend {:.0f}) R {} (src {} bend {:.0f}) trigger R {:.2f}",
-                        g_track_diag.supported, g_track_diag.active, g_track_diag.valid, g_track_diag.torso, g_track_diag.elbow[0], g_track_diag.elbow[1],
-                        g_track_diag.legs, g_track_diag.fingers[0], g_track_diag.hand_source[0], g_track_diag.index_bend[0], g_track_diag.fingers[1],
-                        g_track_diag.hand_source[1], g_track_diag.index_bend[1], g_finger_diag[1].trigger);
-                    {
-                        graph_stage::Log();
-                        spdlog::info("[Body] hand check: wrist off target {:.3f} m {:.1f} deg | weapon off target {:.3f} m | drawn hand in weapon ({:.3f},{:.3f},{:.3f}) | weapon model '{}' at ({:.3f},{:.3f},{:.3f}) in the weapon bone",
-                            g_hand_check.wrist_error, g_hand_check.wrist_angle, g_hand_check.weapon_error, g_hand_check.drawn_hand_in_weapon.x,
-                            g_hand_check.drawn_hand_in_weapon.y, g_hand_check.drawn_hand_in_weapon.z, g_hand_check.model_name, g_hand_check.model_offset.x,
-                            g_hand_check.model_offset.y, g_hand_check.model_offset.z);
-                    }
-                    spdlog::info("[BodyIK] first-person arms: setting {} root hits {} body active {} shoulders {} | active {} live {} origin ({:.1f},{:.1f},{:.1f}) root ({:.2f},{:.2f},{:.2f}) shoulders apart {:.2f} m {:.0f} deg, branch {}, after {:.3f} m | weapon {} support {}",
-                        GameFlow::gStore.internalSettings.firstPersonArms, g_fp_root_hits.exchange(0), g_state.active, g_body_shoulders.valid,
-                        g_fp_diag.active, FirstPersonArmsLive(), g_fp_diag.origin.x, g_fp_diag.origin.y, g_fp_diag.origin.z, g_fp_diag.root_translate.x,
-                        g_fp_diag.root_translate.y, g_fp_diag.root_translate.z, g_fp_diag.attach_offset, g_fp_diag.attach_angle, g_fp_diag.branch,
-                        g_fp_diag.attach_error, g_fp_diag.weapon,
-                        g_fp_diag.support);
-                    {
-                        auto player = CreationEngineSingletonManager::GetPlayerRef();
-                        spdlog::info("[Weapon] drawn {} | mag {} | slots L {} R {} | aiming {} | last {}", player && player->IsWeaponDrawn(),
-                            static_cast<int>(g_actions.mag), g_actions.slot[0], g_actions.slot[1], g_actions.aiming, g_actions.last);
-                    }
-                }
-            }
+            MeasureBarrel();
+            ApplyArms(pose, stage.weapon);
+            const auto weapon = stage.weapon;
+            auto result = g_model_update_hook.call<void*>(model, &root, data, out);
+            CheckHands(pose, weapon, shift);
+            LogFrame();
             return result;
         }
     }
@@ -3361,13 +2340,19 @@ namespace body
     {
         const auto address = MemoryScan::FuncRelocation("48 8B C4 53 57 41 56 41 57 48 81 EC", 0x2be93f0, 0);
         if (!address) {
-            spdlog::error("[BodyIK] BSModelNode::UpdateTransforms not found");
+            spdlog::error("[Body] BSModelNode::UpdateTransforms not found");
             return;
         }
         g_model_update_hook = safetyhook::create_inline(reinterpret_cast<void*>(address), reinterpret_cast<void*>(&ModelNodeUpdateTransforms));
         third_person_mode::Install();
         graph_stage::Install();
-        spdlog::info("[BodyIK] model node hook: {}", static_cast<bool>(g_model_update_hook));
+        spdlog::info("[Body] model node hook: {}", static_cast<bool>(g_model_update_hook));
+    }
+
+    void OnFrameStart()
+    {
+        CaptureInputs();
+        third_person_mode::Update();
     }
 
     RE::NiAVObject* GetBodyMuzzle()
@@ -3377,43 +2362,13 @@ namespace body
 
     bool GetBodyAimForward(float out[3])
     {
-        if (!g_body_muzzle.load()) {
+        std::lock_guard lock(g_body_mutex);
+        if (!g_body_muzzle.load() || !g_barrel.placed) {
             return false;
         }
         out[0] = g_barrel.aim_forward.x;
         out[1] = g_barrel.aim_forward.y;
         out[2] = g_barrel.aim_forward.z;
         return true;
-    }
-
-    void NotifyPlayerFired()
-    {
-        g_fire_sample = true;
-    }
-}
-
-namespace body
-{
-    bool OnFirstPersonRootUpdated(RE::NiAVObject* root, RE::NiUpdateData* data, int engine_frame)
-    {
-        static int last_frame{ -1 };
-        if (engine_frame == last_frame) {
-            return g_first_person_handled;
-        }
-        last_frame = engine_frame;
-        return HandleFirstPersonRoot(root, data);
-    }
-
-    bool FirstPersonArmsActive()
-    {
-        return g_first_person_handled && FirstPersonArmsLive();
-    }
-}
-
-namespace body
-{
-    void OnFrameStart()
-    {
-        third_person_mode::Update();
     }
 }

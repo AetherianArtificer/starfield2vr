@@ -10,7 +10,6 @@
 #include "ModSettings.h"
 #include "CreationEngine/CreationEngineEntry.h"
 #include "CreationEngine/VROptions.h"
-#include "CreationEngine/input/InputRequests.h"
 #include "CreationEngine/StereoViewModule.h"
 #include "CreationEngine/GameSettingsComponent.h"
 #include "CreationEngine/models/ModSettingsStore.h"
@@ -240,74 +239,66 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
 
         if (is_action_active_any_joystick(m_action_a_button_right)) buttons |= XINPUT_GAMEPAD_A;
         if (is_action_active_any_joystick(m_action_b_button_right)) buttons |= XINPUT_GAMEPAD_B;
-        // X (reload) goes to the mod instead while an interaction owns it.
-        {
-            static bool x_was_down{false};
-            const bool  x_down = is_action_active_any_joystick(m_action_a_button_left);
-            if (x_down && input_requests::Suppressed(input_requests::kX)) {
-                if (!x_was_down) {
-                    input_requests::NoteReloadPress();
-                }
-            } else if (x_down) {
-                buttons |= XINPUT_GAMEPAD_X;
-            }
-            x_was_down = x_down;
-        }
-        const auto modifier_down = is_action_active_any_joystick(m_action_b_button_left);
+        if (is_action_active_any_joystick(m_action_a_button_left))  buttons |= XINPUT_GAMEPAD_X;
 
-        if (is_left_joystick_click_down)  buttons |= XINPUT_GAMEPAD_LEFT_THUMB;
-        if (is_right_joystick_click_down && !modifier_down) buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
-
+        // The grips are the hands' own (grabbing); they send nothing to the game. Y is the modifier (Virtual Desktop
+        // owns a held menu button): a tap sends Y; held with the left stick = D-pad, with the left trigger = LB, with
+        // the right trigger = RB, with the left stick click = flat-screen view, with the right stick click = eye
+        // screenshots. A trigger or stick click keeps the meaning it was pressed with until it is released.
+        const auto modifier_down      = is_action_active_any_joystick(m_action_b_button_left);
         const auto left_trigger_down  = is_action_active(m_action_trigger, left_joystick);
         const auto right_trigger_down = is_action_active(m_action_trigger, right_joystick);
+        const auto now                = clock::now();
+        const auto left_axis          = get_joystick_axis(left_joystick);
 
-        if (left_trigger_down)  pXinputGamepad->bLeftTrigger  = 255;
-        if (right_trigger_down) pXinputGamepad->bRightTrigger = 255;
+        struct Latch
+        {
+            bool down{false};
+            bool modified{false};
+        };
+        static Latch lt, rt, ls, rs;
+        // Returns true on the press.
+        auto track = [&](Latch& latch, bool down) {
+            const bool pressed = down && !latch.down;
+            if (pressed) {
+                latch.modified = modifier_down;
+            }
+            latch.down = down;
+            return pressed;
+        };
+        track(lt, left_trigger_down);
+        track(rt, right_trigger_down);
+        const bool ls_pressed = track(ls, is_left_joystick_click_down);
+        const bool rs_pressed = track(rs, is_right_joystick_click_down);
 
-        const auto now = clock::now();
-        const auto left_axis  = get_joystick_axis(left_joystick);
+        if (lt.down) {
+            if (lt.modified) buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER; else pXinputGamepad->bLeftTrigger = 255;
+        }
+        if (rt.down) {
+            if (rt.modified) buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER; else pXinputGamepad->bRightTrigger = 255;
+        }
+        if (ls.down && !ls.modified) buttons |= XINPUT_GAMEPAD_LEFT_THUMB;
+        if (rs.down && !rs.modified) buttons |= XINPUT_GAMEPAD_RIGHT_THUMB;
+        if (ls_pressed && ls.modified) {
+            auto& flat_screen = ModSettings::g_internalSettings.forceFlatScreen;
+            flat_screen = !flat_screen;
+        }
+        if (rs_pressed && rs.modified) {
+            StereoViewModule::Get()->RequestEyeScreenshots();
+        }
 
-        // The grips are the hands' own (grabbing); they send nothing to the game. Y is the modifier: a tap sends Y;
-        // held with the left stick = D-pad, with the left trigger = LB, with the right trigger = RB, with the left
-        // stick click = flat-screen view, with the right stick click = eye screenshots. (Virtual Desktop owns a held
-        // menu button.)
         static bool              modifier_was_down{false};
         static bool              modifier_used{false};
         static clock::time_point y_pulse_until{};
-
         if (modifier_down) {
-            if (std::abs(left_axis.x) >= kStickDeflection || std::abs(left_axis.y) >= kStickDeflection || is_left_joystick_click_down ||
-                is_right_joystick_click_down || left_trigger_down || right_trigger_down) {
+            const bool stick = std::abs(left_axis.x) >= kStickDeflection || std::abs(left_axis.y) >= kStickDeflection;
+            if (stick || (lt.down && lt.modified) || (rt.down && rt.modified) || (ls.down && ls.modified) || (rs.down && rs.modified)) {
                 modifier_used = true;
             }
             if (left_axis.y >= kStickDeflection)  buttons |= XINPUT_GAMEPAD_DPAD_UP;
             if (left_axis.y <= -kStickDeflection) buttons |= XINPUT_GAMEPAD_DPAD_DOWN;
             if (left_axis.x >= kStickDeflection)  buttons |= XINPUT_GAMEPAD_DPAD_RIGHT;
             if (left_axis.x <= -kStickDeflection) buttons |= XINPUT_GAMEPAD_DPAD_LEFT;
-            if (left_trigger_down) {
-                buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
-                pXinputGamepad->bLeftTrigger = 0;
-            }
-            if (right_trigger_down) {
-                buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
-                pXinputGamepad->bRightTrigger = 0;
-            }
-            if (is_right_joystick_click_down) {
-                static clock::time_point last_screenshot{};
-                if (now - last_screenshot > kMenuHold) {
-                    last_screenshot = now;
-                    StereoViewModule::Get()->RequestEyeScreenshots();
-                }
-            }
-            if (is_left_joystick_click_down) {
-                buttons &= ~XINPUT_GAMEPAD_LEFT_THUMB;
-                static clock::time_point last_flat_toggle{};
-                if (now - last_flat_toggle > kMenuHold) {
-                    last_flat_toggle = now;
-                    auto& flat_screen = ModSettings::g_internalSettings.forceFlatScreen;
-                    flat_screen = !flat_screen;
-                }
-            }
         } else if (modifier_was_down) {
             if (!modifier_used) {
                 y_pulse_until = now + kTapPulse;
@@ -354,12 +345,6 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         if (block_sprint && !modifier_down) {
             buttons &= ~XINPUT_GAMEPAD_LEFT_THUMB;
         }
-
-        // Weapon interactions.
-        if (input_requests::Suppressed(input_requests::kRightShoulder)) buttons &= ~XINPUT_GAMEPAD_RIGHT_SHOULDER;
-        if (input_requests::Requested(input_requests::kX))              buttons |= XINPUT_GAMEPAD_X;
-        if (input_requests::Requested(input_requests::kRightShoulder))  buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
-        if (input_requests::Requested(input_requests::kLeftTrigger))    pXinputGamepad->bLeftTrigger = 255;
         return;
     }
 
