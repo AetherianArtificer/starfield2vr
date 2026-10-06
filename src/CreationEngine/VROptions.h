@@ -58,6 +58,7 @@ public:
         kEyeScreenshots,
         kPipelinedFrames,
         kPerfLogging,
+        kWristCompass,
 
         kFirstId = 8600,
         kLastId  = 8699,

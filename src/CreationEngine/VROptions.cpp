@@ -86,6 +86,8 @@ VROptions::VROptions()
     add(kHudPlacement, kCategoryDisplay, Kind::Choice, "HudPlacement", "HUD Placement",
         "Floating Panel shows the HUD on a panel in front of you that recentres when you turn away. Head Locked keeps it fixed in your view.",
         { "Floating Panel", "Head Locked" }, 0);
+    add(kWristCompass, kCategoryDisplay, Kind::Choice, "WristCompass", "Wrist Compass",
+        "Show the compass on your wrist like a watch. Turn the wrist toward you to read it.", { "Off", "Left Wrist", "Right Wrist" }, 1);
     add(kHudSize, kCategoryDisplay, Kind::Choice, "HudSize", "HUD Size", "Size of the in-game HUD.", { "Small", "Medium", "Large" }, 1);
     add(kHudDepth, kCategoryDisplay, Kind::Choice, "HudDepth", "HUD Depth", "How far away the in-game HUD appears.", { "Near", "Medium", "Far" }, 1);
     add(kMenuDistance, kCategoryDisplay, Kind::Choice, "MenuDistance", "Menu Distance", "How far away full-screen menus appear.",
@@ -227,6 +229,14 @@ void VROptions::apply() const
     constexpr std::array<float, 3> kHudPanelDistances{ 1.2f, 2.0f, 3.0f };
     s.hudPanelDistance = Pick(kHudPanelDistances, get(kHudDepth));
     s.hudPanelWidth    = 2.0f * s.hudPanelDistance * std::tan(glm::radians(Pick(kHudPanelAngles, get(kHudSize))) * 0.5f);
+
+    // The compass dial sits at the bottom left of the HUD image. The floating panel gets the HUD at full size; head
+    // locked, the HUD is scaled about the centre.
+    {
+        const float scale = s.hudPanel ? 1.0f : hud.hudScale;
+        auto        at    = [scale](float v) { return 0.5f + (v - 0.5f) * scale; };
+        VR::get()->set_native_wrist_panel(get(kWristCompass) - 1, at(0.0f), at(0.845f), at(0.16f), at(0.995f), 0.07f);
+    }
 
     ModConstants::headTrackingType = get(kAimWith);
 
