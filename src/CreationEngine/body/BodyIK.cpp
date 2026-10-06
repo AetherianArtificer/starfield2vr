@@ -2733,6 +2733,60 @@ namespace body
                 g_has_root_local = true;
             }
 
+            // The weapon's up in its bone space, from the game's own (upright) hold in the animation: the measured
+            // up snapped to the nearest bone axis across the barrel, kept per weapon once it holds steady.
+            struct WeaponUp
+            {
+                RE::NiAVObject* weapon{ nullptr };
+                glm::vec3       candidate{};
+                int             steady{ 0 };
+                bool            locked{ false };
+                glm::vec3       up{};
+            };
+            WeaponUp g_weapon_up;
+
+            void MeasureWeaponUp(const Pose& pose)
+            {
+                const auto& b = *g_active_bones;
+                if (g_weapon_up.weapon != b.weapon_node) {
+                    g_weapon_up        = {};
+                    g_weapon_up.weapon = b.weapon_node;
+                }
+                if (g_weapon_up.locked || b.weapon < 0 || !g_barrel.has_relation || g_barrel.weapon != b.weapon_node) {
+                    return;
+                }
+                const auto forward  = glm::normalize(g_barrel.shot_in_weapon);
+                const auto measured = glm::transpose(pose.GameWorld(b.weapon).r) * glm::vec3{ 0.0f, 0.0f, 1.0f };
+                glm::vec3  best{};
+                float      best_dot = -2.0f;
+                for (int axis = 0; axis < 3; ++axis) {
+                    for (const float sign : { 1.0f, -1.0f }) {
+                        glm::vec3 v{ 0.0f };
+                        v[axis] = sign;
+                        if (std::abs(glm::dot(v, forward)) > 0.7f) {
+                            continue;
+                        }
+                        if (const float d = glm::dot(v, measured); d > best_dot) {
+                            best_dot = d;
+                            best     = v;
+                        }
+                    }
+                }
+                if (best == g_weapon_up.candidate) {
+                    ++g_weapon_up.steady;
+                } else {
+                    g_weapon_up.candidate = best;
+                    g_weapon_up.steady    = 1;
+                }
+                if (g_weapon_up.steady >= 90) {
+                    g_weapon_up.locked = true;
+                    g_weapon_up.up     = best;
+                    spdlog::info("[Body] weapon '{}' axes: barrel ({:.2f},{:.2f},{:.2f}), up ({:.0f},{:.0f},{:.0f}) from the animation (measured ({:.2f},{:.2f},{:.2f}))",
+                        b.weapon_node ? b.weapon_node->name.c_str() : "", forward.x, forward.y, forward.z, best.x, best.y, best.z, measured.x,
+                        measured.y, measured.z);
+                }
+            }
+
             struct WeaponPlacement
             {
                 Xf   weapon;
@@ -2758,8 +2812,9 @@ namespace body
                     g_stage_diag.note = "hand IK targets missing or not under the weapon bone";
                     return std::nullopt;
                 }
-                if (!g_barrel.has_relation || g_barrel.weapon != b.weapon_node || !b.right.shape.valid) {
-                    g_stage_diag.note = "waiting for the muzzle and hand measurements";
+                if (!g_barrel.has_relation || g_barrel.weapon != b.weapon_node || !b.right.shape.valid || !g_weapon_up.locked ||
+                    g_weapon_up.weapon != b.weapon_node) {
+                    g_stage_diag.note = "waiting for the muzzle, hand and weapon-up measurements";
                     return std::nullopt;
                 }
                 const auto grip = HandWorld(tracking::GripPose(false));
@@ -2771,7 +2826,7 @@ namespace body
                 p.hand_in_weapon    = FromNi(pose.local[r_ik]);
                 p.support_in_weapon = FromNi(pose.local[l_ik]);
                 p.forward           = glm::normalize(g_barrel.shot_in_weapon);
-                const auto up       = glm::normalize(glm::vec3{ 0.0f, 0.0f, 1.0f } - p.forward * p.forward.z);
+                const auto up       = glm::normalize(g_weapon_up.up - p.forward * glm::dot(p.forward, g_weapon_up.up));
 
                 auto& weapon = p.weapon;
                 weapon.s     = pose.GameWorld(b.weapon).s;
@@ -2810,6 +2865,10 @@ namespace body
             void PlaceWeapon(const Pose& pose)
             {
                 g_staged_weapon = {};
+                auto player     = CreationEngineSingletonManager::GetPlayerRef();
+                if (player && player->IsWeaponDrawn()) {
+                    MeasureWeaponUp(pose);
+                }
                 const auto p    = ComputeWeapon(pose, true, false);
                 g_weapon_placed = p.has_value();
                 if (!p) {
