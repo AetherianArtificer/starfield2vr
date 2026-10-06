@@ -84,6 +84,7 @@ private:
     void UpdateMenuFallback(bool stereo);
     void ApplyNativeShadowSettings(bool stereo);
     void DisableFrameGeneration();
+    void HideFloatingMarkers(bool stereo);
     [[nodiscard]] uint32_t SceneOf(void* render_graph_data) const;
 
     void      InstallUpscalerHooks();
@@ -143,6 +144,10 @@ private:
     bool  m_saved_shadow_main_view_lod{ true };
     void* m_frame_generation_setting{ nullptr };
     bool  m_frame_generation_looked_up{ false };
+    void* m_floating_markers_setting{ nullptr };
+    bool  m_floating_markers_looked_up{ false };
+    bool  m_floating_markers_hidden{ false };
+    bool  m_floating_markers_saved{ true };
 
     std::atomic<bool> m_screenshot_requested{ false };
     int               m_screenshot_frames{ 0 };

@@ -416,6 +416,7 @@ void StereoViewModule::OnFrameStart()
     UpdateMenuFallback(stereo);
     KeepEyeViewportsFull();
     ApplyNativeShadowSettings(stereo);
+    HideFloatingMarkers(stereo);
     if (stereo) {
         DisableFrameGeneration();
     }
@@ -882,6 +883,35 @@ void StereoViewModule::CaptureEyeImage(uint32_t eye, int pass_kind, void* render
     };
     command_list->ResourceBarrier(2, restore);
     vr->set_native_eye_source(eye, capture.Get());
+}
+
+void StereoViewModule::HideFloatingMarkers(bool stereo)
+{
+    // Quest markers are drawn flat on the HUD where the target would be on screen, which does not line up with the world
+    // in the headset. The game's own Show Floating Markers option hides them; the compass keeps its markers.
+    if (!m_floating_markers_looked_up) {
+        m_floating_markers_looked_up = true;
+        for (auto type : { CreationEngineSettings::SettingType::kINIPrefSetting, CreationEngineSettings::SettingType::kINISetting }) {
+            if ((m_floating_markers_setting = CreationEngineSettings::get_setting("bShowFloatingQuestMarkers:GamePlay", type)) != nullptr) {
+                break;
+            }
+        }
+        if (m_floating_markers_setting == nullptr) {
+            spdlog::warn("[Stereo] Floating quest marker setting not found");
+        }
+    }
+    auto setting = static_cast<RE::Setting*>(m_floating_markers_setting);
+    if (setting == nullptr || stereo == m_floating_markers_hidden) {
+        return;
+    }
+    if (stereo) {
+        m_floating_markers_saved = setting->GetValue<bool>(true);
+        setting->SetValue<bool>(false);
+    } else {
+        setting->SetValue<bool>(m_floating_markers_saved);
+    }
+    m_floating_markers_hidden = stereo;
+    spdlog::info("[Stereo] Floating quest markers {}", stereo ? "hidden for native stereo" : "restored");
 }
 
 void StereoViewModule::DisableFrameGeneration()
