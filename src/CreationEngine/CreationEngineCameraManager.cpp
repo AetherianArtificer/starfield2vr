@@ -32,10 +32,6 @@
 
 namespace {
     float yaw_offset{0.0f};
-    // The game's camera rotation before the head is added, and whether the player's yaw was turned since: while the
-    // game is paused it keeps reporting the same rotation and does not apply the turn.
-    RE::NiQuaternion last_game_rotation{};
-    bool             turned_since_last{false};
 
 
 }
@@ -396,12 +392,7 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
         const auto aim_quat = glm::normalize(glm::quat_cast(tracking::ToHavokSpace(aim_rotation)));
         const auto ni_aim_rotation = RE::NiQuaternion(aim_quat.w, aim_quat.x, aim_quat.y, aim_quat.z);
         {
-            // A turn applied last frame that the game's rotation does not show yet means the game is paused: turning
-            // again would add the head's yaw every frame.
-            const bool game_waiting = turned_since_last && std::memcmp(quat_out, &last_game_rotation, sizeof(RE::NiQuaternion)) == 0;
-            last_game_rotation      = *quat_out;
-            turned_since_last       = false;
-            if (GameFlow::gStore.internalSettings.pawnControl && !game_waiting) {
+            if (GameFlow::gStore.internalSettings.pawnControl) {
                 yaw -= yaw_offset;
                 havok_rotation.FromEulerAnglesXYZ(pitch, roll, yaw);
 
@@ -414,7 +405,6 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
                 float delta_pitch, delta_yaw, delta_roll;
                 havok_rotation.ToEulerAnglesXYZ(delta_pitch, delta_roll, delta_yaw);
                 yaw_offset += delta_yaw;
-                turned_since_last  = delta_yaw != 0.0f;
                 auto corrected_yaw = p_player->data.angle.z - delta_yaw + 2.0f * glm::pi<float>();
                 corrected_yaw = std::fmod(corrected_yaw, 2.0f * glm::pi<float>());
                 p_player->data.angle.z = corrected_yaw;
