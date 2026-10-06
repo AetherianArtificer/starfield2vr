@@ -293,6 +293,8 @@ namespace body
             std::uint64_t            frame{ 0 };
             Xf                       anchor{};  // camera parent (tracking space origin)
             glm::vec3                eye{};
+            glm::vec3                head_forward{ 0.0f, 1.0f, 0.0f };  // game world
+            glm::vec3                head_up{ 0.0f, 0.0f, 1.0f };
             std::optional<glm::mat3> room;
             glm::mat4                grip_pose[2]{};  // left, right; stage space
             glm::mat4                aim_pose[2]{};
@@ -316,6 +318,9 @@ namespace body
             if (world_camera && world_camera->parent && in.room) {
                 in.anchor = FromNi(world_camera->parent->world);
                 in.eye    = ToVec(world_camera->world.translate);
+                const glm::mat3 head{ tracking::AimRotation() };
+                in.head_forward = *in.room * tracking::ToHavokVector(head * glm::vec3{ 0.0f, 0.0f, -1.0f });
+                in.head_up      = *in.room * tracking::ToHavokVector(head * glm::vec3{ 0.0f, 1.0f, 0.0f });
                 for (int side = 0; side < 2; ++side) {
                     in.grip_pose[side] = tracking::GripPose(side == 0);
                     in.aim_pose[side]  = tracking::AimPose(side == 0);
@@ -1199,48 +1204,64 @@ namespace body
             SolveLeg(pose, r, right, knee_dir[1]);
         }
 
-        // Body yaw toward the hands, after FRIK's getNeckYaw: the torso turns 0.7 of the angle between the head's
-        // facing and the direction between the hands (clamped to 50 degrees), less when a hand is above the head.
-        float g_facing_yaw{ 0.0f };
-
-        float FacingYaw(const Pose& pose, const glm::vec3& eye)
+        float Heading(const glm::vec3& v)
         {
-            const auto left  = Grip(true);
-            const auto right = Grip(false);
-            auto       forward = pose.root.r[1];
-            forward.z          = 0.0f;
-            float      target  = 0.0f;
-            if (left && right && glm::length(forward) > 1e-3f) {
-                forward             = glm::normalize(forward);
-                const auto to_left  = left->position - eye;
-                const auto to_right = right->position - eye;
-                if (glm::length(to_left) > 0.14f && glm::length(to_right) > 0.14f) {
-                    float weight = 1.0f;
-                    if (to_left.z > 0.0f) weight = std::max(weight - 3.5f * to_left.z, 0.0f);
-                    if (to_right.z > 0.0f) weight = std::max(weight - 3.5f * to_right.z, 0.0f);
-                    auto sum = to_left + to_right;
-                    sum.z    = 0.0f;
-                    if (glm::length(sum) > 1e-3f) {
-                        sum               = glm::normalize(sum);
-                        const float angle = std::atan2(forward.x * sum.y - forward.y * sum.x, glm::dot(forward, sum));
-                        target            = std::clamp(angle * weight, glm::radians(-50.0f), glm::radians(50.0f)) * 0.7f;
-                    }
-                }
-            }
-            g_facing_yaw += (target - g_facing_yaw) * 0.25f;
-            return g_facing_yaw;
+            return std::atan2(v.y, v.x);
         }
 
-        // Body yaw from the tracked hips: their forward (from the hip line, or the shoulder line without legs).
-        std::optional<float> TrackedFacingYaw(const Pose& pose)
+        float WrapAngle(float a)
+        {
+            return std::remainder(a, glm::two_pi<float>());
+        }
+
+        glm::vec3 HeadingVector(float heading)
+        {
+            return { std::cos(heading), std::sin(heading), 0.0f };
+        }
+
+        // The head's heading, still defined when looking straight down or up (the head's up then points forward).
+        float HeadHeading()
+        {
+            return Heading(g_in.head_forward - g_in.head_up * g_in.head_forward.z);
+        }
+
+        // Torso heading toward the hands, after FRIK's getNeckYaw: 0.7 of the angle between the head's facing and the
+        // direction between the hands (clamped to 50 degrees), less when a hand is above the head.
+        float HandsHeading(float head, const glm::vec3& eye)
+        {
+            if (!GameFlow::gStore.internalSettings.bodyFacing) {
+                return head;
+            }
+            const auto left  = Grip(true);
+            const auto right = Grip(false);
+            if (!left || !right) {
+                return head;
+            }
+            const auto to_left  = left->position - eye;
+            const auto to_right = right->position - eye;
+            if (glm::length(to_left) < 0.14f || glm::length(to_right) < 0.14f) {
+                return head;
+            }
+            float weight = 1.0f;
+            if (to_left.z > 0.0f) weight = std::max(weight - 3.5f * to_left.z, 0.0f);
+            if (to_right.z > 0.0f) weight = std::max(weight - 3.5f * to_right.z, 0.0f);
+            auto sum = to_left + to_right;
+            sum.z    = 0.0f;
+            if (glm::length(sum) < 1e-3f) {
+                return head;
+            }
+            const float angle = WrapAngle(Heading(sum) - head);
+            return head + std::clamp(angle * weight, glm::radians(-50.0f), glm::radians(50.0f)) * 0.7f;
+        }
+
+        // Torso heading from body tracking: the hip line, or the shoulder line without legs.
+        std::optional<float> TrackedHeading()
         {
             auto side = g_in.body.full_body ? TrackedDirection(joint::kUpperLeg[0], joint::kUpperLeg[1]) : std::nullopt;
             if (!side) {
                 side = TrackedDirection(joint::kArmUpper[0], joint::kArmUpper[1]);
             }
-            auto forward = pose.root.r[1];
-            forward.z    = 0.0f;
-            if (!side || glm::length(forward) < 1e-3f) {
+            if (!side) {
                 return std::nullopt;
             }
             auto tracked = glm::cross(glm::vec3{ 0.0f, 0.0f, 1.0f }, *side);
@@ -1248,15 +1269,32 @@ namespace body
             if (glm::length(tracked) < 1e-3f) {
                 return std::nullopt;
             }
-            forward             = glm::normalize(forward);
-            tracked             = glm::normalize(tracked);
-            const float target  = std::clamp(std::atan2(forward.x * tracked.y - forward.y * tracked.x, glm::dot(forward, tracked)), glm::radians(-50.0f),
-                 glm::radians(50.0f));
-            g_facing_yaw += (target - g_facing_yaw) * 0.25f;
-            return g_facing_yaw;
+            return Heading(tracked);
         }
 
-        // Horizontal offset of the head from the neck that the spine absorbs this frame (the rest moves the body).
+        // The body's own heading and place (VRIK): they persist between frames and move with the room (locomotion,
+        // snap and smooth turns), not with the head. The body turns once the head and hands have turned past a
+        // threshold, and steps under the head once the head has moved past one; until then the spine leans.
+        struct BodyRoot
+        {
+            bool      valid{ false };
+            float     heading{ 0.0f };  // game world
+            glm::vec3 neck{ 0.0f };     // where the neck stands, game world (z unused)
+            float     room_heading{ 0.0f };
+            glm::vec3 anchor{ 0.0f };
+            bool      turning{ false };
+            bool      stepping{ false };
+            std::chrono::steady_clock::time_point last{};
+            // For the log, since the last line.
+            float head_gap{ 0.0f };
+            float actor_gap{ 0.0f };
+            int   turns{ 0 };
+            int   steps{ 0 };
+            int   seats{ 0 };
+        };
+        BodyRoot g_body_root;
+
+        // Horizontal offset of the head from where the body's neck stands, which the spine absorbs this frame.
         glm::vec3 g_lean{ 0.0f };
         float     g_lean_applied{ 0.0f };
 
@@ -1668,51 +1706,115 @@ namespace body
             return pose;
         }
 
-        // Body placed so the neck is under and behind the eyes; sets pose.root and returns the root used.
+        // Body placed from its persistent heading and place; sets pose.root and returns the root used.
         RE::NiTransform DecideRoot(Pose& pose, const RE::NiTransform& root_local)
         {
-            // Horizontal only. Small offsets are taken by the spine (lean); beyond kLeanReach the body follows.
             constexpr float kNeckBehindEyes = 0.12f;
-            constexpr float kLeanReach      = 0.20f;
-            RE::NiTransform shifted_root    = root_local;
-            g_lean                          = glm::vec3{ 0.0f };
-            if (g_in.valid && g_bones.neck >= 0) {
-                const auto eye = g_in.eye;
-                // Torso partly toward the hands (FRIK: 0.7 of the hands' yaw, within 50 degrees).
-                if (GameFlow::gStore.internalSettings.bodyFacing) {
-                    const auto tracked = TrackedFacingYaw(pose);
-                    const auto yaw     = tracked ? *tracked : FacingYaw(pose, eye);
-                    Xf         root = FromNi(shifted_root);
-                    const auto turn = glm::mat3_cast(glm::angleAxis(yaw, glm::vec3{ 0.0f, 0.0f, 1.0f }));
-                    const auto pivot = glm::vec3{ eye.x, eye.y, root.t.z };
-                    root.r          = turn * root.r;
-                    root.t          = pivot + turn * (root.t - pivot);
-                    ToNi(root, shifted_root);
-                    pose.root = root;
+            constexpr float kLeanReach      = 0.20f;  // the spine never leans further; the body is pulled along
+            constexpr float kStepStart      = 0.15f;  // head offset that makes the body step under it
+            constexpr float kStepStop       = 0.03f;
+            const float     kTurnStart      = glm::radians(35.0f);
+            const float     kTurnStop       = glm::radians(5.0f);
+            constexpr float kFollowRate     = 6.0f;  // 1/s, while turning or stepping
+            constexpr float kMovingSpeed    = 0.3f;  // m/s of the room through the world (locomotion)
+
+            g_lean    = glm::vec3{ 0.0f };
+            pose.root = FromNi(root_local);
+            if (!g_in.valid || !g_in.room || g_bones.neck < 0) {
+                return root_local;
+            }
+            auto&       b   = g_body_root;
+            const auto  now = std::chrono::steady_clock::now();
+            const float dt  = b.valid ? std::chrono::duration<float>(now - b.last).count() : 0.0f;
+            b.last          = now;
+
+            const auto  eye          = g_in.eye;
+            const float head         = HeadHeading();
+            const float room_heading = Heading(*g_in.room * glm::vec3{ 0.0f, 1.0f, 0.0f });
+            const auto  tracked      = TrackedHeading();
+            const float wanted       = tracked ? *tracked : HandsHeading(head, eye);
+            const auto  neck_target  = eye - HeadingVector(head) * kNeckBehindEyes;
+
+            // Carried along with the room: locomotion moves the anchor, turning rotates the room about it.
+            float room_speed = 0.0f;
+            if (b.valid) {
+                const auto  moved = g_in.anchor.t - b.anchor;
+                const float turn  = WrapAngle(room_heading - b.room_heading);
+                if (dt > 0.5f || glm::length(glm::vec2{ moved }) > 2.0f) {
+                    b.valid = false;  // load, fast travel or a long pause: stand under the head again
                 } else {
-                    g_facing_yaw = 0.0f;
-                }
-                auto forward = pose.root.r[1];
-                forward.z    = 0.0f;
-                if (glm::length(forward) > 1e-3f) {
-                    forward            = glm::normalize(forward);
-                    const auto neck    = pose.GameWorld(g_bones.neck).t;
-                    auto       delta   = eye - forward * kNeckBehindEyes - neck;
-                    delta.z            = 0.0f;
-                    const float length = glm::length(delta);
-                    if (length < 1.0f) {
-                        auto body = delta;
-                        if (GameFlow::gStore.internalSettings.bodyLean) {
-                            body   = length > kLeanReach ? delta * ((length - kLeanReach) / length) : glm::vec3{ 0.0f };
-                            g_lean = delta - body;
-                        }
-                        shifted_root.translate.x += body.x;
-                        shifted_root.translate.y += body.y;
-                    }
+                    const auto r = glm::mat3_cast(glm::angleAxis(turn, glm::vec3{ 0.0f, 0.0f, 1.0f }));
+                    b.neck       = g_in.anchor.t + r * (b.neck - b.anchor);
+                    b.heading    = WrapAngle(b.heading + turn);
+                    room_speed   = dt > 1e-4f ? glm::length(glm::vec2{ moved }) / dt : 0.0f;
                 }
             }
-            pose.root = FromNi(shifted_root);
-            return shifted_root;
+            if (!b.valid) {
+                b.valid    = true;
+                b.heading  = wanted;
+                b.neck     = neck_target;
+                b.turning  = false;
+                b.stepping = false;
+                ++b.seats;
+            }
+            b.room_heading     = room_heading;
+            b.anchor           = g_in.anchor.t;
+            const float follow = 1.0f - std::exp(-kFollowRate * dt);
+
+            // Heading: tracked hips are followed directly; otherwise turn past the threshold, or always while moving.
+            const float gap = WrapAngle(wanted - b.heading);
+            if (tracked || room_speed > kMovingSpeed) {
+                b.heading = WrapAngle(b.heading + gap * follow);
+            } else {
+                if (!b.turning && std::abs(gap) > kTurnStart) {
+                    b.turning = true;
+                    ++b.turns;
+                }
+                if (b.turning) {
+                    b.heading = WrapAngle(b.heading + gap * follow);
+                    b.turning = std::abs(WrapAngle(wanted - b.heading)) > kTurnStop;
+                }
+            }
+
+            // Place: lean within reach, step under the head past the threshold, and never lean beyond the reach.
+            glm::vec3 offset = neck_target - b.neck;
+            offset.z         = 0.0f;
+            if (!b.stepping && glm::length(offset) > kStepStart) {
+                b.stepping = true;
+                ++b.steps;
+            }
+            if (b.stepping) {
+                b.neck += offset * follow;
+                offset     = neck_target - b.neck;
+                offset.z   = 0.0f;
+                b.stepping = glm::length(offset) > kStepStop;
+            }
+            if (const float length = glm::length(offset); length > kLeanReach) {
+                const auto excess = offset * ((length - kLeanReach) / length);
+                b.neck += excess;
+                offset -= excess;
+            }
+            if (GameFlow::gStore.internalSettings.bodyLean) {
+                g_lean = offset;
+            } else {
+                b.neck += offset;
+            }
+
+            // The actor's root turned onto the body's heading, then moved so the neck stands at b.neck.
+            Xf          root  = pose.root;
+            const float actor = Heading(root.r[1]);
+            root.r            = glm::mat3_cast(glm::angleAxis(WrapAngle(b.heading - actor), glm::vec3{ 0.0f, 0.0f, 1.0f })) * root.r;
+            pose.root         = root;
+            const auto neck   = pose.GameWorld(g_bones.neck).t;
+            root.t.x += b.neck.x - neck.x;
+            root.t.y += b.neck.y - neck.y;
+            pose.root = root;
+
+            b.head_gap  = std::max(b.head_gap, std::abs(WrapAngle(head - b.heading)));
+            b.actor_gap = std::max(b.actor_gap, std::abs(WrapAngle(actor - b.heading)));
+            RE::NiTransform out = root_local;
+            ToNi(root, out);
+            return out;
         }
 
         bool RagdollActive(std::uint8_t* model)
@@ -2262,9 +2364,10 @@ namespace body
             last          = now;
             auto&       d = graph_stage::g_diag;
             const char* convention[] = { "unknown", "direct", "transposed", "FAILED" };
-            spdlog::info("[Body] stages {} builds {} reused {} | convention {} copy error {:.4f} | aim twist undone {:.3f} | camera shift {:.3f} m | facing {:.1f} deg lean {:.3f} m walk {} | weapon placed {} support {} ({:.2f} m) | hand to grip target {:.3f} m | grip off controller {:.3f} m | weapon off placement {:.3f} m | {}",
+            spdlog::info("[Body] stages {} builds {} reused {} | convention {} copy error {:.4f} | aim twist undone {:.3f} | camera shift {:.3f} m | body vs head {:.0f} deg vs actor {:.0f} deg turns {} steps {} seats {} lean {:.3f} m walk {} | weapon placed {} support {} ({:.2f} m) | hand to grip target {:.3f} m | grip off controller {:.3f} m | weapon off placement {:.3f} m | {}",
                 d.stages, d.builds, d.reused, convention[static_cast<int>(graph_stage::g_convention)], d.copy_error, d.twist_undone, d.camera_shift,
-                glm::degrees(g_facing_yaw), g_lean_applied, g_walk.state, d.placed, g_diag.support_held, g_diag.support_distance, d.hand_to_target,
+                glm::degrees(g_body_root.head_gap), glm::degrees(g_body_root.actor_gap), g_body_root.turns, g_body_root.steps, g_body_root.seats,
+                g_lean_applied, g_walk.state, d.placed, g_diag.support_held, g_diag.support_distance, d.hand_to_target,
                 d.grip_off, d.weapon_off, d.note);
             spdlog::info("[Body] tracking: body supported {} active {} valid {} | torso {} elbows L {} R {} legs {} | fingers L {} (src {} bend {:.0f}) R {} (src {} bend {:.0f}) | finger input R trig {:.2f} grip {:.2f} thumb {} L trig {:.2f} grip {:.2f} thumb {}",
                 g_track_diag.supported, g_track_diag.active, g_track_diag.valid, g_track_diag.torso, g_track_diag.elbow[0], g_track_diag.elbow[1],
@@ -2272,6 +2375,8 @@ namespace body
                 g_track_diag.hand_source[1], g_track_diag.index_bend[1], g_finger_diag[1].trigger, g_finger_diag[1].grip, g_finger_diag[1].thumb,
                 g_finger_diag[0].trigger, g_finger_diag[0].grip, g_finger_diag[0].thumb);
             d = {};
+            g_body_root.head_gap = g_body_root.actor_gap = 0.0f;
+            g_body_root.turns = g_body_root.steps = g_body_root.seats = 0;
         }
 
         safetyhook::InlineHook g_model_update_hook;
