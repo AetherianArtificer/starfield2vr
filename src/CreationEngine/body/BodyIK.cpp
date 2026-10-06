@@ -1079,6 +1079,7 @@ namespace body
             std::chrono::steady_clock::time_point last_time{};
         };
         Walk g_walk;
+        bool g_legs_animated{ false };  // for the log: the game's walk animation owned the legs this frame
 
         void UpdateWalk(const glm::vec3& body_pos, const glm::vec3& l_anim, const glm::vec3& r_anim)
         {
@@ -1220,14 +1221,35 @@ namespace body
             if (l.thigh < 0 || l.calf < 0 || l.foot < 0 || r.thigh < 0 || r.calf < 0 || r.foot < 0) {
                 return;
             }
-            UpdateWalk(pose.root.t, left_anim.t, right_anim.t);
+            // Moving through the world (stick locomotion): the game's own walk animation owns the legs, held a moment
+            // after stopping so its stop plays out. Otherwise procedural steps follow the body's moves within the room
+            // (room-scale steps, stepping under the head), measured relative to the room so locomotion never counts.
+            static glm::vec3                             last_anchor{ 0.0f };
+            static std::chrono::steady_clock::time_point last{}, moved{};
+            const auto  now = std::chrono::steady_clock::now();
+            const float dt  = std::chrono::duration<float>(now - last).count();
+            const float speed = dt > 1e-4f && dt < 0.25f ? glm::length(glm::vec2{ g_in.anchor.t - last_anchor }) / dt : 0.0f;
+            last        = now;
+            last_anchor = g_in.anchor.t;
+            if (speed > 0.3f) {
+                moved = now;
+            }
+            const bool locomoting = now - moved < std::chrono::milliseconds(400);
+            g_legs_animated       = locomoting;
+            if (locomoting) {
+                g_walk = {};
+            } else {
+                UpdateWalk(pose.root.t - g_in.anchor.t, left_anim.t, right_anim.t);
+            }
             auto left  = left_anim;
             auto right = right_anim;
             auto forward = pose.root.r[1];
             forward.z    = 0.0f;
             forward      = glm::length(forward) > 1e-3f ? glm::normalize(forward) : glm::vec3{ 0.0f, 1.0f, 0.0f };
             glm::vec3 knee_dir[2] = { forward, forward };
-            if (GameFlow::gStore.internalSettings.walkingLegs && g_walk.state == 1) {
+            if (locomoting) {
+                // the animation's feet
+            } else if (GameFlow::gStore.internalSettings.walkingLegs && g_walk.state == 1) {
                 left.t  = g_walk.l_pos;
                 right.t = g_walk.r_pos;
             } else if (g_in.body.full_body && !PlayerSeated() && g_bones.pelvis >= 0) {
@@ -2614,11 +2636,11 @@ namespace body
             }
             const char* heading_convention[] = { "measuring", "verified", "FAILED" };
             auto        player               = CreationEngineSingletonManager::GetPlayerRef();
-            spdlog::info("[Body] stages {} builds {} reused {} | convention {} copy error {:.4f} | aim twist undone {:.3f} | camera shift {:.3f} m | heading {} (tracked {} untracked {}) body-head {:.0f} deg actor-target {:.1f} deg turns {} | anim yaw blocked {:.1f} deg | mode {} | place steps {} seats {} lean {:.3f} m walk {} | weapon placed {} support {} ({:.2f} m) | hand to grip target {:.3f} m | grip off controller {:.3f} m | weapon off placement {:.3f} m | {}",
+            spdlog::info("[Body] stages {} builds {} reused {} | convention {} copy error {:.4f} | aim twist undone {:.3f} | camera shift {:.3f} m | heading {} (tracked {} untracked {}) body-head {:.0f} deg actor-target {:.1f} deg turns {} | anim yaw blocked {:.1f} deg | mode {} | place steps {} seats {} lean {:.3f} m walk {} legs {} | weapon placed {} support {} ({:.2f} m) | hand to grip target {:.3f} m | grip off controller {:.3f} m | weapon off placement {:.3f} m | {}",
                 d.stages, d.builds, d.reused, convention[static_cast<int>(graph_stage::g_convention)], d.copy_error, d.twist_undone, d.camera_shift,
                 heading_convention[static_cast<int>(heading::g_convention.load())], h.tracked, h.untracked, glm::degrees(h.head_gap),
                 d.actor_target < 0.0f ? -1.0f : glm::degrees(d.actor_target), h.turns, glm::degrees(graph_stage::g_motion_yaw_blocked.exchange(0.0f)),
-                third_person_mode::Active(player), g_place.steps, g_place.seats, g_lean_applied, g_walk.state, d.placed, g_diag.support_held,
+                third_person_mode::Active(player), g_place.steps, g_place.seats, g_lean_applied, g_walk.state, g_legs_animated ? "animation" : "ours", d.placed, g_diag.support_held,
                 g_diag.support_distance, d.hand_to_target, d.grip_off, d.weapon_off, d.note);
             g_place.steps = g_place.seats = 0;
             d.camera_drop = g_camera_drop;
