@@ -1803,6 +1803,7 @@ namespace body
             struct Stage
             {
                 std::uint64_t                       sequence{ 0 };
+                const void*                         storage{ nullptr };  // the skeleton layout the indices refer to
                 RE::NiTransform                     root{};
                 Inputs                              input;
                 std::optional<WeaponPlacement>      weapon;
@@ -1839,6 +1840,7 @@ namespace body
             };
             std::vector<Sample> g_samples;
             bool                g_samples_pending{ false };
+            const void*         g_samples_storage{ nullptr };  // the skeleton layout the samples were taken in
 
             struct Diag
             {
@@ -2003,6 +2005,7 @@ namespace body
                             }
                         }
                         g_samples_pending = !g_samples.empty();
+                        g_samples_storage = g_bones.storage;
                     }
                     return;
                 }
@@ -2057,6 +2060,7 @@ namespace body
                     stage.writes.emplace_back(m, value);
                 }
                 stage.input    = g_in;
+                stage.storage  = g_bones.storage;
                 stage.sequence = g_stage.sequence + 1;
                 g_stage        = std::move(stage);
                 g_diag.placed  = g_diag.placed || g_stage.weapon.has_value();
@@ -2105,7 +2109,9 @@ namespace body
             // At the frame build, before anything is restored or written: the locals are the game's copy of the graph.
             void CheckCopied(const Pose& pose)
             {
-                if (g_samples_pending) {
+                if (g_samples_pending && g_samples_storage != g_bones.storage) {
+                    g_samples_pending = false;  // the skeleton was rebuilt with another layout; sample again
+                } else if (g_samples_pending) {
                     g_samples_pending = false;
                     int         direct = 0, transposed = 0;
                     std::string differ;
@@ -2141,7 +2147,7 @@ namespace body
                         spdlog::error("[Body] the graph pose does not match the copied locals; the body is not posed");
                     }
                 }
-                if (g_stage.sequence != 0 && g_stage.sequence != g_applied) {
+                if (g_stage.sequence != 0 && g_stage.sequence != g_applied && g_stage.storage == g_bones.storage) {
                     float worst = 0.0f;
                     for (const auto& [m, value] : g_stage.writes) {
                         const auto copied  = FromNi(pose.local[m]);
@@ -2288,8 +2294,9 @@ namespace body
             graph_stage::g_has_root_local = true;
 
             auto& stage = graph_stage::g_stage;
-            if (stage.sequence == 0) {
-                graph_stage::g_diag.note = "waiting for the first animation stage";
+            if (stage.sequence == 0 || stage.storage != g_bones.storage) {
+                graph_stage::g_diag.note = "waiting for an animation stage on this skeleton";
+                LogFrame();
                 lock.unlock();
                 return g_model_update_hook.call<void*>(model, root_local, data, out);
             }
