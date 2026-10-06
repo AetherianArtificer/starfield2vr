@@ -1047,8 +1047,24 @@ uintptr_t StereoViewModule::RunLatePass(int pass_kind, void* pass, void* render_
     if (eye >= 0) {
         CaptureEyeImage((uint32_t)eye, pass_kind, render_graph_data, pass_data);
     } else if (m_menu_fallback.load()) {
-        // A fullscreen menu: the main graph renders the menu's scene, before the menu's UI is drawn over it.
-        CaptureEyeImage(kMenuSceneCapture, pass_kind, render_graph_data, pass_data);
+        // A fullscreen menu: the main view's graph renders the menu's scene, before the menu's UI is drawn over it.
+        // Some menus render 3D content of their own in another graph, which is left out of this capture.
+        auto       root  = CreationEngineSingletonManager::GetSceneGraphRoot();
+        const auto scene = SceneOf(render_graph_data) & 0xFFFFFF;
+        if (root != nullptr && scene == (At<uint32_t>(root, kRootMainView) & 0xFFFFFF)) {
+            CaptureEyeImage(kMenuSceneCapture, pass_kind, render_graph_data, pass_data);
+        } else {
+            static std::array<uint32_t, 8> logged{};
+            if (std::find(logged.begin(), logged.end(), scene) == logged.end()) {
+                for (auto& slot : logged) {
+                    if (slot == 0) {
+                        slot = scene;
+                        spdlog::info("[Stereo] A menu frame also renders view {:x} in another graph; it is not captured", scene);
+                        break;
+                    }
+                }
+            }
+        }
     }
     return result;
 }

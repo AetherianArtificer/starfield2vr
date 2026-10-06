@@ -85,6 +85,8 @@ VROptions::VROptions()
     add(kHudPlacement, kCategoryDisplay, Kind::Choice, "HudPlacement", "HUD Placement",
         "Floating Panel shows the HUD on a panel in front of you that recentres when you turn away. Head Locked keeps it fixed in your view.",
         { "Floating Panel", "Head Locked" }, 0);
+    add(kMenuRoom, kCategoryDisplay, Kind::Toggle, "MenuRoom", "Menu Room",
+        "Surround fullscreen menus with a room coloured like the menu, instead of empty space.", on_off, 1);
     add(kWristCompass, kCategoryDisplay, Kind::Choice, "WristHud", "Wrist HUD",
         "Show the compass on one wrist and health and ammo on the other, like watches, instead of on the HUD. Turn a wrist toward you to read it.",
         { "Off", "Compass Left, Health Right", "Compass Right, Health Left" }, 1);
@@ -221,6 +223,7 @@ void VROptions::apply() const
     s.bodyTracking         = get(kBodyTracking) != 0;
     s.hudPanel             = get(kHudPlacement) == 0;
     s.perfLogging          = get(kPerfLogging) != 0;
+    VR::get()->set_menu_room(get(kMenuRoom) != 0);
     VR::get()->set_pipelined_frames(get(kPipelinedFrames) != 0);
 
     auto& hud       = GameFlow::gStore.hudSettings;
