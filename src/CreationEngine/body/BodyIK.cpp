@@ -1867,8 +1867,9 @@ namespace body
                 return torso;
             }
 
-            // The weapon's up in its bone's space, from the game's own upright hold in the animation: the measured up
-            // snapped to the nearest bone axis across the barrel, kept per weapon model once it holds steady.
+            // The weapon's up in its bone's space, from the game's own hold in the animation while it holds the barrel
+            // level (a lowered or raised hold says nothing about up): the measured up snapped to the nearest bone axis
+            // across the barrel, kept per weapon model once it holds steady.
             struct WeaponUp
             {
                 RE::NiAVObject* model{ nullptr };
@@ -1890,6 +1891,9 @@ namespace body
                 }
                 const auto forward  = g_barrel.shot_in_weapon;
                 const auto measured = glm::transpose(pose.GameWorld(g_bones.weapon).r) * glm::vec3{ 0.0f, 0.0f, 1.0f };
+                if (std::abs(glm::dot(forward, measured)) > 0.5f) {
+                    return;  // barrel more than 30 degrees from level
+                }
                 glm::vec3  best{};
                 float      best_dot = -2.0f;
                 for (int axis = 0; axis < 3; ++axis) {
