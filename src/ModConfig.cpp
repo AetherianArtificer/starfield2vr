@@ -14,6 +14,7 @@
 #include "CreationEngine/GameSettingsComponent.h"
 #include "CreationEngine/models/ModSettingsStore.h"
 #include "CreationEngine/models/GameFlow.h"
+#include "CreationEngine/body/BodyIK.h"
 
 namespace ModSettings {
     // HudScale g_hudScale;
@@ -172,6 +173,12 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             };
             const float delta = yaw_of(get_transform(get_left_controller_index())) - yaw_of(get_transform(0));
             const float c = std::cos(delta), s = std::sin(delta);
+            axis = Vector2f{ axis.x * c + axis.y * s, -axis.x * s + axis.y * c };
+        }
+        // The game moves the actor relative to its heading; while the body owns that heading the stick stays
+        // relative to the head (clockwise turn from the body to the head).
+        if (const auto turn = body::LocomotionTurn()) {
+            const float c = std::cos(*turn), s = std::sin(*turn);
             axis = Vector2f{ axis.x * c + axis.y * s, -axis.x * s + axis.y * c };
         }
 

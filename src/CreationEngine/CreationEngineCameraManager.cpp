@@ -336,10 +336,22 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
         // order of extraction Pitch->Yaw->Roll (Havok X->Z->Y)
         auto p_player = CreationEngineSingletonManager::GetPlayerRef();
 
+        // Where each change of the actor's yaw came from, logged once a second: ours, snap turns, and the rest (the
+        // game: stick turning, scripts, anything else).
+        static float last_angle_z{ 0.0f };
+        static bool  has_last{ false };
+        static float yaw_ours{ 0.0f }, yaw_snap{ 0.0f }, yaw_other{ 0.0f };
+        static std::chrono::steady_clock::time_point last_log{};
+        const auto wrap = [](float a) { return std::remainder(a, 2.0f * glm::pi<float>()); };
+        if (p_player && has_last) {
+            yaw_other += std::abs(wrap(p_player->data.angle.z - last_angle_z));
+        }
+
         if (p_player) {
             if (const float snap = GameFlow::pendingSnapYaw.exchange(0.0f); snap != 0.0f) {
                 const float two_pi = 2.0f * glm::pi<float>();
                 p_player->data.angle.z = std::fmod(p_player->data.angle.z + snap + two_pi, two_pi);
+                yaw_snap += std::abs(snap);
                 spdlog::info("[SnapTurn] Applied {:.0f} degrees on engine frame {}", glm::degrees(snap), vr->m_engine_frame_count);
             }
         }
@@ -360,18 +372,41 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
                 yaw -= yaw_offset;
                 havok_rotation.FromEulerAnglesXYZ(pitch, roll, yaw);
 
-                auto new_quat = RE::NiQuaternion(havok_rotation);
+                // yaw_offset is the actor's yaw in the room. Each step turns the actor and the offset together, so the
+                // room, and the view, stay where they are; turns made elsewhere (snap, stick) are kept.
+                float delta_yaw = 0.0f;
+                if (const auto body_in_room = body::BodyHeadingInRoom()) {
+                    // The shown body owns the actor's heading.
+                    delta_yaw = wrap(*body_in_room - yaw_offset);
+                    yaw_ours += std::abs(delta_yaw);
+                } else {
+                    auto new_quat = RE::NiQuaternion(havok_rotation);
 
-                new_quat = new_quat * ni_hmd_rotation;
+                    new_quat = new_quat * ni_hmd_rotation;
 
-                auto delta = quat_out->InvertVector() * new_quat;
-                delta.ToMatrix(havok_rotation);
-                float delta_pitch, delta_yaw, delta_roll;
-                havok_rotation.ToEulerAnglesXYZ(delta_pitch, delta_roll, delta_yaw);
-                yaw_offset += delta_yaw;
+                    auto delta = quat_out->InvertVector() * new_quat;
+                    delta.ToMatrix(havok_rotation);
+                    float delta_pitch, delta_roll;
+                    havok_rotation.ToEulerAnglesXYZ(delta_pitch, delta_roll, delta_yaw);
+                    havok_rotation.FromEulerAnglesXYZ(pitch, roll, yaw);
+                }
+                yaw_offset = wrap(yaw_offset + delta_yaw);
                 auto corrected_yaw = p_player->data.angle.z - delta_yaw + 2.0f * glm::pi<float>();
                 corrected_yaw = std::fmod(corrected_yaw, 2.0f * glm::pi<float>());
                 p_player->data.angle.z = corrected_yaw;
+                body::ObserveHeadYaw(yaw_offset);
+            }
+            if (p_player) {
+                last_angle_z = p_player->data.angle.z;
+                has_last     = true;
+                if (const auto now = std::chrono::steady_clock::now(); now - last_log >= std::chrono::seconds(1)) {
+                    last_log = now;
+                    if (yaw_ours + yaw_snap + yaw_other > 0.0f) {
+                        spdlog::info("[Heading] actor yaw turned by: body {:.1f} deg, snap {:.1f} deg, game {:.1f} deg", glm::degrees(yaw_ours),
+                            glm::degrees(yaw_snap), glm::degrees(yaw_other));
+                    }
+                    yaw_ours = yaw_snap = yaw_other = 0.0f;
+                }
             }
             if (GameFlow::gStore.internalSettings.decoupledPitch && !((ModConstants::headTrackingType == 0 && GameFlow::isAimingDownSights()) || ModConstants::headTrackingType == 2)) {
                 pitch = 0.0f;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 namespace RE
 {
     class NiAVObject;
@@ -18,4 +20,15 @@ namespace body
     RE::NiAVObject* GetBodyMuzzle();
     // Aim direction (game world) the held weapon was posed along this frame, if any.
     bool GetBodyAimForward(float out[3]);
+
+    // While the body is shown it owns the actor's heading (radians, counter-clockwise, game world).
+    std::optional<float> ActorHeadingTarget();
+    // The same, relative to the room: what the camera's yaw offset (the actor's yaw in the room) should be.
+    std::optional<float> BodyHeadingInRoom();
+    // Before the body owns the heading: the camera's yaw offset, which then follows the head, to verify it against
+    // the body's head heading.
+    void ObserveHeadYaw(float yaw_offset);
+    // While the body owns the actor's heading: the body's heading minus the head's (radians, counter-clockwise), to
+    // keep stick movement relative to the head.
+    std::optional<float> LocomotionTurn();
 }
