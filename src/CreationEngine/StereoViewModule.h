@@ -145,8 +145,10 @@ private:
     std::atomic<bool> m_menu_fallback{ false };
 
     // Per eye, one capture texture for each output size the post chain writes.
-    std::array<D3D12_RESOURCE_DESC, 2>                                 m_eye_output_desc{};
-    std::array<std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>, 2> m_eye_capture{};
+    // Captures per eye, and a third for the menu's scene while a fullscreen menu shows.
+    static constexpr uint32_t kMenuSceneCapture = 2;
+    std::array<D3D12_RESOURCE_DESC, 3>                                 m_eye_output_desc{};
+    std::array<std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>, 3> m_eye_capture{};
     Microsoft::WRL::ComPtr<ID3D12Resource>                             m_ui_capture{};
 
     bool  m_shadow_settings_applied{ false };

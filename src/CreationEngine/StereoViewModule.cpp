@@ -866,11 +866,11 @@ void StereoViewModule::CaptureEyeImage(uint32_t eye, int pass_kind, void* render
         const CD3DX12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
         auto device = g_framework->get_d3d12_hook()->get_device();
         if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &capture_desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&capture)))) {
-            spdlog::error("[Stereo] Failed to create the {} eye capture texture", eye == 0 ? "left" : "right");
+            spdlog::error("[Stereo] Failed to create the {} capture texture", eye == 0 ? "left eye" : eye == 1 ? "right eye" : "menu scene");
             return;
         }
-        capture->SetName(eye == 0 ? L"Native stereo left eye capture" : L"Native stereo right eye capture");
-        spdlog::info("[Stereo] {} eye image {}x{} format {}", eye == 0 ? "Left" : "Right", desc.Width, desc.Height, (uint32_t)desc.Format);
+        capture->SetName(eye == 0 ? L"Native stereo left eye capture" : eye == 1 ? L"Native stereo right eye capture" : L"Menu scene capture");
+        spdlog::info("[Stereo] {} image {}x{} format {}", eye == 0 ? "Left eye" : eye == 1 ? "Right eye" : "Menu scene", desc.Width, desc.Height, (uint32_t)desc.Format);
         m_eye_capture[eye].push_back(capture);
     }
 
@@ -887,7 +887,11 @@ void StereoViewModule::CaptureEyeImage(uint32_t eye, int pass_kind, void* render
         CD3DX12_RESOURCE_BARRIER::Transition(capture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
     };
     command_list->ResourceBarrier(2, restore);
-    vr->set_native_eye_source(eye, capture.Get());
+    if (eye == kMenuSceneCapture) {
+        vr->set_native_menu_scene(capture.Get());
+    } else {
+        vr->set_native_eye_source(eye, capture.Get());
+    }
 }
 
 void StereoViewModule::Override(SettingOverride& o, bool apply)
@@ -1042,6 +1046,9 @@ uintptr_t StereoViewModule::RunLatePass(int pass_kind, void* pass, void* render_
     const int eye = EyeOfGraph(render_graph_data);
     if (eye >= 0) {
         CaptureEyeImage((uint32_t)eye, pass_kind, render_graph_data, pass_data);
+    } else if (m_menu_fallback.load()) {
+        // A fullscreen menu: the main graph renders the menu's scene, before the menu's UI is drawn over it.
+        CaptureEyeImage(kMenuSceneCapture, pass_kind, render_graph_data, pass_data);
     }
     return result;
 }
