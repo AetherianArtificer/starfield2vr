@@ -84,7 +84,17 @@ private:
     void UpdateMenuFallback(bool stereo);
     void ApplyNativeShadowSettings(bool stereo);
     void DisableFrameGeneration();
-    void HideFloatingMarkers(bool stereo);
+    // A boolean game setting held at a value while `apply` is true, and given back its own value after.
+    struct SettingOverride
+    {
+        const char* name;
+        bool        value;
+        void*       setting{ nullptr };
+        bool        looked_up{ false };
+        bool        applied{ false };
+        bool        saved{ false };
+    };
+    void Override(SettingOverride& o, bool apply);
     [[nodiscard]] uint32_t SceneOf(void* render_graph_data) const;
 
     void      InstallUpscalerHooks();
@@ -144,10 +154,8 @@ private:
     bool  m_saved_shadow_main_view_lod{ true };
     void* m_frame_generation_setting{ nullptr };
     bool  m_frame_generation_looked_up{ false };
-    void* m_floating_markers_setting{ nullptr };
-    bool  m_floating_markers_looked_up{ false };
-    bool  m_floating_markers_hidden{ false };
-    bool  m_floating_markers_saved{ true };
+    SettingOverride m_floating_markers{ "bShowFloatingQuestMarkers:GamePlay", false };
+    SettingOverride m_crosshair{ "bCrosshairEnabled:GamePlay", false };
 
     std::atomic<bool> m_screenshot_requested{ false };
     int               m_screenshot_frames{ 0 };

@@ -1,6 +1,7 @@
 #include "StereoViewModule.h"
 
 #include "CreationEngineRendererModule.h"
+#include "CreationEngineConstants.h"
 #include "CreationEngineSettings.h"
 #include "CreationEngineSingletonManager.h"
 #include "PerfStats.h"
@@ -416,7 +417,11 @@ void StereoViewModule::OnFrameStart()
     UpdateMenuFallback(stereo);
     KeepEyeViewportsFull();
     ApplyNativeShadowSettings(stereo);
-    HideFloatingMarkers(stereo);
+    // Floating quest markers sit flat on the HUD where the target would be on screen, which does not line up with the
+    // world; the compass keeps its markers. The crosshair marks the screen centre, which is where shots go only when
+    // the head aims.
+    Override(m_floating_markers, stereo);
+    Override(m_crosshair, stereo && (ModConstants::headTrackingType == 1 || ModConstants::headTrackingType == ModConstants::kAimWithRightHand));
     if (stereo) {
         DisableFrameGeneration();
     }
@@ -885,33 +890,31 @@ void StereoViewModule::CaptureEyeImage(uint32_t eye, int pass_kind, void* render
     vr->set_native_eye_source(eye, capture.Get());
 }
 
-void StereoViewModule::HideFloatingMarkers(bool stereo)
+void StereoViewModule::Override(SettingOverride& o, bool apply)
 {
-    // Quest markers are drawn flat on the HUD where the target would be on screen, which does not line up with the world
-    // in the headset. The game's own Show Floating Markers option hides them; the compass keeps its markers.
-    if (!m_floating_markers_looked_up) {
-        m_floating_markers_looked_up = true;
+    if (!o.looked_up) {
+        o.looked_up = true;
         for (auto type : { CreationEngineSettings::SettingType::kINIPrefSetting, CreationEngineSettings::SettingType::kINISetting }) {
-            if ((m_floating_markers_setting = CreationEngineSettings::get_setting("bShowFloatingQuestMarkers:GamePlay", type)) != nullptr) {
+            if ((o.setting = CreationEngineSettings::get_setting(o.name, type)) != nullptr) {
                 break;
             }
         }
-        if (m_floating_markers_setting == nullptr) {
-            spdlog::warn("[Stereo] Floating quest marker setting not found");
+        if (o.setting == nullptr) {
+            spdlog::warn("[Stereo] Setting {} not found", o.name);
         }
     }
-    auto setting = static_cast<RE::Setting*>(m_floating_markers_setting);
-    if (setting == nullptr || stereo == m_floating_markers_hidden) {
+    auto setting = static_cast<RE::Setting*>(o.setting);
+    if (setting == nullptr || apply == o.applied) {
         return;
     }
-    if (stereo) {
-        m_floating_markers_saved = setting->GetValue<bool>(true);
-        setting->SetValue<bool>(false);
+    if (apply) {
+        o.saved = setting->GetValue<bool>(o.value);
+        setting->SetValue<bool>(o.value);
     } else {
-        setting->SetValue<bool>(m_floating_markers_saved);
+        setting->SetValue<bool>(o.saved);
     }
-    m_floating_markers_hidden = stereo;
-    spdlog::info("[Stereo] Floating quest markers {}", stereo ? "hidden for native stereo" : "restored");
+    o.applied = apply;
+    spdlog::info("[Stereo] {} {}", o.name, apply ? (o.value ? "on for VR" : "off for VR") : "restored");
 }
 
 void StereoViewModule::DisableFrameGeneration()
