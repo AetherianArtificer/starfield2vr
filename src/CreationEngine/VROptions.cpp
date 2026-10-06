@@ -239,6 +239,10 @@ void VROptions::apply() const
         const int   wrist = get(kWristCompass);
         const int   compass_hand = wrist == 1 ? 0 : wrist == 2 ? 1 : -1;
         const int   health_hand  = compass_hand < 0 ? -1 : 1 - compass_hand;
+        // The crosshair marks the screen centre, which is where shots go only when the head aims.
+        const int  aim_with      = get(kAimWith);
+        const bool hide_reticle  = aim_with == 1 || aim_with == ModConstants::kAimWithRightHand;
+        VR::get()->set_native_hud_cuts({ hide_reticle ? std::array<float, 4>{ at(0.485f), at(0.485f), at(0.515f), at(0.515f) } : std::array<float, 4>{}, std::array<float, 4>{} });
         VR::get()->set_native_wrist_panels({ VR::WristPanel{ compass_hand, { at(0.0f), at(0.845f), at(0.16f), at(0.995f) }, 0.07f },
                                              VR::WristPanel{ health_hand, { at(0.80f), at(0.895f), at(0.995f), at(0.99f) }, 0.09f } });
     }
