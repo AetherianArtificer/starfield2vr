@@ -462,12 +462,12 @@ void StereoViewModule::OnFrameStart()
     m_missed_appends = m_appended.exchange(false) ? 0 : m_missed_appends + 1;
     vr->set_native_mono_frame(m_menu_fallback.load() || m_missed_appends > 1);
 
-    // A fullscreen menu's UI layer, scene and finished image are saved a moment after it opens, for the first few
-    // menus of a session.
+    // While a fullscreen menu shows, its UI layer, scene and finished image are saved every few seconds, a few times
+    // a session.
     static int menu_frames = 0;
     static int menus_saved = 0;
     menu_frames = m_menu_fallback.load() ? menu_frames + 1 : 0;
-    if (menu_frames == 90 && menus_saved < 5) {
+    if (menu_frames > 0 && menu_frames % 300 == 90 && menus_saved < 8) {
         ++menus_saved;
         const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         vr->request_menu_dump(Framework::get_persistent_dir(std::format("vr_menu_{}.png", stamp)).wstring());
