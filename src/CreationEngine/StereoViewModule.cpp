@@ -1,9 +1,11 @@
 #include "StereoViewModule.h"
 
 #include "CreationEngineRendererModule.h"
+#include "CreationEngineConstants.h"
 #include "CreationEngineSettings.h"
 #include "CreationEngineSingletonManager.h"
 #include "PerfStats.h"
+#include "RenderPassProfiler.h"
 #include "ModSettings.h"
 #include <CreationEngine/memory/offsets.h>
 #include <CreationEngine/memory/stereo_offsets.h>
@@ -60,25 +62,6 @@ namespace
     constexpr size_t kCameraViewport      = 0x1E4;
     constexpr size_t kCameraScissors      = 0x1F4;
     constexpr size_t kPassCameraView      = 0x24;
-
-    // A pass's command list for timing; null when the pass has none, instead of faulting.
-    uintptr_t CommandListContextGuarded(void* render_graph_data)
-    {
-        __try {
-            return static_cast<RE::CreationRendererPrivate::RenderGraphData*>(render_graph_data)->getCommandList();
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            return 0;
-        }
-    }
-
-    ID3D12GraphicsCommandList* TimingCommandList(void* render_graph_data)
-    {
-        if (render_graph_data == nullptr) {
-            return nullptr;
-        }
-        auto context = reinterpret_cast<RE::RenderGraphDataD3D12Context*>(CommandListContextGuarded(render_graph_data));
-        return context ? context->pID3D12CommandList : nullptr;
-    }
 
     template <class T>
     T& At(void* base, size_t offset)
@@ -346,6 +329,12 @@ void StereoViewModule::InstallHooks()
     m_submit_graph_hook->create();
     InstallUpscalerHooks();
     InstallLatePassHooks();
+    if (auto setup = offsets::SetupSceneView()) {
+        m_setup_view_hook = std::make_unique<FunctionHook>(setup, reinterpret_cast<uintptr_t>(&onSetupSceneView));
+        m_setup_view_hook->create();
+    } else {
+        spdlog::error("[Stereo] Scene view setup not found; the right eye's DLSS gets the left eye's constants");
+    }
     if (auto vtable = reinterpret_cast<uintptr_t*>(
             MemoryScan::VTable("ScaleformCompositeRenderPass", ".?AVScaleformCompositeRenderPass@CreationRendererPrivate@@", 0))) {
         m_scaleform_composite_hook = std::make_unique<FunctionHook>(vtable[7], reinterpret_cast<uintptr_t>(&onScaleformComposite));
@@ -407,6 +396,15 @@ void StereoViewModule::OnFrameStart()
 {
     static auto vr = VR::get();
 
+    // Every pass is hooked once the device exists, after this module's own pass hooks.
+    // Detailed profiling hooks every render pass, once the option is on (it is read from the settings after startup).
+    static bool profiler_installed = false;
+    if (!profiler_installed && GameFlow::gStore.internalSettings.perfLogging && g_framework->get_d3d12_hook() &&
+        g_framework->get_d3d12_hook()->get_device()) {
+        profiler_installed = true;
+        RenderPassProfiler::Install();
+    }
+
     // Native presentation runs whenever the headset is active; until both eye views exist both eyes show the frame.
     const bool active = vr->is_hmd_active();
     vr->request_native_stereo(active);
@@ -419,16 +417,17 @@ void StereoViewModule::OnFrameStart()
     UpdateMenuFallback(stereo);
     KeepEyeViewportsFull();
     ApplyNativeShadowSettings(stereo);
+    // Floating quest markers sit flat on the HUD where the target would be on screen, which does not line up with the
+    // world; the compass keeps its markers. The crosshair marks the screen centre, which is where shots go only when
+    // the head aims.
+    Override(m_floating_markers, stereo);
+    Override(m_crosshair, stereo && (ModConstants::headTrackingType == 1 || ModConstants::headTrackingType == ModConstants::kAimWithRightHand));
     if (stereo) {
         DisableFrameGeneration();
     }
     const auto& settings = GameFlow::gStore.internalSettings;
     vr->set_native_hud_panel(stereo && settings.hudPanel, settings.hudPanelWidth, settings.hudPanelDistance);
 
-    if (m_screenshot_requested.exchange(false)) {
-        const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-        vr->request_backbuffer_dump(Framework::get_persistent_dir(std::format("vr_eyes_{}.png", stamp)).wstring());
-    }
 
     if (!stereo) {
         m_missed_appends = 0;
@@ -439,9 +438,42 @@ void StereoViewModule::OnFrameStart()
     MirrorMainView();
     UpdateEyeFrustums();
 
+    // The eyes' separation in the game world against the headset's, now and then.
+    static int separation_frames = 0;
+    if (++separation_frames % 900 == 1 && m_left_camera && m_right_camera) {
+        const auto& l = m_left_camera->world.translate;
+        const auto& r = m_right_camera->world.translate;
+        const float game = std::sqrt((l.x - r.x) * (l.x - r.x) + (l.y - r.y) * (l.y - r.y) + (l.z - r.z) * (l.z - r.z));
+        const auto  hmd_l = vr->get_eye_transform(VRRuntime::Eye::LEFT)[3];
+        const auto  hmd_r = vr->get_eye_transform(VRRuntime::Eye::RIGHT)[3];
+        const float hmd = glm::length(glm::vec3{ hmd_r } - glm::vec3{ hmd_l });
+        spdlog::info("[Stereo] Eye cameras {:.4f} apart in the game world; headset eyes {:.4f} m apart", game, hmd);
+        // Frustum tangents (left, right, top, bottom) each eye renders with, against the headset's.
+        const auto runtime = vr->get_runtime();
+        for (int eye = 0; eye < 2; ++eye) {
+            const auto& f = (eye == 0 ? m_left_camera : m_right_camera)->viewFrustum;
+            const auto& h = runtime->frustums[eye];
+            spdlog::info("[Stereo] {} eye frustum ({:.3f}, {:.3f}, {:.3f}, {:.3f}); headset ({:.3f}, {:.3f}, {:.3f}, {:.3f})", eye == 0 ? "Left" : "Right", f.left, f.right,
+                         f.top, f.bottom, h[0], h[1], h[2], h[3]);
+        }
+    }
+
     // Without a fresh right eye graph this frame (a loading screen, a fullscreen menu) both eyes show the same image.
     m_missed_appends = m_appended.exchange(false) ? 0 : m_missed_appends + 1;
     vr->set_native_mono_frame(m_menu_fallback.load() || m_missed_appends > 1);
+
+    // Requested screenshots are taken after a second of gameplay with both eyes, so a menu is never captured.
+    if (m_screenshot_requested.load()) {
+        const bool gameplay = !m_menu_fallback.load() && m_missed_appends == 0;
+        m_screenshot_frames  = gameplay ? m_screenshot_frames + 1 : 0;
+        if (m_screenshot_frames >= 90) {
+            m_screenshot_requested = false;
+            m_screenshot_frames    = 0;
+            const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            vr->request_backbuffer_dump(Framework::get_persistent_dir(std::format("vr_eyes_{}.png", stamp)).wstring());
+            spdlog::info("[Stereo] Eye screenshots saved");
+        }
+    }
 }
 
 void StereoViewModule::KeepEyeViewportsFull()
@@ -622,16 +654,12 @@ uintptr_t StereoViewModule::RunUpscalerPass(int pass_kind, void* pass, void* ren
     // DLSS keeps the right eye's history in a viewport of its own.
     const auto right_view = m_right_view_id & 0xFFFFFF;
     const bool right      = (At<uint32_t>(pass, kPassCameraView) & 0xFFFFFF) == right_view || (SceneOf(render_graph_data) & 0xFFFFFF) == right_view;
-    auto list = TimingCommandList(render_graph_data);
-    if (pass_kind == kDLSSInputs) {
-        PerfStats::MarkGpu(list, PerfStats::GpuPoint::kEyeUpscaleStart, right ? 1 : 0);
-    }
     UpscalerAfrNvidiaModule::set_secondary_view(right);
+    UpscalerAfrNvidiaModule::set_in_upscaler_pass(true);
     auto result = original(pass, render_graph_data, pass_data);
+    RenderPassProfiler::MarkPass(pass, render_graph_data);
+    UpscalerAfrNvidiaModule::set_in_upscaler_pass(false);
     UpscalerAfrNvidiaModule::set_secondary_view(false);
-    if (pass_kind == kDLSSUpscale) {
-        PerfStats::MarkGpu(list, PerfStats::GpuPoint::kEyeUpscaleEnd, right ? 1 : 0);
-    }
     return result;
 }
 
@@ -657,7 +685,9 @@ uintptr_t StereoViewModule::onScaleformComposite(void* pass, void* render_graph_
     if (vr->is_native_stereo() && pass_data != nullptr) {
         instance->CaptureUiLayer(render_graph_data, pass_data);
     }
-    return original(pass, render_graph_data, pass_data);
+    const auto result = original(pass, render_graph_data, pass_data);
+    RenderPassProfiler::MarkPass(pass, render_graph_data);
+    return result;
 }
 
 bool StereoViewModule::RegisterRightGraph()
@@ -860,6 +890,33 @@ void StereoViewModule::CaptureEyeImage(uint32_t eye, int pass_kind, void* render
     vr->set_native_eye_source(eye, capture.Get());
 }
 
+void StereoViewModule::Override(SettingOverride& o, bool apply)
+{
+    if (!o.looked_up) {
+        o.looked_up = true;
+        for (auto type : { CreationEngineSettings::SettingType::kINIPrefSetting, CreationEngineSettings::SettingType::kINISetting }) {
+            if ((o.setting = CreationEngineSettings::get_setting(o.name, type)) != nullptr) {
+                break;
+            }
+        }
+        if (o.setting == nullptr) {
+            spdlog::warn("[Stereo] Setting {} not found", o.name);
+        }
+    }
+    auto setting = static_cast<RE::Setting*>(o.setting);
+    if (setting == nullptr || apply == o.applied) {
+        return;
+    }
+    if (apply) {
+        o.saved = setting->GetValue<bool>(o.value);
+        setting->SetValue<bool>(o.value);
+    } else {
+        setting->SetValue<bool>(o.saved);
+    }
+    o.applied = apply;
+    spdlog::info("[Stereo] {} {}", o.name, apply ? (o.value ? "on for VR" : "off for VR") : "restored");
+}
+
 void StereoViewModule::DisableFrameGeneration()
 {
     // Generated frames are interpolated from consecutive presented images, which in native stereo hold the eyes in turn.
@@ -978,14 +1035,13 @@ uintptr_t StereoViewModule::RunLatePass(int pass_kind, void* pass, void* render_
     static auto vr       = VR::get();
 
     const auto result = original(pass, render_graph_data, pass_data);
+    RenderPassProfiler::MarkPass(pass, render_graph_data);
     if (!vr->is_native_stereo() || pass_data == nullptr) {
         return result;
     }
     const int eye = EyeOfGraph(render_graph_data);
     if (eye >= 0) {
         CaptureEyeImage((uint32_t)eye, pass_kind, render_graph_data, pass_data);
-        // The last post effect of the eye's chain overwrites this point, so it ends up marking the chain's end.
-        PerfStats::MarkGpu(TimingCommandList(render_graph_data), PerfStats::GpuPoint::kEyePostEnd, eye);
     }
     return result;
 }
@@ -1005,3 +1061,22 @@ int StereoViewModule::EyeOfGraph(void* render_graph_data) const
     return -1;
 }
 
+
+uintptr_t StereoViewModule::onSetupSceneView(uintptr_t a1, uintptr_t view, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8)
+{
+    static auto instance = Get();
+    using func_t         = uintptr_t(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+    static auto original = instance->m_setup_view_hook->get_original<func_t>();
+    static auto vr       = VR::get();
+
+    // The view's DLSS constants are sent from here, outside the DLSS passes: the right eye's go to its own viewport.
+    const bool right = vr->is_native_stereo() && instance->m_registered && view != 0 &&
+                       (At<uint32_t>(reinterpret_cast<void*>(view), 0x24) & 0xFFFFFF) == (instance->m_right_view_id & 0xFFFFFF);
+    if (!right) {
+        return original(a1, view, a3, a4, a5, a6, a7, a8);
+    }
+    UpscalerAfrNvidiaModule::set_secondary_view(true);
+    const auto result = original(a1, view, a3, a4, a5, a6, a7, a8);
+    UpscalerAfrNvidiaModule::set_secondary_view(false);
+    return result;
+}

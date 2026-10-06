@@ -2,8 +2,7 @@
 
 #include <cstdint>
 
-// Periodic frame-time summary in vr_log.txt: present intervals, CPU stage times from the game's Reflex markers, and
-// GPU times from timestamps written inside render passes.
+// Periodic frame-time summary in vr_log.txt: present intervals and CPU stage times from the game's Reflex markers.
 namespace PerfStats
 {
     void OnPresent();
@@ -12,13 +11,14 @@ namespace PerfStats
     // 5 present end) for an engine frame.
     void OnReflexMarker(uint32_t marker, uint32_t frame);
 
-    // Points in each eye's GPU work, recorded inside the DLSS and post effect passes, whose command lists are recording.
-    // The right eye's graph is submitted first, so its DLSS inputs open each frame.
-    enum class GpuPoint
+    // CPU work the mod adds to each frame, timed where it runs.
+    enum class CpuSpan
     {
-        kEyeUpscaleStart, // the eye's DLSS inputs, before they run
-        kEyeUpscaleEnd,   // the eye's DLSS upscale, after it runs
-        kEyePostEnd,      // the eye's last post effect, after it runs
+        kVrWait,    // waiting for the previous frame's present
+        kVrSync,    // headset frame sync and pose update
+        kModFrame,  // per-frame stereo, camera and aim work
+        kBodyIk,    // the player body's IK in its model update
     };
-    void MarkGpu(void* command_list, GpuPoint point, int eye);
+    void AddCpu(CpuSpan span, double ms);
+
 }

@@ -3,6 +3,7 @@
 //
 
 #include "PerfStats.h"
+#include <chrono>
 #include "CreationEngineRendererModule.h"
 #include "CreationEngineCameraManager.h"
 #include "CreationEngineConstants.h"
@@ -205,14 +206,25 @@ uintptr_t CreationEngineRendererModule::setReflexMarkerInternal(uintptr_t rcx, u
     if ((marker == 6 || marker == 0 || marker == 1) && !engine_notified) {
         engine_notified = true;
         instance->SetWindowSize(0,0);
+        using clock = std::chrono::steady_clock;
+        auto since  = [](clock::time_point from) { return std::chrono::duration<double, std::milli>(clock::now() - from).count(); };
+        auto start  = clock::now();
         vr->on_wait_rendering(oldFrameIndex);
+        PerfStats::AddCpu(PerfStats::CpuSpan::kVrWait, since(start));
         vr->m_engine_frame_count = oldFrameIndex;
+        // One menu decision per frame: the render thread updates its flag while the game thread runs ahead.
+        ModSettings::g_internalSettings.showQuadDisplayFrame = ModSettings::g_internalSettings.showQuadDisplay;
+        vr->set_frame_flat(ModSettings::showFlatScreenDisplay());
+        start = clock::now();
         vr->on_begin_rendering(oldFrameIndex);
         vr->update_hmd_state(oldFrameIndex);
+        PerfStats::AddCpu(PerfStats::CpuSpan::kVrSync, since(start));
         g_framework->run_imgui_frame(false);
+        start = clock::now();
         StereoViewModule::Get()->OnFrameStart();
         CreationEngineCameraManager::SnapshotAimPose();
         cameraModule->UpdateWorldCamera();
+        PerfStats::AddCpu(PerfStats::CpuSpan::kModFrame, since(start));
     }
     // Reset notification if marker is 1
     if (marker == 1) {
@@ -221,6 +233,7 @@ uintptr_t CreationEngineRendererModule::setReflexMarkerInternal(uintptr_t rcx, u
 
     if (marker == 2) {
         vr->m_render_frame_count = oldFrameIndex;
+        vr->on_render_start(oldFrameIndex);
     }
 
     if (marker == 4) {

@@ -156,6 +156,13 @@ namespace Steam::MemoryOffsets::Stereo
     }
 
     // Queues a render graph submission record for this frame.
+    // Per-view scene setup (view description in the second argument, view id at +0x24); sends the view's DLSS constants.
+    inline uintptr_t SetupSceneView()
+    {
+        static auto addr = FuncRelocation("48 89 5C 24 08 48 89 74 24 18 48 89 7C 24 20 48 89 54 24 10 55 41 54 41 55 41 56 41 57 B8 00 6F 01 00", 0x291fa90);
+        return addr;
+    }
+
     inline uintptr_t SubmitRenderGraph()
     {
         static auto addr = FuncRelocation("48 89 5C 24 08 57 48 83 EC 30 48 8B FA 48 8B D9 48 8B 52 70", 0x29123a0);

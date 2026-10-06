@@ -18,6 +18,8 @@ namespace RE
 class StereoViewModule
 {
 public:
+    // The eye whose graph the render graph data belongs to: 0 left, 1 right, -1 neither.
+    [[nodiscard]] int EyeOfGraphPublic(void* render_graph_data) const { return EyeOfGraph(render_graph_data); }
     static StereoViewModule* Get()
     {
         static auto instance(new StereoViewModule);
@@ -82,6 +84,17 @@ private:
     void UpdateMenuFallback(bool stereo);
     void ApplyNativeShadowSettings(bool stereo);
     void DisableFrameGeneration();
+    // A boolean game setting held at a value while `apply` is true, and given back its own value after.
+    struct SettingOverride
+    {
+        const char* name;
+        bool        value;
+        void*       setting{ nullptr };
+        bool        looked_up{ false };
+        bool        applied{ false };
+        bool        saved{ false };
+    };
+    void Override(SettingOverride& o, bool apply);
     [[nodiscard]] uint32_t SceneOf(void* render_graph_data) const;
 
     void      InstallUpscalerHooks();
@@ -96,10 +109,12 @@ private:
     static uintptr_t onSetMultiCameraViewData(void* column, uint32_t graph_index, ViewIdArray* views);
     static uintptr_t onSubmitRenderGraph(void* frame_list, void* record);
     static uintptr_t onScaleformComposite(void* pass, void* render_graph_data, void* pass_data);
+    static uintptr_t onSetupSceneView(uintptr_t a1, uintptr_t view, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8);
 
     std::unique_ptr<FunctionHook> m_set_multi_view_hook{};
     std::unique_ptr<FunctionHook> m_submit_graph_hook{};
     std::unique_ptr<FunctionHook> m_scaleform_composite_hook{};
+    std::unique_ptr<FunctionHook> m_setup_view_hook{};
     std::unique_ptr<FunctionHook> m_upscaler_hooks[kUpscalerPassCount]{};
     std::unique_ptr<FunctionHook> m_late_hooks[kLatePassCount]{};
 
@@ -139,6 +154,9 @@ private:
     bool  m_saved_shadow_main_view_lod{ true };
     void* m_frame_generation_setting{ nullptr };
     bool  m_frame_generation_looked_up{ false };
+    SettingOverride m_floating_markers{ "bShowFloatingQuestMarkers:GamePlay", false };
+    SettingOverride m_crosshair{ "bCrosshairEnabled:GamePlay", false };
 
     std::atomic<bool> m_screenshot_requested{ false };
+    int               m_screenshot_frames{ 0 };
 };

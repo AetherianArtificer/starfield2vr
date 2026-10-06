@@ -76,11 +76,18 @@ VROptions::VROptions()
     add(kRenderResolution, kCategoryDisplay, Kind::Choice, "RenderResolution", "Render Resolution",
         "Resolution rendered for the headset. Lower it if the frame rate drops.",
         { "70%", "80%", "90%", "100%", "110%", "120%", "130%", "150%" }, 3);
+    add(kPipelinedFrames, kCategoryDisplay, Kind::Toggle, "PipelinedFrames", "Overlap Frames",
+        "Let the game prepare the next frame while the current one is still being drawn. Raises the frame rate; turn off if motion looks uneven.", on_off, 1);
+    add(kPerfLogging, kCategoryDisplay, Kind::Toggle, "PerfLogging", "Detailed Performance Logging",
+        "Time every render pass and GPU submission and write the results to vr_log.txt. Costs some performance; takes effect when the game starts.", on_off, 0);
     add(kWorldScale, kCategoryDisplay, Kind::Choice, "WorldScale", "World Scale", "Make the world feel larger or smaller around you.",
         { "90%", "95%", "100%", "105%", "110%" }, 2);
     add(kHudPlacement, kCategoryDisplay, Kind::Choice, "HudPlacement", "HUD Placement",
         "Floating Panel shows the HUD on a panel in front of you that recentres when you turn away. Head Locked keeps it fixed in your view.",
         { "Floating Panel", "Head Locked" }, 0);
+    add(kWristCompass, kCategoryDisplay, Kind::Choice, "WristHud", "Wrist HUD",
+        "Show the compass on one wrist and health and ammo on the other, like watches, instead of on the HUD. Turn a wrist toward you to read it.",
+        { "Off", "Compass Left, Health Right", "Compass Right, Health Left" }, 1);
     add(kHudSize, kCategoryDisplay, Kind::Choice, "HudSize", "HUD Size", "Size of the in-game HUD.", { "Small", "Medium", "Large" }, 1);
     add(kHudDepth, kCategoryDisplay, Kind::Choice, "HudDepth", "HUD Depth", "How far away the in-game HUD appears.", { "Near", "Medium", "Far" }, 1);
     add(kMenuDistance, kCategoryDisplay, Kind::Choice, "MenuDistance", "Menu Distance", "How far away full-screen menus appear.",
@@ -90,7 +97,7 @@ VROptions::VROptions()
         "Reset your view height and direction when a loading screen ends.", on_off, 1);
     add(kRecenterView, kCategoryDisplay, Kind::Action, "", "Recenter View", "Reset your view height and direction now.", {}, 0);
     add(kEyeScreenshots, kCategoryDisplay, Kind::Action, "", "Save Eye Screenshots",
-        "Save the image each eye of the headset receives, as PNG files in the game folder. Useful when reporting a display problem.", {}, 0);
+        "Save the image each eye of the headset receives, as PNG files in the game folder, a second after you are back in the game. Useful when reporting a display problem.", {}, 0);
 
     // VR Controls
     add(kControllerLayout, kCategoryControls, Kind::Choice, "ControllerLayout", "Controller Layout",
@@ -213,6 +220,8 @@ void VROptions::apply() const
     s.walkingLegs          = get(kWalkingLegs) != 0;
     s.bodyTracking         = get(kBodyTracking) != 0;
     s.hudPanel             = get(kHudPlacement) == 0;
+    s.perfLogging          = get(kPerfLogging) != 0;
+    VR::get()->set_pipelined_frames(get(kPipelinedFrames) != 0);
 
     auto& hud       = GameFlow::gStore.hudSettings;
     hud.hudScale    = Pick(kHudSizes, get(kHudSize));
@@ -222,6 +231,18 @@ void VROptions::apply() const
     constexpr std::array<float, 3> kHudPanelDistances{ 1.2f, 2.0f, 3.0f };
     s.hudPanelDistance = Pick(kHudPanelDistances, get(kHudDepth));
     s.hudPanelWidth    = 2.0f * s.hudPanelDistance * std::tan(glm::radians(Pick(kHudPanelAngles, get(kHudSize))) * 0.5f);
+
+    // The compass dial sits at the bottom left of the HUD image, health and ammo at the bottom right. The floating panel
+    // gets the HUD at full size; head locked, the HUD is scaled about the centre.
+    {
+        const float scale = s.hudPanel ? 1.0f : hud.hudScale;
+        auto        at    = [scale](float v) { return 0.5f + (v - 0.5f) * scale; };
+        const int   wrist = get(kWristCompass);
+        const int   compass_hand = wrist == 1 ? 0 : wrist == 2 ? 1 : -1;
+        const int   health_hand  = compass_hand < 0 ? -1 : 1 - compass_hand;
+        VR::get()->set_native_wrist_panels({ VR::WristPanel{ compass_hand, { at(0.0f), at(0.845f), at(0.16f), at(0.995f) }, 0.07f },
+                                             VR::WristPanel{ health_hand, { at(0.80f), at(0.895f), at(0.995f), at(0.99f) }, 0.09f } });
+    }
 
     ModConstants::headTrackingType = get(kAimWith);
 

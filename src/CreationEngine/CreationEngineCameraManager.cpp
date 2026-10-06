@@ -269,7 +269,8 @@ float CreationEngineCameraManager::get_head_tracking_multiplier() const {
 
 void CreationEngineCameraManager::UpdateWorldCamera() {
     static auto vr = VR::get();
-    auto worldCamera = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
+    auto root        = CreationEngineSingletonManager::GetSceneGraphRoot();
+    auto worldCamera = root ? root->worldCamera : nullptr;
 
     if (!worldCamera) {
         return;
@@ -310,15 +311,24 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
         camera->local.translate.z = local[3][2];
     };
 
+    auto left_camera = right_camera ? StereoViewModule::Get()->LeftCamera() : nullptr;
     if (right_camera) {
         place(worldCamera, vr->get_eye_transform(VRRuntime::Eye::LEFT));
         place(right_camera, vr->get_eye_transform(VRRuntime::Eye::RIGHT));
-        if (auto left_camera = StereoViewModule::Get()->LeftCamera()) {
+        if (left_camera) {
             left_camera->local = worldCamera->local;
         }
     } else {
         // Before the eye views exist both eyes show the world camera's view.
         place(worldCamera, vr->get_eye_transform(VRRuntime::Eye::LEFT));
+    }
+
+    // The cameras' world transforms follow at once, as the game skips its scene update while paused.
+    for (auto camera : { worldCamera, right_camera, left_camera }) {
+        if (camera != nullptr && camera->parent != nullptr) {
+            RE::NiUpdateData data{};
+            camera->UpdateWorldData(&data);
+        }
     }
 }
 
@@ -329,8 +339,18 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
     static auto original_func = instance->m_onGetCameraRotationHook->get_original<decltype(onFPSGetCameraRotation)>();
     original_func(fps, quat_out);
     static auto vr = VR::get();
-    if (!vr->is_hmd_active() || ModConstants::cameraShake || ModSettings::showFlatScreenDisplay()) {
+    // The head's share of the player's yaw is kept through menus and pauses, so the view continues where the head
+    // points when they close. A recenter (after a load, or asked for) starts the head's share of the yaw from zero.
+    static uint32_t recenters = vr->get_recenter_count();
+    if (const auto now = vr->get_recenter_count(); now != recenters) {
+        recenters  = now;
         yaw_offset = 0.0f;
+    }
+    if (!vr->is_hmd_active()) {
+        yaw_offset = 0.0f;
+        return;
+    }
+    if (ModConstants::cameraShake || ModSettings::showFlatScreenDisplay()) {
         return;
     }
     if (!GameFlow::isImmovable() && !GameFlow::isControlledByAI()) {
@@ -419,7 +439,6 @@ void CreationEngineCameraManager::onFPSGetCameraRotation(RE::FirstPersonState *f
             tracking::RecordAppliedAim(aim_rotation, vr->m_engine_frame_count);
         }
     } else {
-        yaw_offset = 0.0f;
         GameFlow::pendingSnapYaw.store(0.0f);
     }
 }

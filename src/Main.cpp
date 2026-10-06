@@ -1,3 +1,4 @@
+#include <build_label.h>
 #include "ModConfig.h"
 #include "Framework.hpp"
 #include "dgxiProxy.h"
@@ -23,7 +24,7 @@ bool verifyLeftHandedCoordinates() {
 void InitThread(HINSTANCE hModule) {
     Sleep(5000);
     g_framework = std::make_unique<Framework>(hModule);
-    spdlog::info("SFVR build " __DATE__ " " __TIME__);
+    spdlog::info("SFVR build " SFVR_BUILD_LABEL ", " __DATE__ " " __TIME__);
 #ifdef GLM_FORCE_LEFT_HANDED
     spdlog::info("GLM_FORCE_LEFT_HANDED is defined function={} clip={}", verifyLeftHandedCoordinates(), GLM_CONFIG_CLIP_CONTROL);
     assert(verifyLeftHandedCoordinates());

@@ -61,6 +61,14 @@ file(
 )
 
 add_library(${PROJECT_NAME} SHARED ${headers} ${sources})
+
+# Branch and commit of the build, logged at startup. Rewritten only when they change, so only Main.cpp recompiles.
+execute_process(COMMAND git rev-parse --abbrev-ref HEAD WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                OUTPUT_VARIABLE SFVR_GIT_BRANCH OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+execute_process(COMMAND git describe --always --dirty --abbrev=7 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                OUTPUT_VARIABLE SFVR_GIT_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_label.h.in ${CMAKE_CURRENT_BINARY_DIR}/generated/build_label.h @ONLY)
+target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 #target_compile_definitions(common INTERFACE MOTION_VECTOR_REPROJECTION)
