@@ -333,6 +333,8 @@ namespace body
             float                    floor_eye_height{ -1.0f };
             VR::BodyTrackingState    body;
             VR::HandTrackingState    hands[2];
+            glm::vec3                capture_roots[2]{};  // the last two build roots when this was captured, newest first
+            bool                     has_capture_roots{ false };
         };
         std::mutex         g_inputs_mutex;
         std::atomic<float> g_body_height_fix{ 0.0f };  // metres taken off tracked joints (for the log)
@@ -358,18 +360,27 @@ namespace body
             float     g_var_cur{ 0.0f }, g_var_lag{ 0.0f };
             int       g_samples{ 0 };
 
-            // At a build, before it is recorded: the camera's coming step.
-            glm::vec3 Shift(const glm::vec3& root)
+            // At a build, before it is recorded: how far the camera that will show it is from the camera the inputs were
+            // captured with, from the actor positions each belongs to.
+            glm::vec3 Shift(const glm::vec3& root, const glm::vec3 (&captured)[2], bool has_captured)
             {
                 std::lock_guard lock(g_mutex);
-                if (g_builds < 2) {
+                if (g_builds < 2 || !has_captured) {
                     return glm::vec3{ 0.0f };
                 }
                 switch (g_model.load()) {
-                case Model::Current: return root - g_roots[0];
-                case Model::Lagging: return g_roots[0] - g_roots[1];
+                case Model::Current: return root - captured[0];
+                case Model::Lagging: return g_roots[0] - captured[1];
                 default: return glm::vec3{ 0.0f };
                 }
+            }
+
+            bool Roots(glm::vec3 (&out)[2])
+            {
+                std::lock_guard lock(g_mutex);
+                out[0] = g_roots[0];
+                out[1] = g_roots[1];
+                return g_builds >= 2;
             }
 
             void OnBuild(const glm::vec3& root, const glm::vec3& neck)
@@ -479,6 +490,7 @@ namespace body
                 const auto f = in.head_forward - in.head_up * in.head_forward.z;
                 const auto h = glm::length(glm::vec2{ f }) > 1e-4f ? glm::normalize(glm::vec3{ f.x, f.y, 0.0f }) : glm::vec3{ 0.0f };
                 camera_follow::Observe(in.anchor.t, in.eye - h * 0.12f);
+                in.has_capture_roots = camera_follow::Roots(in.capture_roots);
             }
             std::lock_guard lock(g_inputs_mutex);
             in.frame    = g_published.frame + 1;
@@ -535,6 +547,7 @@ namespace body
             int   hand_source[2]{};
             float index_bend[2]{ -1.0f, -1.0f };
             int   core{ 0 }, hands{ 0 }, legs_valid{ 0 };
+            float torso_tilt{ -1.0f }, torso_turn{ -1.0f };  // degrees: tracked hips-to-neck from vertical, rotation given to the spine
             float wrist_off[2]{ -1.0f, -1.0f };  // tracked wrist joint against the controller's grip
         };
         TrackingDiag g_track_diag;
@@ -608,6 +621,19 @@ namespace body
                 return std::nullopt;  // limb nearly straight; the bend side is not observable
             }
             return StageDirection(bend);
+        }
+
+        // The game's sneak state (ActorState bit 9, as in the Creation Engine's other games). Changes are logged.
+        bool PlayerSneaking()
+        {
+            static bool last{ false };
+            auto        player = CreationEngineSingletonManager::GetPlayerRef();
+            const bool  now    = player && ((player->actorState >> 9) & 1) != 0;
+            if (now != last) {
+                last = now;
+                spdlog::info("[Body] sneak flag {}", now ? "on" : "off");
+            }
+            return now;
         }
 
         bool PlayerSeated()
@@ -1147,16 +1173,17 @@ namespace body
                 r.calf < 0 || r.foot < 0) {
                 return;
             }
-            // The neck sits a fixed distance below the eyes, measured from the game's standing pose (camera highest
-            // above the feet). Real and button crouches then share one rule.
-            static float standing_eye{ 0.0f };
-            static float neck_below_eye{ -1.0f };
-            const float  game_eye   = g_in.anchor.t.z - pose.root.t.z;
-            const float  neck_z     = pose.GameWorld(g_bones.neck).t.z;
-            if (game_eye > standing_eye) {
-                standing_eye = game_eye;
+            // The neck sits a fixed distance below the eyes, learned from the game's eye (the camera's parent) and the
+            // animated neck while the game stands the body (not sneaking). A real crouch, the head below that, lowers
+            // the pelvis; a button crouch lowers the animated neck and the camera together.
+            static float       neck_below_eye{ -1.0f };
+            static const void* storage{ nullptr };
+            if (storage != g_bones.storage) {
+                storage        = g_bones.storage;
+                neck_below_eye = -1.0f;
             }
-            if (game_eye >= standing_eye - 0.02f) {
+            const float neck_z = pose.GameWorld(g_bones.neck).t.z;
+            if (!PlayerSneaking()) {
                 const float measured = g_in.anchor.t.z - neck_z;
                 neck_below_eye       = neck_below_eye < 0.0f ? measured : neck_below_eye + (measured - neck_below_eye) * 0.05f;
             }
@@ -1607,6 +1634,8 @@ namespace body
             const auto side_g = glm::normalize(pose.GameWorld(g_bones.right.biceps).t - pose.GameWorld(g_bones.left.biceps).t);
             auto frame = [](const glm::vec3& up, const glm::vec3& side) { return FrameOf(glm::cross(up, side), up); };
             const auto turn  = glm::quat_cast(frame(*up_t, *side_t) * glm::transpose(frame(up_g, side_g)));
+            g_track_diag.torso_tilt = glm::degrees(std::acos(std::clamp(up_t->z, -1.0f, 1.0f)));
+            g_track_diag.torso_turn = glm::degrees(2.0f * std::acos(std::clamp(std::abs(turn.w), 0.0f, 1.0f)));
             const auto count = static_cast<int>(g_bones.spine.size());
             const auto share = glm::mat3_cast(glm::slerp(glm::quat{ 1.0f, 0.0f, 0.0f, 0.0f }, turn, 1.0f / static_cast<float>(count)));
             for (const int bone : g_bones.spine) {
@@ -2121,8 +2150,8 @@ namespace body
             return it == g_bones.by_name.end() ? -1 : it->second;
         }
 
-        // How far the animated head is below its standing height (button crouch), for the camera. Walk bob stays
-        // below the threshold; the drop is eased in and out.
+        // How far the animated head is below its standing height while the game sneaks, for the camera; eased in
+        // and out.
         std::atomic<float> g_camera_drop{ 0.0f };
 
         void MeasureCameraDrop(const Pose& pose)
@@ -2144,14 +2173,9 @@ namespace body
                 standing = height;
             }
             const float below = standing - height;
-            if (!crouched && below > 0.15f) {
-                crouched = true;
-            } else if (crouched && below < 0.08f) {
-                crouched = false;
-            }
+            crouched          = PlayerSneaking();
             if (!crouched) {
-                standing += (height - standing) * (1.0f - std::exp(-0.5f * dt));  // follows slow changes (scale, gear)
-                standing = std::max(standing, height - 0.05f);
+                standing += (height - standing) * (1.0f - std::exp(-2.0f * dt));
             }
             const float target = crouched ? std::max(below, 0.0f) : 0.0f;
             drop += (target - drop) * (1.0f - std::exp(-8.0f * dt));
@@ -2782,9 +2806,10 @@ namespace body
             spdlog::info("[Body] fingertips to wrist L {:.3f}-{:.3f} R {:.3f}-{:.3f} m | camera drop {:.3f} m | tracked joints lowered by {:.3f} m | R_HandIk vs animated hand {:.1f} deg {:.3f} m",
                 d.finger_min[0], d.finger_max[0], d.finger_min[1], d.finger_max[1], d.camera_drop, g_body_height_fix.load(), d.ik_vs_hand_deg,
                 d.ik_vs_hand_m);
-            spdlog::info("[Body] tracking: body supported {} active {} valid {} (core {}/18 hands {}/52 legs {}/14) | wrist to controller L {:.3f} R {:.3f} m | torso {} elbows L {} R {} legs {} | fingers L {} (src {} bend {:.0f}) R {} (src {} bend {:.0f}) | finger input R trig {:.2f} grip {:.2f} thumb {} L trig {:.2f} grip {:.2f} thumb {}",
+            spdlog::info("[Body] tracking: body supported {} active {} valid {} (core {}/18 hands {}/52 legs {}/14) | wrist to controller L {:.3f} R {:.3f} m | torso {} (tilt {:.0f} deg, spine turned {:.0f} deg) elbows L {} R {} legs {} | fingers L {} (src {} bend {:.0f}) R {} (src {} bend {:.0f}) | finger input R trig {:.2f} grip {:.2f} thumb {} L trig {:.2f} grip {:.2f} thumb {}",
                 g_track_diag.supported, g_track_diag.active, g_track_diag.valid, g_track_diag.core, g_track_diag.hands, g_track_diag.legs_valid,
-                g_track_diag.wrist_off[0], g_track_diag.wrist_off[1], g_track_diag.torso, g_track_diag.elbow[0], g_track_diag.elbow[1],
+                g_track_diag.wrist_off[0], g_track_diag.wrist_off[1], g_track_diag.torso, g_track_diag.torso_tilt, g_track_diag.torso_turn,
+                g_track_diag.elbow[0], g_track_diag.elbow[1],
                 g_track_diag.legs, g_track_diag.fingers[0], g_track_diag.hand_source[0], g_track_diag.index_bend[0], g_track_diag.fingers[1],
                 g_track_diag.hand_source[1], g_track_diag.index_bend[1], g_finger_diag[1].trigger, g_finger_diag[1].grip, g_finger_diag[1].thumb,
                 g_finger_diag[0].trigger, g_finger_diag[0].grip, g_finger_diag[0].thumb);
@@ -2834,7 +2859,7 @@ namespace body
             // the body and hands take it too.
             g_in              = stage.input;
             auto  world_camera = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
-            const glm::vec3 shift = camera_follow::Shift(ToVec(root_local->translate));
+            const glm::vec3 shift = camera_follow::Shift(ToVec(root_local->translate), g_in.capture_roots, g_in.has_capture_roots);
             g_in.anchor.t += shift;
             g_in.eye += shift;
             d.camera_shift = std::max(d.camera_shift, glm::length(shift));
