@@ -86,8 +86,9 @@ VROptions::VROptions()
     add(kHudPlacement, kCategoryDisplay, Kind::Choice, "HudPlacement", "HUD Placement",
         "Floating Panel shows the HUD on a panel in front of you that recentres when you turn away. Head Locked keeps it fixed in your view.",
         { "Floating Panel", "Head Locked" }, 0);
-    add(kWristCompass, kCategoryDisplay, Kind::Choice, "WristCompass", "Wrist Compass",
-        "Show the compass on your wrist like a watch. Turn the wrist toward you to read it.", { "Off", "Left Wrist", "Right Wrist" }, 1);
+    add(kWristCompass, kCategoryDisplay, Kind::Choice, "WristHud", "Wrist HUD",
+        "Show the compass on one wrist and health and ammo on the other, like watches, instead of on the HUD. Turn a wrist toward you to read it.",
+        { "Off", "Compass Left, Health Right", "Compass Right, Health Left" }, 1);
     add(kHudSize, kCategoryDisplay, Kind::Choice, "HudSize", "HUD Size", "Size of the in-game HUD.", { "Small", "Medium", "Large" }, 1);
     add(kHudDepth, kCategoryDisplay, Kind::Choice, "HudDepth", "HUD Depth", "How far away the in-game HUD appears.", { "Near", "Medium", "Far" }, 1);
     add(kMenuDistance, kCategoryDisplay, Kind::Choice, "MenuDistance", "Menu Distance", "How far away full-screen menus appear.",
@@ -230,12 +231,16 @@ void VROptions::apply() const
     s.hudPanelDistance = Pick(kHudPanelDistances, get(kHudDepth));
     s.hudPanelWidth    = 2.0f * s.hudPanelDistance * std::tan(glm::radians(Pick(kHudPanelAngles, get(kHudSize))) * 0.5f);
 
-    // The compass dial sits at the bottom left of the HUD image. The floating panel gets the HUD at full size; head
-    // locked, the HUD is scaled about the centre.
+    // The compass dial sits at the bottom left of the HUD image, health and ammo at the bottom right. The floating panel
+    // gets the HUD at full size; head locked, the HUD is scaled about the centre.
     {
         const float scale = s.hudPanel ? 1.0f : hud.hudScale;
         auto        at    = [scale](float v) { return 0.5f + (v - 0.5f) * scale; };
-        VR::get()->set_native_wrist_panel(get(kWristCompass) - 1, at(0.0f), at(0.845f), at(0.16f), at(0.995f), 0.07f);
+        const int   wrist = get(kWristCompass);
+        const int   compass_hand = wrist == 1 ? 0 : wrist == 2 ? 1 : -1;
+        const int   health_hand  = compass_hand < 0 ? -1 : 1 - compass_hand;
+        VR::get()->set_native_wrist_panels({ VR::WristPanel{ compass_hand, { at(0.0f), at(0.845f), at(0.16f), at(0.995f) }, 0.07f },
+                                             VR::WristPanel{ health_hand, { at(0.80f), at(0.895f), at(0.995f), at(0.99f) }, 0.09f } });
     }
 
     ModConstants::headTrackingType = get(kAimWith);
