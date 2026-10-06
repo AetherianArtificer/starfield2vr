@@ -3,6 +3,7 @@
 #include "StereoViewModule.h"
 #include <Framework.hpp>
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -69,9 +70,54 @@ namespace RenderPassProfiler
 
         // Per class and eye (left, right, other): GPU ms summed over the reporting window.
         std::vector<std::array<double, 3>> g_sums;
+        double                             g_tick_ms{ 0.0 };
+
+        // When each eye's passes ran in a frame slot: the first start, the last end, and which threads ran them.
+        struct Timeline
+        {
+            std::atomic<int64_t>  first[2]{ INT64_MAX, INT64_MAX };
+            std::atomic<int64_t>  last[2]{ 0, 0 };
+            std::atomic<uint64_t> threads[2]{ 0, 0 };
+        };
+        std::array<Timeline, kSlots> g_timeline;
+        std::atomic<int>             g_thread_count{ 0 };
+        thread_local int             t_thread_index{ -1 };
+        double                       g_span_sum[2]{}, g_overlap_sum{ 0.0 }, g_threads_sum[2]{};
+        int                          g_timeline_frames{ 0 };
+
+        void NoteTimeline(int eye, int64_t start, int64_t stop)
+        {
+            if (t_thread_index < 0) {
+                t_thread_index = g_thread_count.fetch_add(1) & 63;
+            }
+            auto& t     = g_timeline[g_frame.load(std::memory_order_relaxed) % kSlots];
+            auto  first = t.first[eye].load(std::memory_order_relaxed);
+            while (start < first && !t.first[eye].compare_exchange_weak(first, start)) {
+            }
+            auto last = t.last[eye].load(std::memory_order_relaxed);
+            while (stop > last && !t.last[eye].compare_exchange_weak(last, stop)) {
+            }
+            t.threads[eye].fetch_or(1ull << t_thread_index, std::memory_order_relaxed);
+        }
+
+        void CollectTimeline(uint32_t slot)
+        {
+            auto& t = g_timeline[slot];
+            const int64_t f0 = t.first[0].exchange(INT64_MAX), l0 = t.last[0].exchange(0);
+            const int64_t f1 = t.first[1].exchange(INT64_MAX), l1 = t.last[1].exchange(0);
+            const uint64_t th0 = t.threads[0].exchange(0), th1 = t.threads[1].exchange(0);
+            if (l0 <= f0 || l1 <= f1) {
+                return;
+            }
+            g_span_sum[0] += (l0 - f0) * g_tick_ms;
+            g_span_sum[1] += (l1 - f1) * g_tick_ms;
+            g_overlap_sum += std::max<int64_t>(0, std::min(l0, l1) - std::max(f0, f1)) * g_tick_ms;
+            g_threads_sum[0] += (double)std::popcount(th0);
+            g_threads_sum[1] += (double)std::popcount(th1);
+            ++g_timeline_frames;
+        }
         // CPU time recording each pass, in performance counter ticks, per class and eye.
         std::vector<std::array<std::atomic<uint64_t>, 3>> g_cpu_ticks;
-        double                                            g_tick_ms{ 0.0 };
         int                                g_frames_summed{ 0 };
         auto                               g_last_report = std::chrono::steady_clock::now();
 
@@ -160,6 +206,9 @@ namespace RenderPassProfiler
             QueryPerformanceCounter(&stop);
             const int eye = StereoViewModule::Get()->EyeOfGraphPublic(render_graph_data);
             g_cpu_ticks[cls][eye == 0 ? 0 : eye == 1 ? 1 : 2].fetch_add((uint64_t)(stop.QuadPart - start.QuadPart), std::memory_order_relaxed);
+            if (eye == 0 || eye == 1) {
+                NoteTimeline(eye, start.QuadPart, stop.QuadPart);
+            }
             Mark(cls, render_graph_data);
             return result;
         }
@@ -288,6 +337,14 @@ namespace RenderPassProfiler
             }
             std::sort(order.begin(), order.end(), [&](int a, int b) { return total(cpu[a]) > total(cpu[b]); });
             spdlog::info("[Passes] CPU per frame recording passes: left eye {:.2f} ms, right eye {:.2f} ms, other {:.2f} ms", cpu_all[0], cpu_all[1], cpu_all[2]);
+            if (g_timeline_frames > 0) {
+                const double t = g_timeline_frames;
+                spdlog::info("[Passes] Wall time per frame from first to last pass: left eye {:.2f} ms on {:.1f} threads, right eye {:.2f} ms on {:.1f} threads, "
+                             "overlapping {:.2f} ms",
+                             g_span_sum[0] / t, g_threads_sum[0] / t, g_span_sum[1] / t, g_threads_sum[1] / t, g_overlap_sum / t);
+            }
+            g_span_sum[0] = g_span_sum[1] = g_overlap_sum = g_threads_sum[0] = g_threads_sum[1] = 0.0;
+            g_timeline_frames = 0;
             for (int i = 0, shown = 0; i < (int)order.size() && shown < 20; ++i) {
                 const auto& c = cpu[order[i]];
                 if (g_classes[order[i]].subgraph) {
@@ -456,6 +513,7 @@ namespace RenderPassProfiler
                 Collect(next);
             }
         }
+        CollectTimeline(next);
         g_query_count[next] = 0;
         g_entry_count[next] = 0;
         g_frame.fetch_add(1);
