@@ -339,6 +339,108 @@ namespace body
         Inputs     g_published;  // latest capture (main thread)
         Inputs     g_in;         // the inputs of the body pass running now (under g_body_mutex)
 
+        // The body is posed before the camera that will show it is placed. Which actor position that camera follows,
+        // the root of the build just made ("current") or the one before it ("lagging"), is measured while the actor
+        // moves; the build then moves the body by the step the camera is about to take.
+        namespace camera_follow
+        {
+            enum class Model { Unknown, Current, Lagging, Undecided };
+            std::atomic<Model> g_model{ Model::Unknown };
+            std::mutex         g_mutex;
+            glm::vec3          g_roots[3]{};  // build roots, newest first
+            int                g_builds{ 0 };
+            glm::vec3          g_placed_neck{ 0.0f };
+            bool               g_has_neck{ false };
+            float              g_ahead{ 0.0f };  // signed, the largest this second: body neck ahead of the camera's
+            // Main thread.
+            glm::vec3 g_prev_cur{}, g_prev_lag{};
+            bool      g_has_prev{ false };
+            float     g_var_cur{ 0.0f }, g_var_lag{ 0.0f };
+            int       g_samples{ 0 };
+
+            // At a build, before it is recorded: the camera's coming step.
+            glm::vec3 Shift(const glm::vec3& root)
+            {
+                std::lock_guard lock(g_mutex);
+                if (g_builds < 2) {
+                    return glm::vec3{ 0.0f };
+                }
+                switch (g_model.load()) {
+                case Model::Current: return root - g_roots[0];
+                case Model::Lagging: return g_roots[0] - g_roots[1];
+                default: return glm::vec3{ 0.0f };
+                }
+            }
+
+            void OnBuild(const glm::vec3& root, const glm::vec3& neck)
+            {
+                std::lock_guard lock(g_mutex);
+                g_roots[2]    = g_roots[1];
+                g_roots[1]    = g_roots[0];
+                g_roots[0]    = root;
+                g_placed_neck = neck;
+                g_has_neck    = true;
+                ++g_builds;
+            }
+
+            // At the frame's start the camera is where the last frame showed it.
+            void Observe(const glm::vec3& anchor, const glm::vec3& neck_target)
+            {
+                glm::vec3 r0, r1, neck;
+                bool      has_neck;
+                {
+                    std::lock_guard lock(g_mutex);
+                    if (g_builds < 2) {
+                        return;
+                    }
+                    r0       = g_roots[0];
+                    r1       = g_roots[1];
+                    neck     = g_placed_neck;
+                    has_neck = g_has_neck;
+                }
+                const auto step   = glm::vec2{ r0 - r1 };
+                const bool moving = glm::length(step) > 0.005f;
+                const auto cur    = anchor - r0;
+                const auto lag    = anchor - r1;
+                if (g_has_prev && moving && g_model == Model::Unknown) {
+                    g_var_cur += glm::length(cur - g_prev_cur);
+                    g_var_lag += glm::length(lag - g_prev_lag);
+                    if (++g_samples >= 60) {
+                        if (g_var_cur < 0.5f * g_var_lag) {
+                            g_model = Model::Current;
+                        } else if (g_var_lag < 0.5f * g_var_cur) {
+                            g_model = Model::Lagging;
+                        } else if (g_samples >= 300) {
+                            g_model = Model::Undecided;
+                        }
+                        if (g_model != Model::Unknown) {
+                            const char* names[] = { "unknown", "the build's root", "the root before it", "UNDECIDED" };
+                            const auto  m       = g_model.load();
+                            const float mine    = m == Model::Lagging ? g_var_lag : g_var_cur;
+                            const float other   = m == Model::Lagging ? g_var_cur : g_var_lag;
+                            if (m == Model::Undecided) {
+                                spdlog::error("[Body] the camera follows neither root (variation {:.3f} m against {:.3f} m over {} moving frames); the body is not moved with it",
+                                    g_var_cur, g_var_lag, g_samples);
+                            } else {
+                                spdlog::info("[Body] the camera follows {} (variation {:.3f} m against {:.3f} m over {} moving frames)", names[static_cast<int>(m)],
+                                    mine, other, g_samples);
+                            }
+                        }
+                    }
+                }
+                g_prev_cur = cur;
+                g_prev_lag = lag;
+                g_has_prev = true;
+                if (moving && has_neck) {
+                    const float ahead = glm::dot(glm::vec2{ neck - neck_target }, glm::normalize(step));
+                    std::lock_guard lock(g_mutex);
+                    if (std::abs(ahead) > std::abs(g_ahead)) {
+                        g_ahead = ahead;
+                    }
+                }
+            }
+        }
+
         // Main thread, at the frame's start.
         void CaptureInputs()
         {
@@ -373,6 +475,11 @@ namespace body
             }
             vr->get_hand_tracking(true, in.hands[0]);
             vr->get_hand_tracking(false, in.hands[1]);
+            if (in.valid) {
+                const auto f = in.head_forward - in.head_up * in.head_forward.z;
+                const auto h = glm::length(glm::vec2{ f }) > 1e-4f ? glm::normalize(glm::vec3{ f.x, f.y, 0.0f }) : glm::vec3{ 0.0f };
+                camera_follow::Observe(in.anchor.t, in.eye - h * 0.12f);
+            }
             std::lock_guard lock(g_inputs_mutex);
             in.frame    = g_published.frame + 1;
             g_published = std::move(in);
@@ -2644,6 +2751,14 @@ namespace body
                 g_diag.support_distance, d.hand_to_target, d.grip_off, d.weapon_off, d.note);
             g_place.steps = g_place.seats = 0;
             d.camera_drop = g_camera_drop;
+            float ahead;
+            {
+                std::lock_guard cl(camera_follow::g_mutex);
+                ahead                  = camera_follow::g_ahead;
+                camera_follow::g_ahead = 0.0f;
+            }
+            const char* follow[] = { "measuring", "current", "lagging", "UNDECIDED" };
+            spdlog::info("[Body] camera follows {} | body ahead of camera {:.3f} m", follow[static_cast<int>(camera_follow::g_model.load())], ahead);
             spdlog::info("[Body] fingertips to wrist L {:.3f}-{:.3f} R {:.3f}-{:.3f} m | camera drop {:.3f} m | tracked joints lowered by {:.3f} m | R_HandIk vs animated hand {:.1f} deg {:.3f} m",
                 d.finger_min[0], d.finger_max[0], d.finger_min[1], d.finger_max[1], d.camera_drop, g_body_height_fix.load(), d.ik_vs_hand_deg,
                 d.ik_vs_hand_m);
@@ -2695,10 +2810,11 @@ namespace body
             d.reused += stage.sequence == graph_stage::g_applied ? 1 : 0;
             graph_stage::g_applied = stage.sequence;
 
-            // The camera may have moved since the inputs were captured; the body and hands move with it.
+            // The camera that will show this body takes one more step with the actor after the inputs were captured;
+            // the body and hands take it too.
             g_in              = stage.input;
             auto  world_camera = CreationEngineSingletonManager::GetSceneGraphRoot()->worldCamera;
-            const glm::vec3 shift = world_camera && world_camera->parent ? ToVec(world_camera->parent->world.translate) - g_in.anchor.t : glm::vec3{ 0.0f };
+            const glm::vec3 shift = camera_follow::Shift(ToVec(root_local->translate));
             g_in.anchor.t += shift;
             g_in.eye += shift;
             d.camera_shift = std::max(d.camera_shift, glm::length(shift));
@@ -2715,6 +2831,7 @@ namespace body
             ApplyArms(pose, stage.weapon, shift);
             const auto weapon = stage.weapon;
             auto result = g_model_update_hook.call<void*>(model, &root, data, out);
+            camera_follow::OnBuild(ToVec(root_local->translate), g_bones.neck >= 0 ? FromNi(pose.world[g_bones.neck]).t : glm::vec3{ 0.0f });
             CheckHands(pose, weapon, shift);
             LogFrame();
             return result;
