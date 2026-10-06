@@ -293,6 +293,7 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
             hmd_transform[3] -= glm::vec4{ tracking::StandingOriginPosition(), 0.0f };
             const float tracking_scale = tracking::TrackingScale();
             hmd_transform[3]           = glm::vec4{ glm::vec3{ hmd_transform[3] } * tracking_scale, 1.0f };
+            hmd_transform[3].y -= body::CameraDrop();
             auto eye = eye_transform;
             eye[3]   = glm::vec4{ glm::vec3{ eye[3] } * tracking_scale, 1.0f };
             // The camera's parent carries the aim rotation; keep the view on the head.

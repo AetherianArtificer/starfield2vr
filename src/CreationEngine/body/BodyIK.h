@@ -31,4 +31,6 @@ namespace body
     // While the body owns the actor's heading: the body's heading minus the head's (radians, counter-clockwise), to
     // keep stick movement relative to the head.
     std::optional<float> LocomotionTurn();
+    // Metres the camera is lowered while the shown body crouches (its animation crouches, the first-person rig does not).
+    float CameraDrop();
 }

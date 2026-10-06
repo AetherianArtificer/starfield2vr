@@ -334,7 +334,8 @@ namespace body
             VR::BodyTrackingState    body;
             VR::HandTrackingState    hands[2];
         };
-        std::mutex g_inputs_mutex;
+        std::mutex         g_inputs_mutex;
+        std::atomic<float> g_body_height_fix{ 0.0f };  // metres taken off tracked joints (for the log)
         Inputs     g_published;  // latest capture (main thread)
         Inputs     g_in;         // the inputs of the body pass running now (under g_body_mutex)
 
@@ -361,6 +362,15 @@ namespace body
             }
             in.floor_eye_height = vr->get_floor_eye_height();
             vr->get_body_tracking(in.body);
+            // VDXR adds its configured eye height to every body joint (body_tracking.cpp, jointsToVirtual), so the
+            // tracked head sits that far above the HMD. The head joint is put back at the HMD's height.
+            if (in.body.active && in.body.joint_count > 7 && in.body.joints[7].position_valid) {
+                const float fix = in.body.joints[7].position.y - vr->get_transform(0)[3].y;
+                for (std::uint32_t i = 0; i < in.body.joint_count && i < in.body.joints.size(); ++i) {
+                    in.body.joints[i].position.y -= fix;
+                }
+                g_body_height_fix = fix;
+            }
             vr->get_hand_tracking(true, in.hands[0]);
             vr->get_hand_tracking(false, in.hands[1]);
             std::lock_guard lock(g_inputs_mutex);
@@ -1982,6 +1992,43 @@ namespace body
             return it == g_bones.by_name.end() ? -1 : it->second;
         }
 
+        // How far the animated head is below its standing height (button crouch), for the camera. Walk bob stays
+        // below the threshold; the drop is eased in and out.
+        std::atomic<float> g_camera_drop{ 0.0f };
+
+        void MeasureCameraDrop(const Pose& pose)
+        {
+            static float standing{ -1.0f };
+            static float drop{ 0.0f };
+            static bool  crouched{ false };
+            static const void* storage{ nullptr };
+            static std::chrono::steady_clock::time_point last{};
+            if (g_bones.head < 0) {
+                return;
+            }
+            const auto  now    = std::chrono::steady_clock::now();
+            const float dt     = std::clamp(std::chrono::duration<float>(now - last).count(), 0.0f, 0.25f);
+            last               = now;
+            const float height = pose.World(g_bones.head).t.z - pose.root.t.z;
+            if (storage != g_bones.storage || standing < 0.0f) {
+                storage  = g_bones.storage;
+                standing = height;
+            }
+            const float below = standing - height;
+            if (!crouched && below > 0.15f) {
+                crouched = true;
+            } else if (crouched && below < 0.08f) {
+                crouched = false;
+            }
+            if (!crouched) {
+                standing += (height - standing) * (1.0f - std::exp(-0.5f * dt));  // follows slow changes (scale, gear)
+                standing = std::max(standing, height - 0.05f);
+            }
+            const float target = crouched ? std::max(below, 0.0f) : 0.0f;
+            drop += (target - drop) * (1.0f - std::exp(-8.0f * dt));
+            g_camera_drop = drop;
+        }
+
         std::uint8_t* BodyModel()
         {
             if (!g_state.active || !g_state.root) {
@@ -2029,6 +2076,7 @@ namespace body
                 Xf        weapon{};
                 glm::vec3 forward{};  // barrel, in the weapon bone's space
                 bool      support_held{ false };
+                Xf        hand_in_weapon[2]{};  // left, right: the animated wrists relative to the weapon bone
             };
 
             // One run of the stage: what the frame build applies.
@@ -2086,6 +2134,9 @@ namespace body
                 float       grip_off{ -1.0f };       // the grip's palm centre against the controller
                 float       weapon_off{ -1.0f };     // the drawn weapon bone against its placement
                 float       actor_target{ -1.0f };   // the actor's heading against the body's, radians
+                float       finger_min[2]{ 9.0f, 9.0f }, finger_max[2]{ -1.0f, -1.0f };  // fingertip to wrist, final worlds
+                float       camera_drop{ 0.0f };     // the animated head's drop below standing, given to the camera
+                float       ik_vs_hand_deg{ -1.0f }, ik_vs_hand_m{ -1.0f };  // R_HandIk against the animated right hand
                 bool        placed{ false };
                 std::string note;
             };
@@ -2182,9 +2233,21 @@ namespace body
                 if (!grip || !aim) {
                     return std::nullopt;
                 }
-                const auto hand_in_weapon    = FromNi(pose.local[r_ik]);
-                const auto support_in_weapon = FromNi(pose.local[l_ik]);
+                // The grips are the animation's own hands on this weapon (the graph's arm IK has put them there), with
+                // the rotation the clip gives each hand, which its finger pose was authored for.
                 WeaponPlacement p;
+                const auto weapon_anim = pose.GameWorld(b.weapon);
+                p.hand_in_weapon[0]    = Compose(Inverse(weapon_anim), pose.GameWorld(b.left.wrist));
+                p.hand_in_weapon[1]    = Compose(Inverse(weapon_anim), pose.GameWorld(b.right.wrist));
+                const auto& hand_in_weapon    = p.hand_in_weapon[1];
+                const auto& support_in_weapon = p.hand_in_weapon[0];
+                {
+                    const auto  ik    = FromNi(pose.local[r_ik]);
+                    const float cos_a = std::clamp((glm::dot(ik.r[0], hand_in_weapon.r[0]) + glm::dot(ik.r[1], hand_in_weapon.r[1]) +
+                                                       glm::dot(ik.r[2], hand_in_weapon.r[2]) - 1.0f) * 0.5f, -1.0f, 1.0f);
+                    g_diag.ik_vs_hand_deg  = std::max(g_diag.ik_vs_hand_deg, glm::degrees(std::acos(cos_a)));
+                    g_diag.ik_vs_hand_m    = std::max(g_diag.ik_vs_hand_m, glm::length(ik.t - hand_in_weapon.t));
+                }
                 p.forward     = g_barrel.shot_in_weapon;
                 const auto up = glm::normalize(g_weapon_up.up - p.forward * glm::dot(p.forward, g_weapon_up.up));
 
@@ -2282,6 +2345,7 @@ namespace body
                 if (player && player->IsWeaponDrawn()) {
                     MeasureWeaponUp(pose);
                 }
+                MeasureCameraDrop(pose);
                 Stage      stage;
                 const bool torso_tracked = TorsoTracked();
                 stage.root               = DecideRoot(pose, g_root_local, torso_tracked);
@@ -2434,8 +2498,16 @@ namespace body
 
         // The frame build's arms: a hand on the weapon goes onto the game's grip target (R_HandIk / L_HandIk, which
         // the animation moves with the weapon, e.g. during a reload); a free hand follows its controller.
-        void ApplyArms(const Pose& pose, const std::optional<graph_stage::WeaponPlacement>& weapon)
+        void ApplyArms(const Pose& pose, const std::optional<graph_stage::WeaponPlacement>& weapon, const glm::vec3& shift)
         {
+            // The weapon bone hangs from the arm chain, which the solve moves: it is set on its placement before the
+            // hands are solved onto its grips and again after.
+            std::optional<Xf> placed;
+            if (weapon && g_bones.weapon >= 0) {
+                placed = weapon->weapon;
+                placed->t += shift;
+                pose.SetGameWorld(g_bones.weapon, *placed);
+            }
             if (g_bones.head >= 0) {
                 pose.local[g_bones.head].scale = 0.0f;
             }
@@ -2469,10 +2541,8 @@ namespace body
                     continue;
                 }
                 float& gap = left ? g_diag.left_gap : g_diag.right_gap;
-                if (weapon && (!left || support)) {
-                    if (const auto target = target_of(left ? "L_HandIk" : "R_HandIk")) {
-                        gap = SolveArm(pose, arm, left, *target, std::nullopt);
-                    }
+                if (weapon && placed && (!left || support)) {
+                    gap = SolveArm(pose, arm, left, Compose(*placed, weapon->hand_in_weapon[side]), std::nullopt);
                     continue;  // the fingers keep the animation's grip
                 }
                 const auto grip = Grip(left);
@@ -2488,22 +2558,40 @@ namespace body
                 gap                      = SolveArm(pose, arm, left, WristTarget(pose, arm, *aim, *grip), bend);
                 ApplyFingers(pose, side, arm.wrist);
             }
+            if (placed) {
+                pose.SetGameWorld(g_bones.weapon, *placed);
+            }
         }
 
         // After the update, from the final worlds.
         void CheckHands(const Pose& pose, const std::optional<graph_stage::WeaponPlacement>& weapon, const glm::vec3& shift)
         {
-            auto&     d    = graph_stage::g_diag;
-            const int r_ik = BoneIndex("R_HandIk");
-            if (!weapon || r_ik < 0 || g_bones.right.wrist < 0 || g_bones.weapon < 0) {
+            auto& d = graph_stage::g_diag;
+            for (int side = 0; side < 2; ++side) {
+                const int wrist = side == 0 ? g_bones.left.wrist : g_bones.right.wrist;
+                if (wrist < 0) {
+                    continue;
+                }
+                const auto w = FromNi(pose.world[wrist]).t;
+                for (const auto& chain : g_bones.fingers[side]) {
+                    if (chain[2] >= 0) {
+                        const float span   = glm::length(FromNi(pose.world[chain[2]]).t - w);
+                        d.finger_min[side] = std::min(d.finger_min[side], span);
+                        d.finger_max[side] = std::max(d.finger_max[side], span);
+                    }
+                }
+            }
+            if (!weapon || g_bones.right.wrist < 0 || g_bones.weapon < 0) {
                 return;
             }
+            auto placed = weapon->weapon;
+            placed.t += shift;
             const auto wrist  = FromNi(pose.world[g_bones.right.wrist]);
-            const auto target = FromNi(pose.world[r_ik]);
+            const auto target = Compose(placed, weapon->hand_in_weapon[1]);
             d.hand_to_target  = std::max(d.hand_to_target, glm::length(wrist.t - target.t));
-            d.weapon_off      = std::max(d.weapon_off, glm::length(FromNi(pose.world[g_bones.weapon]).t - (weapon->weapon.t + shift)));
+            d.weapon_off      = std::max(d.weapon_off, glm::length(FromNi(pose.world[g_bones.weapon]).t - placed.t));
             if (const auto grip = Grip(false); grip && g_bones.right.shape.valid) {
-                const auto palm = target.t + target.r * (g_bones.right.shape.forward * g_bones.right.shape.palm) * target.s;
+                const auto palm = wrist.t + wrist.r * (g_bones.right.shape.forward * g_bones.right.shape.palm) * wrist.s;
                 d.grip_off      = std::max(d.grip_off, glm::length(palm - grip->position));
             }
         }
@@ -2533,6 +2621,10 @@ namespace body
                 third_person_mode::Active(player), g_place.steps, g_place.seats, g_lean_applied, g_walk.state, d.placed, g_diag.support_held,
                 g_diag.support_distance, d.hand_to_target, d.grip_off, d.weapon_off, d.note);
             g_place.steps = g_place.seats = 0;
+            d.camera_drop = g_camera_drop;
+            spdlog::info("[Body] fingertips to wrist L {:.3f}-{:.3f} R {:.3f}-{:.3f} m | camera drop {:.3f} m | tracked joints lowered by {:.3f} m | R_HandIk vs animated hand {:.1f} deg {:.3f} m",
+                d.finger_min[0], d.finger_max[0], d.finger_min[1], d.finger_max[1], d.camera_drop, g_body_height_fix.load(), d.ik_vs_hand_deg,
+                d.ik_vs_hand_m);
             spdlog::info("[Body] tracking: body supported {} active {} valid {} (core {}/18 hands {}/52 legs {}/14) | wrist to controller L {:.3f} R {:.3f} m | torso {} elbows L {} R {} legs {} | fingers L {} (src {} bend {:.0f}) R {} (src {} bend {:.0f}) | finger input R trig {:.2f} grip {:.2f} thumb {} L trig {:.2f} grip {:.2f} thumb {}",
                 g_track_diag.supported, g_track_diag.active, g_track_diag.valid, g_track_diag.core, g_track_diag.hands, g_track_diag.legs_valid,
                 g_track_diag.wrist_off[0], g_track_diag.wrist_off[1], g_track_diag.torso, g_track_diag.elbow[0], g_track_diag.elbow[1],
@@ -2598,7 +2690,7 @@ namespace body
             }
 
             MeasureBarrel();
-            ApplyArms(pose, stage.weapon);
+            ApplyArms(pose, stage.weapon, shift);
             const auto weapon = stage.weapon;
             auto result = g_model_update_hook.call<void*>(model, &root, data, out);
             CheckHands(pose, weapon, shift);
@@ -2615,6 +2707,11 @@ namespace body
             return std::nullopt;
         }
         return WrapAngle(Heading(*room * glm::vec3{ 0.0f, 1.0f, 0.0f }) + control->body);
+    }
+
+    float CameraDrop()
+    {
+        return g_state.active && third_person_mode::Active(CreationEngineSingletonManager::GetPlayerRef()) ? g_camera_drop.load() : 0.0f;
     }
 
     std::optional<float> BodyHeadingInRoom()
