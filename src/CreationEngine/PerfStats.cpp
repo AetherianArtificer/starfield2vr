@@ -1,6 +1,7 @@
 #include "PerfStats.h"
 #include "GpuQueueTiming.h"
 #include "RenderPassProfiler.h"
+#include <CreationEngine/models/ModSettingsStore.h>
 
 #include <Framework.hpp>
 #include <algorithm>
@@ -117,8 +118,10 @@ namespace PerfStats
             return;
         }
 
-        GpuQueueTiming::OnPresent();
-        RenderPassProfiler::OnPresent();
+        if (GameFlow::gStore.internalSettings.perfLogging) {
+            GpuQueueTiming::OnPresent();
+            RenderPassProfiler::OnPresent();
+        }
         g_frame_ms.push_back(std::chrono::duration<float, std::milli>(now - g_last_present).count());
         g_last_present = now;
 

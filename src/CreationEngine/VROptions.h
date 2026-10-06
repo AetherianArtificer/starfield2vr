@@ -57,6 +57,7 @@ public:
         kHudPlacement,
         kEyeScreenshots,
         kPipelinedFrames,
+        kPerfLogging,
 
         kFirstId = 8600,
         kLastId  = 8699,

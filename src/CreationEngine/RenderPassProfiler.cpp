@@ -154,7 +154,6 @@ namespace RenderPassProfiler
             if (cls < 0) {
                 return reinterpret_cast<func_t*>(g_originals[hook])(pass, render_graph_data, pass_data, a4);
             }
-            static auto vr = VR::get();
             LARGE_INTEGER start, stop;
             QueryPerformanceCounter(&start);
             const auto result = reinterpret_cast<func_t*>(g_originals[hook])(pass, render_graph_data, pass_data, a4);

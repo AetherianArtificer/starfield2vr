@@ -188,8 +188,8 @@ namespace GpuQueueTiming
                 }
             }
             auto vtable = *reinterpret_cast<void***>(game_queue);
+            g_execute   = reinterpret_cast<ExecuteFn>(vtable[kExecuteSlot]);
             g_hook      = std::make_unique<PointerHook>(&vtable[kExecuteSlot], (void*)&OnExecute);
-            g_execute   = g_hook->get_original<ExecuteFn>();
             spdlog::info("[Perf] GPU queue timing installed");
             return true;
         }

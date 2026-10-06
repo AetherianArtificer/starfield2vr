@@ -396,10 +396,13 @@ void StereoViewModule::OnFrameStart()
     static auto vr = VR::get();
 
     // Every pass is hooked once the device exists, after this module's own pass hooks.
-    static bool profiler_installed = false;
-    if (!profiler_installed && g_framework->get_d3d12_hook() && g_framework->get_d3d12_hook()->get_device()) {
-        profiler_installed = true;
-        RenderPassProfiler::Install();
+    // Detailed profiling hooks every render pass; only when asked for, decided once.
+    static bool profiler_decided = false;
+    if (!profiler_decided && g_framework->get_d3d12_hook() && g_framework->get_d3d12_hook()->get_device()) {
+        profiler_decided = true;
+        if (GameFlow::gStore.internalSettings.perfLogging) {
+            RenderPassProfiler::Install();
+        }
     }
 
     // Native presentation runs whenever the headset is active; until both eye views exist both eyes show the frame.
