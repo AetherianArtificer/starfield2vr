@@ -47,6 +47,9 @@ namespace GameFlow
         bool ship_hud_seen_this_frame{false};
         std::atomic<bool> ship_hud_last_frame{false};
 
+        // When the main menu's movie was last drawn; it is drawn around several render graphs a frame.
+        std::atomic<int64_t> main_menu_drawn_at{0};
+
         void update_loading_recenter()
         {
             if (loading_seen_this_frame) {
@@ -128,6 +131,8 @@ namespace GameFlow
         case "Interface/SkillsMenu_LRG.swf"_DJB:
         case "Interface/MainMenu.swf"_DJB:
         case "Interface/MainMenu_LRG.swf"_DJB:
+            main_menu_drawn_at.store(std::chrono::steady_clock::now().time_since_epoch().count());
+            [[fallthrough]];
         case "Interface/CursorMenu.swf"_DJB:
         case "Interface/CursorMenu_LRG.swf"_DJB:
         case "Interface/DataMenu.swf"_DJB:
@@ -173,6 +178,11 @@ namespace GameFlow
 
     bool isShowingMenu() {
         return gState.uiData.rendered_menus_count[(gState.uiData.modulino + 1) % 2] >= 0;
+    }
+
+    bool isMainMenuShowing() {
+        const auto drawn = std::chrono::steady_clock::duration{ main_menu_drawn_at.load() };
+        return std::chrono::steady_clock::now().time_since_epoch() - drawn < std::chrono::milliseconds(100);
     }
 
     bool isPilotingShip() {
