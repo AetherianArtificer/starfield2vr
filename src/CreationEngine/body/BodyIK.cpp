@@ -2668,6 +2668,7 @@ namespace body
                 Xf                 anchor{};
                 bool               has_anchor{ false };
                 std::vector<Write> writes;
+                std::vector<Write> torso;  // the torso as the arm IK saw it
             };
             Stage                       g_stage;
             std::mutex                  g_mutex;
@@ -2701,6 +2702,7 @@ namespace body
                 float anchor_moved{ 0.0f };      // camera anchor movement between the graph stage and the frame
                 float weapon_moved{ 0.0f };      // weapon placement change between the two
                 float grip_off_controller{ -1.0f };  // drawn grip's palm centre against the controller, when drawn
+                float torso_undone{ 0.0f };          // largest torso turn by graph nodes after the arm IK, undone
                 bool  placed{ false };
                 std::string note;
             };
@@ -2976,6 +2978,19 @@ namespace body
                     }
                     g_stage.writes.push_back({ g, m, ToGraph(FromNi(pose.local[m]), g_convention) });
                 }
+                // Graph nodes after the arm IK turn the torso toward the game's aim (C_Chest, the clavicles); the torso
+                // is the player's, so it is put back as the arm IK saw it when the frame is built.
+                g_stage.torso.clear();
+                const auto& b = *g_active_bones;
+                std::vector<int> torso = b.spine;
+                for (const int bone : { b.chest, b.neck, b.right.clavicle, b.left.clavicle, b.pelvis }) {
+                    torso.push_back(bone);
+                }
+                for (const int m : torso) {
+                    if (m >= offset && m - offset < count && std::find_if(g_stage.torso.begin(), g_stage.torso.end(), [m](const Write& w) { return w.model == m; }) == g_stage.torso.end()) {
+                        g_stage.torso.push_back({ m - offset, m, ToGraph(FromNi(pose.local[m]), g_convention) });
+                    }
+                }
                 g_stage.ran = true;
             }
 
@@ -3076,6 +3091,16 @@ namespace body
                         }
                     }
                     g_stage_diag.copy_error = worst;
+                    float turned = 0.0f;
+                    for (const auto& w : g_stage.torso) {
+                        const auto copied = FromNi(pose.local[w.model]);
+                        const auto staged = FromGraph(w.value, g_convention);
+                        for (int a = 0; a < 3; ++a) {
+                            turned = std::max(turned, glm::length(copied.r[a] - staged.r[a]));
+                        }
+                        ToNi(staged, pose.local[w.model]);
+                    }
+                    g_stage_diag.torso_undone = std::max(g_stage_diag.torso_undone, turned);
                 }
             }
 
@@ -3116,10 +3141,10 @@ namespace body
             void Log()
             {
                 std::lock_guard lock(g_mutex);
-                spdlog::info("[Body] graph stage: convention {} | arm IK hits R {} L {} other {} (target {}) | weights target {:.2f} weapon {:.2f} blend {:.2f} | placed {} | copy error {:.4f} | right hand to IK target {:.3f} m {:.1f} deg | support to IK {:.3f} m | weapon off placement {:.3f} m | camera moved since stage {:.3f} m, weapon re-placed by {:.3f} m | grip off controller {:.3f} m | {}",
+                spdlog::info("[Body] graph stage: convention {} | arm IK hits R {} L {} other {} (target {}) | weights target {:.2f} weapon {:.2f} blend {:.2f} | placed {} | copy error {:.4f} | right hand to IK target {:.3f} m {:.1f} deg | support to IK {:.3f} m | weapon off placement {:.3f} m | camera moved since stage {:.3f} m, weapon re-placed by {:.3f} m | grip off controller {:.3f} m | torso turn undone {:.3f} | {}",
                     static_cast<int>(g_convention), g_stage_diag.hits_right, g_stage_diag.hits_left, g_stage_diag.hits_other, g_stage_diag.other_target, g_stage_diag.target_weight,
                     g_stage_diag.weapon_weight, g_stage_diag.blend, g_stage_diag.placed, g_stage_diag.copy_error, g_stage_diag.hand_to_ik, g_stage_diag.hand_to_ik_angle, g_stage_diag.support_to_ik,
-                    g_stage_diag.weapon_error, g_stage_diag.anchor_moved, g_stage_diag.weapon_moved, g_stage_diag.grip_off_controller, g_stage_diag.note);
+                    g_stage_diag.weapon_error, g_stage_diag.anchor_moved, g_stage_diag.weapon_moved, g_stage_diag.grip_off_controller, g_stage_diag.torso_undone, g_stage_diag.note);
                 g_stage_diag = {};
             }
         }
