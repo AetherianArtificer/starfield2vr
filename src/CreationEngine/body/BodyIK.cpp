@@ -338,6 +338,46 @@ namespace body
         };
         std::mutex         g_inputs_mutex;
         std::atomic<float> g_body_height_fix{ 0.0f };  // metres taken off tracked joints (for the log)
+
+        // Body tracking is used only once its joints are shown to be in the room's frame: the hips-to-head line stays
+        // within 25 degrees of vertical both while the head looks level and while it looks down (joints that turn with
+        // the head fail the second). Main thread.
+        namespace body_space
+        {
+            enum class State { Unknown, Verified, Failed };
+            std::atomic<State> g_state{ State::Unknown };
+            int                g_level_ok{ 0 }, g_down_ok{ 0 }, g_down_bad{ 0 }, g_level_bad{ 0 };
+
+            void Check(const VR::BodyTrackingState& body, const glm::mat4& hmd)
+            {
+                if (g_state != State::Unknown || !body.active || body.joint_count <= 7 || !body.joints[1].position_valid ||
+                    !body.joints[7].position_valid) {
+                    return;
+                }
+                const auto  up    = glm::vec3{ body.joints[7].position } - glm::vec3{ body.joints[1].position };
+                if (glm::length(up) < 0.2f) {
+                    return;
+                }
+                const float tilt  = glm::degrees(std::acos(std::clamp(glm::normalize(up).y, -1.0f, 1.0f)));
+                const auto  look  = glm::vec3{ hmd * glm::vec4{ 0.0f, 0.0f, -1.0f, 0.0f } };
+                const float pitch = glm::degrees(std::asin(std::clamp(look.y, -1.0f, 1.0f)));
+                const bool  ok    = tilt < 25.0f;
+                if (std::abs(pitch) < 15.0f) {
+                    (ok ? g_level_ok : g_level_bad) += 1;
+                } else if (pitch < -35.0f) {
+                    (ok ? g_down_ok : g_down_bad) += 1;
+                }
+                if (g_level_ok >= 30 && g_down_ok >= 30) {
+                    g_state = State::Verified;
+                    spdlog::info("[Body] body tracking verified: hips-to-head stays upright looking level ({} ok, {} not) and down ({} ok, {} not)",
+                        g_level_ok, g_level_bad, g_down_ok, g_down_bad);
+                } else if (g_down_bad >= 20 || g_level_bad >= 60) {
+                    g_state = State::Failed;
+                    spdlog::error("[Body] body tracking FAILED: hips-to-head tilted {:.0f} deg with the head pitched {:.0f} deg (level {} ok {} not, down {} ok {} not); body tracking is not used",
+                        tilt, pitch, g_level_ok, g_level_bad, g_down_ok, g_down_bad);
+                }
+            }
+        }
         Inputs     g_published;  // latest capture (main thread)
         Inputs     g_in;         // the inputs of the body pass running now (under g_body_mutex)
 
@@ -475,6 +515,21 @@ namespace body
             }
             in.floor_eye_height = vr->get_floor_eye_height();
             vr->get_body_tracking(in.body);
+            {
+                const auto hmd = vr->get_transform(0);
+                static std::chrono::steady_clock::time_point last_dump{};
+                if (in.body.active && in.body.joint_count > 7 && std::chrono::steady_clock::now() - last_dump > std::chrono::seconds(1)) {
+                    last_dump  = std::chrono::steady_clock::now();
+                    auto fmt   = [](const VR::TrackedJoint& j) { return std::format("({:.2f},{:.2f},{:.2f})", j.position.x, j.position.y, j.position.z); };
+                    auto fmt_q = [](const VR::TrackedJoint& j) { return std::format("[{:.2f},{:.2f},{:.2f},{:.2f}]", j.orientation.w, j.orientation.x, j.orientation.y, j.orientation.z); };
+                    const auto look = glm::vec3{ hmd * glm::vec4{ 0.0f, 0.0f, -1.0f, 0.0f } };
+                    spdlog::info("[Body] raw joints (stage): hips {} chest {} neck {} head {} head rot {} | L shoulder {} R shoulder {} | L ankle {} | hmd ({:.2f},{:.2f},{:.2f}) looking ({:.2f},{:.2f},{:.2f}) | space {}",
+                        fmt(in.body.joints[1]), fmt(in.body.joints[5]), fmt(in.body.joints[6]), fmt(in.body.joints[7]), fmt_q(in.body.joints[7]),
+                        fmt(in.body.joints[10]), fmt(in.body.joints[15]), in.body.joint_count > 73 ? fmt(in.body.joints[73]) : std::string{ "-" },
+                        hmd[3].x, hmd[3].y, hmd[3].z, look.x, look.y, look.z, static_cast<int>(body_space::g_state.load()));
+                }
+                body_space::Check(in.body, hmd);
+            }
             // VDXR adds its configured eye height to every body joint (body_tracking.cpp, jointsToVirtual), so the
             // tracked head sits that far above the HMD. The head joint is put back at the HMD's height.
             if (in.body.active && in.body.joint_count > 7 && in.body.joints[7].position_valid) {
@@ -570,7 +625,7 @@ namespace body
 
         bool BodyTrackingOn()
         {
-            return GameFlow::gStore.internalSettings.bodyTracking && g_in.body.active;
+            return GameFlow::gStore.internalSettings.bodyTracking && g_in.body.active && body_space::g_state == body_space::State::Verified;
         }
 
         std::optional<glm::vec3> TrackedJoint(int index)
@@ -626,8 +681,17 @@ namespace body
         // The game's sneak state (ActorState bit 9, as in the Creation Engine's other games). Changes are logged.
         bool PlayerSneaking()
         {
-            static bool last{ false };
+            static bool          last{ false };
+            static std::uint32_t last_state[2]{};
+            static int           changes{ 0 };
             auto        player = CreationEngineSingletonManager::GetPlayerRef();
+            if (player && (player->actorState != last_state[0] || player->actorState2 != last_state[1]) && changes < 400) {
+                ++changes;
+                spdlog::info("[Body] actor state {:08x} {:08x} (changed bits {:08x} {:08x})", player->actorState, player->actorState2,
+                    player->actorState ^ last_state[0], player->actorState2 ^ last_state[1]);
+                last_state[0] = player->actorState;
+                last_state[1] = player->actorState2;
+            }
             const bool  now    = player && ((player->actorState >> 9) & 1) != 0;
             if (now != last) {
                 last = now;
@@ -1478,7 +1542,8 @@ namespace body
 
             std::optional<float> TrackedWorld(const Inputs& in)
             {
-                if (!GameFlow::gStore.internalSettings.bodyTracking || !in.body.active || !in.room) {
+                if (!GameFlow::gStore.internalSettings.bodyTracking || !in.body.active || !in.room ||
+                    body_space::g_state != body_space::State::Verified) {
                     return std::nullopt;
                 }
                 auto valid = [&](int j) { return j < static_cast<int>(in.body.joint_count) && in.body.joints[j].position_valid; };
