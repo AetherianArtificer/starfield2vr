@@ -2294,12 +2294,22 @@ namespace body
                 glm::vec3       up{};
             };
             WeaponUp g_weapon_up;
+            // Measured ups by weapon model name: the model's nodes are rebuilt on every draw.
+            std::unordered_map<std::string, glm::vec3> g_up_by_name;
+            // Until a weapon is measured its up is taken as +Z, which every weapon NIF measured so far has used.
+            const glm::vec3 kNifUp{ 0.0f, 0.0f, 1.0f };
 
             void MeasureWeaponUp(const Pose& pose)
             {
                 if (g_weapon_up.model != g_barrel.model) {
                     g_weapon_up       = {};
                     g_weapon_up.model = g_barrel.model;
+                    if (g_barrel.model) {
+                        if (const auto it = g_up_by_name.find(g_barrel.model->name.c_str()); it != g_up_by_name.end()) {
+                            g_weapon_up.locked = true;
+                            g_weapon_up.up     = it->second;
+                        }
+                    }
                 }
                 if (g_weapon_up.locked || !g_barrel.has_relation || g_bones.weapon < 0) {
                     return;
@@ -2329,6 +2339,11 @@ namespace body
                 if (g_weapon_up.steady >= 90) {
                     g_weapon_up.locked = true;
                     g_weapon_up.up     = best;
+                    g_up_by_name[g_barrel.model->name.c_str()] = best;
+                    if (best != kNifUp) {
+                        spdlog::error("[Body] weapon '{}' measured up ({:.0f},{:.0f},{:.0f}), not +Z: it was held rolled until now", g_barrel.model->name.c_str(),
+                            best.x, best.y, best.z);
+                    }
                     spdlog::info("[Body] weapon '{}': barrel ({:.2f},{:.2f},{:.2f}), up ({:.0f},{:.0f},{:.0f}) from the animation (measured ({:.2f},{:.2f},{:.2f}))",
                         g_barrel.model->name.c_str(), forward.x, forward.y, forward.z, best.x, best.y, best.z, measured.x, measured.y, measured.z);
                 }
@@ -2353,9 +2368,13 @@ namespace body
                     g_diag.note = "hand IK targets missing or not under the weapon bone";
                     return std::nullopt;
                 }
-                if (!g_barrel.has_relation || !b.right.shape.valid || !g_weapon_up.locked || g_weapon_up.model != g_barrel.model) {
+                if (!g_barrel.has_relation || !b.right.shape.valid) {
                     g_diag.note = "measuring the weapon";
                     return std::nullopt;
+                }
+                const bool measured = g_weapon_up.locked && g_weapon_up.model == g_barrel.model;
+                if (!measured) {
+                    g_diag.note = "weapon up taken as +Z until measured";
                 }
                 const auto grip = Grip(false);
                 const auto aim  = Aim(false);
@@ -2378,7 +2397,8 @@ namespace body
                     g_diag.ik_vs_hand_m    = std::max(g_diag.ik_vs_hand_m, glm::length(ik.t - hand_in_weapon.t));
                 }
                 p.forward     = g_barrel.shot_in_weapon;
-                const auto up = glm::normalize(g_weapon_up.up - p.forward * glm::dot(p.forward, g_weapon_up.up));
+                const auto up_in_weapon = measured ? g_weapon_up.up : kNifUp;
+                const auto up           = glm::normalize(up_in_weapon - p.forward * glm::dot(p.forward, up_in_weapon));
 
                 auto& weapon      = p.weapon;
                 weapon.s          = pose.GameWorld(b.weapon).s;
