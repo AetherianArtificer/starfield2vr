@@ -341,10 +341,6 @@ void StereoViewModule::InstallHooks()
         m_scaleform_composite_hook = std::make_unique<FunctionHook>(vtable[7], reinterpret_cast<uintptr_t>(&onScaleformComposite));
         m_scaleform_composite_hook->create();
     }
-    if (auto vtable = reinterpret_cast<uintptr_t*>(MemoryScan::VTable("UIRenderPass", ".?AVUIRenderPass@CreationRendererPrivate@@", 0))) {
-        m_ui_render_hook = std::make_unique<FunctionHook>(vtable[7], reinterpret_cast<uintptr_t>(&onUIRenderPass));
-        m_ui_render_hook->create();
-    }
     MenuStereo::InstallHooks();
 }
 
@@ -693,90 +689,6 @@ uint32_t StereoViewModule::SceneOf(void* render_graph_data) const
     return base ? At<uint32_t>(base, 0x24) : kInvalidId;
 }
 
-// The menus' 3D models (characters, items, ships). Drawn into the image the composite has already put the UI on, they
-// would be missing from the menu's backdrop, so on menu frames they are drawn onto the backdrop as well.
-uintptr_t StereoViewModule::onUIRenderPass(void* pass, void* render_graph_data, void* pass_data)
-{
-    static auto instance = Get();
-    using func_t         = uintptr_t(void*, void*, void*);
-    static auto original = instance->m_ui_render_hook->get_original<func_t>();
-    static auto vr       = VR::get();
-    if (!vr->is_native_stereo() || !instance->m_menu_fallback.load() || pass_data == nullptr) {
-        return original(pass, render_graph_data, pass_data);
-    }
-    auto data  = static_cast<RE::CreationRendererPrivate::RenderPassData*>(pass_data);
-    auto graph = static_cast<RE::CreationRendererPrivate::RenderGraphData*>(render_graph_data);
-    auto context = graph != nullptr ? reinterpret_cast<RE::RenderGraphDataD3D12Context*>(graph->getCommandList()) : nullptr;
-    ID3D12Resource*       target{ nullptr };
-    D3D12_RESOURCE_STATES target_state{};
-    static bool logged = false;
-    const uint32_t count = data->renderPassItems != nullptr ? (uint32_t)data->renderPassItems->_size : 0;
-    for (uint32_t i = 0; i < count && i < 16; ++i) {
-        auto item     = data->getRenderPassItemByIndex(i);
-        auto resource = data->getNativeResourceByIndex(i);
-        if (item == nullptr || resource == nullptr) {
-            continue;
-        }
-        const auto state = (D3D12_RESOURCE_STATES)RE::CreationRendererPrivate::RenderPassItem::getDXGIState(item->stateOrFlags);
-        if (!logged) {
-            const auto desc = resource->GetDesc();
-            spdlog::info("[Stereo] Menu 3D models pass texture {}: {}x{} format {} state {:x}{}", i, desc.Width, desc.Height, (uint32_t)desc.Format, (uint32_t)state,
-                         resource == instance->m_backdrop_source ? " (the menu backdrop's source)" : "");
-        }
-        if (resource == instance->m_backdrop_source && (state & D3D12_RESOURCE_STATE_RENDER_TARGET) != 0) {
-            target       = resource;
-            target_state = state;
-        }
-    }
-    const bool after = instance->m_composited.load();
-    if (!logged) {
-        logged = true;
-        spdlog::info("[Stereo] Menu 3D models are drawn {} the UI composite, {}", after ? "after" : "before",
-                     target != nullptr ? "into the menu backdrop's source" : "elsewhere");
-    }
-    if (!after || target == nullptr || context == nullptr || context->pID3D12CommandList == nullptr || instance->m_backdrop_capture == nullptr) {
-        return original(pass, render_graph_data, pass_data);
-    }
-    const auto desc = target->GetDesc();
-    auto&      hold = instance->m_ui3d_hold;
-    if (hold == nullptr || hold->GetDesc().Width != desc.Width || hold->GetDesc().Height != desc.Height || hold->GetDesc().Format != desc.Format) {
-        hold.Reset();
-        auto hold_desc = CD3DX12_RESOURCE_DESC::Tex2D(desc.Format, desc.Width, desc.Height, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-        const CD3DX12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
-        if (FAILED(g_framework->get_d3d12_hook()->get_device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &hold_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                                                       IID_PPV_ARGS(&hold)))) {
-            spdlog::error("[Stereo] Failed to create the menu 3D models holding texture");
-            return original(pass, render_graph_data, pass_data);
-        }
-        hold->SetName(L"Menu 3D models hold");
-    }
-    auto list     = context->pID3D12CommandList;
-    auto backdrop = instance->m_backdrop_capture.Get();
-    auto copy = [&](ID3D12Resource* dst, D3D12_RESOURCE_STATES dst_state, ID3D12Resource* src, D3D12_RESOURCE_STATES src_state) {
-        D3D12_RESOURCE_BARRIER before[2]{ CD3DX12_RESOURCE_BARRIER::Transition(dst, dst_state, D3D12_RESOURCE_STATE_COPY_DEST),
-                                          CD3DX12_RESOURCE_BARRIER::Transition(src, src_state, D3D12_RESOURCE_STATE_COPY_SOURCE) };
-        D3D12_RESOURCE_BARRIER after[2]{ CD3DX12_RESOURCE_BARRIER::Transition(dst, D3D12_RESOURCE_STATE_COPY_DEST, dst_state),
-                                         CD3DX12_RESOURCE_BARRIER::Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, src_state) };
-        const UINT first = dst_state == D3D12_RESOURCE_STATE_COPY_DEST ? 1 : 0;
-        list->ResourceBarrier(2 - first, before + first);
-        list->CopyResource(dst, src);
-        list->ResourceBarrier(2 - first, after + first);
-    };
-    // The image with the UI is held, the backdrop takes its place for the models, and then it is put back and the
-    // models are drawn over it too.
-    copy(hold.Get(), D3D12_RESOURCE_STATE_COPY_DEST, target, target_state);
-    copy(target, target_state, backdrop, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    original(pass, render_graph_data, pass_data);
-    copy(backdrop, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, target, target_state);
-    copy(target, target_state, hold.Get(), D3D12_RESOURCE_STATE_COPY_DEST);
-    static bool logged_drawn = false;
-    if (!logged_drawn) {
-        logged_drawn = true;
-        spdlog::info("[Stereo] Menu 3D models drawn onto the menu backdrop");
-    }
-    return original(pass, render_graph_data, pass_data);
-}
-
 uintptr_t StereoViewModule::onScaleformComposite(void* pass, void* render_graph_data, void* pass_data)
 {
     static auto instance = Get();
@@ -787,7 +699,6 @@ uintptr_t StereoViewModule::onScaleformComposite(void* pass, void* render_graph_
         instance->CaptureUiLayer(render_graph_data, pass_data);
     }
     const auto result = original(pass, render_graph_data, pass_data);
-    instance->m_composited.store(true);
     MenuStereo::EndFrame();
     RenderPassProfiler::MarkPass(pass, render_graph_data);
     return result;
@@ -1162,7 +1073,6 @@ void StereoViewModule::CaptureUiLayer(void* render_graph_data, void* pass_data)
     };
     command_list->ResourceBarrier(2, backdrop_restore);
     vr->set_native_menu_scene(m_backdrop_capture.Get());
-    m_backdrop_source = backdrop;
 }
 
 namespace
@@ -1211,8 +1121,6 @@ uintptr_t StereoViewModule::RunLatePass(int pass_kind, void* pass, void* render_
     using func_t     = uintptr_t(void*, void*, void*);
     auto        original = m_late_hooks[pass_kind]->get_original<func_t>();
     static auto vr       = VR::get();
-    // The post chain runs before the UI: a new frame's composite is still to come.
-    m_composited.store(false);
 
     const auto result = original(pass, render_graph_data, pass_data);
     RenderPassProfiler::MarkPass(pass, render_graph_data);
