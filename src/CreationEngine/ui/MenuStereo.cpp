@@ -24,36 +24,81 @@ namespace MenuStereo
 {
     namespace
     {
-        // ---- The layout: per menu, clips and how far toward the player they stand, in metres.
+        // ---- The layout: per menu, clips and regions, each at a depth tier (docs/vr-menu-rules.md).
 
+        constexpr const char* kLayoutHeader = "# SFVR menu depth 2";
         constexpr const char* kDefaultLayout =
-            "# Menu depth: metres toward the player from the menu panel, which is 3 m away. Negative pushes a clip back.\n"
-            "# <menu> <clip path from the menu's root clip> <metres>. Saved changes apply while the game runs.\n"
-            "MainMenu GameLogo_mc -0.5\n"
-            "MainMenu AdBannerHolder_mc 0.25\n"
-            "MainMenu MOTDHolder_mc 0.25\n"
-            "MainMenu MainPanel_mc 1.0\n"
-            "MainMenu LoadPanel_mc 1.0\n"
-            "MainMenu SettingsPanel_mc 0.8\n"
-            "MainMenu ButtonBar_mc 0.8\n"
-            "MainMenu EngagementPrompt_mc 0.6\n"
-            "PauseMenu GameLogo_mc -0.5\n"
-            "PauseMenu MainPanel_mc 1.0\n"
-            "PauseMenu LoadPanel_mc 1.0\n"
-            "PauseMenu SavePanel_mc 1.0\n"
-            "PauseMenu SettingsPanel_mc 0.8\n"
-            "PauseMenu HelpPanel_mc 0.8\n"
-            "PauseMenu InstalledContentPanel_mc 0.8\n"
-            "PauseMenu CreationsLibraryPanel_mc 0.8\n";
+            "# SFVR menu depth 2\n"
+            "# Fullscreen menus sit on a flat panel 3 m away. Each line puts part of a menu at a depth tier, in metres toward\n"
+            "# the player (negative is behind the panel). Saved changes apply while the game runs.\n"
+            "#   tier <name> <metres>               a depth every menu shares\n"
+            "#   tilt <degrees>                     how far tilted parts turn toward the player\n"
+            "#   <menu> <clip.path> <tier> [tilt]   a clip, by its path from the menu's root clip\n"
+            "#   <menu> @x0,y0,x1,y1 <tier> [tilt]  the root clip's children placed inside that rectangle of the 1920x1080 stage\n"
+            "tier backdrop -0.5\n"
+            "tier surface 0\n"
+            "tier info 0.3\n"
+            "tier controls 0.8\n"
+            "tier focus 1.0\n"
+            "tier modal 1.2\n"
+            "tilt 12\n"
+            "\n"
+            "MainMenu GameLogo_mc backdrop\n"
+            "MainMenu AdBannerHolder_mc info\n"
+            "MainMenu MOTDHolder_mc info\n"
+            "MainMenu MainPanel_mc focus tilt\n"
+            "MainMenu LoadPanel_mc focus\n"
+            "MainMenu SettingsPanel_mc controls\n"
+            "MainMenu ButtonBar_mc controls\n"
+            "MainMenu EngagementPrompt_mc controls\n"
+            "\n"
+            "PauseMenu GameLogo_mc backdrop\n"
+            "PauseMenu MainPanel_mc focus tilt\n"
+            "PauseMenu LoadPanel_mc focus\n"
+            "PauseMenu SavePanel_mc focus\n"
+            "PauseMenu SettingsPanel_mc controls\n"
+            "PauseMenu HelpPanel_mc controls\n"
+            "PauseMenu InstalledContentPanel_mc controls\n"
+            "PauseMenu CreationsLibraryPanel_mc controls\n"
+            "\n"
+            "# The hub: the player stays on the surface, the six tiles and the selection highlight come forward.\n"
+            "DataMenu @0,60,520,480 focus\n"
+            "DataMenu Map_mc focus\n"
+            "DataMenu @0,560,520,940 focus\n"
+            "DataMenu Ship_mc focus\n"
+            "DataMenu @1400,60,1920,480 focus\n"
+            "DataMenu Skill_mc focus\n"
+            "DataMenu @1400,560,1920,940 focus\n"
+            "DataMenu Inventory_mc focus\n"
+            "DataMenu @900,40,1020,120 focus\n"
+            "DataMenu Power_mc focus\n"
+            "DataMenu @0,880,1920,1000 focus\n"
+            "DataMenu Mission_mc focus\n"
+            "DataMenu MenuHighlight_mc focus\n"
+            "\n"
+            "InventoryMenu CategoryHeader_mc focus tilt\n"
+            "InventoryMenu CategoryList_mc focus tilt\n"
+            "InventoryMenu CategoryFooter_mc focus tilt\n"
+            "InventoryMenu ItemHeader_mc focus tilt\n"
+            "InventoryMenu ItemList_mc focus tilt\n"
+            "InventoryMenu ItemCard_mc info\n"
+            "InventoryMenu EquippedItemCard_mc info\n"
+            "InventoryMenu PlayerStatus_mc info\n"
+            "InventoryMenu ButtonBar_mc controls\n"
+            "InventoryMenu QuantityMenu_mc modal\n"
+            "InventoryMenu LegendaryDetailCard_mc modal\n";
 
         struct ClipDepth
         {
-            std::vector<std::string> path;
-            double                   metres;
+            std::vector<std::string> path;  // empty for a region
+            double                   region[4]{};
+            double                   metres{ 0.0 };
+            bool                     tilt{ false };
         };
 
         std::mutex                                              g_layout_mutex;
         std::unordered_map<std::string, std::vector<ClipDepth>> g_layout;
+        std::atomic<double>                                     g_tilt_degrees{ 0.0 };
         std::filesystem::file_time_type                         g_layout_time{};
         std::atomic<int>                                        g_layout_check{ 0 };
         std::mutex                                              g_load_mutex;
@@ -62,7 +107,18 @@ namespace MenuStereo
         {
             const auto path = Framework::get_persistent_dir("menu_depth.txt");
             std::error_code error;
-            if (!std::filesystem::exists(path, error)) {
+            bool write = !std::filesystem::exists(path, error);
+            if (!write) {
+                std::string first;
+                std::getline(std::ifstream{ path }, first);
+                if (first.rfind(kLayoutHeader, 0) != 0) {
+                    const auto old = Framework::get_persistent_dir("menu_depth.v1.txt");
+                    std::filesystem::rename(path, old, error);
+                    spdlog::info("[MenuStereo] menu_depth.txt is from an older version; kept as {}", old.string());
+                    write = true;
+                }
+            }
+            if (write) {
                 std::ofstream{ path } << kDefaultLayout;
                 spdlog::info("[MenuStereo] Wrote the default menu depth layout to {}", path.string());
             }
@@ -71,7 +127,9 @@ namespace MenuStereo
                 return;
             }
             g_layout_time = time;
+            std::unordered_map<std::string, double>                 tiers;
             std::unordered_map<std::string, std::vector<ClipDepth>> layout;
+            double tilt = 0.0;
             std::ifstream file{ path };
             std::string line;
             int clips = 0;
@@ -80,23 +138,55 @@ namespace MenuStereo
                     continue;
                 }
                 std::istringstream words{ line };
-                std::string menu, clip;
-                double metres = 0.0;
-                if (!(words >> menu >> clip >> metres)) {
+                std::string first, second, third, fourth;
+                words >> first >> second;
+                if (first == "tilt") {
+                    tilt = std::atof(second.c_str());
+                    continue;
+                }
+                words >> third >> fourth;
+                if (first == "tier") {
+                    if (third.empty()) {
+                        spdlog::error("[MenuStereo] menu_depth.txt: \"{}\" has no depth", line);
+                        continue;
+                    }
+                    tiers[second] = std::atof(third.c_str());
+                    continue;
+                }
+                if (second.empty() || third.empty()) {
                     spdlog::error("[MenuStereo] menu_depth.txt: cannot read \"{}\"", line);
                     continue;
                 }
-                ClipDepth entry{ {}, metres };
-                std::istringstream parts{ clip };
-                for (std::string part; std::getline(parts, part, '.');) {
-                    entry.path.push_back(part);
+                ClipDepth entry{};
+                if (const auto tier = tiers.find(third); tier != tiers.end()) {
+                    entry.metres = tier->second;
+                } else {
+                    char* end = nullptr;
+                    entry.metres = std::strtod(third.c_str(), &end);
+                    if (end == third.c_str()) {
+                        spdlog::error("[MenuStereo] menu_depth.txt: \"{}\": no tier named {}", line, third);
+                        continue;
+                    }
                 }
-                layout[menu].push_back(std::move(entry));
+                entry.tilt = fourth == "tilt";
+                if (second[0] == '@') {
+                    if (std::sscanf(second.c_str() + 1, "%lf,%lf,%lf,%lf", &entry.region[0], &entry.region[1], &entry.region[2], &entry.region[3]) != 4) {
+                        spdlog::error("[MenuStereo] menu_depth.txt: \"{}\": a region is @x0,y0,x1,y1", line);
+                        continue;
+                    }
+                } else {
+                    std::istringstream parts{ second };
+                    for (std::string part; std::getline(parts, part, '.');) {
+                        entry.path.push_back(part);
+                    }
+                }
+                layout[first].push_back(std::move(entry));
                 ++clips;
             }
+            g_tilt_degrees.store(tilt);
             std::scoped_lock _{ g_layout_mutex };
             g_layout = std::move(layout);
-            spdlog::info("[MenuStereo] Menu depth layout: {} clips in {} menus", clips, g_layout.size());
+            spdlog::info("[MenuStereo] Menu depth layout: {} entries in {} menus, {} tiers, tilt {} degrees", clips, g_layout.size(), tiers.size(), tilt);
         }
 
         // ---- Menus, their movies, and the clips moved in them.
@@ -116,6 +206,8 @@ namespace MenuStereo
             double base[4]{};
             double wrote[4]{};
             bool   placed{ false };
+            // -1 when the clip lies left of the projection centre, 1 right of it.
+            double side{ 1.0 };
         };
         std::mutex                        g_placed_mutex;
         std::unordered_map<void*, Placed> g_placed;  // clip -> values
@@ -134,6 +226,20 @@ namespace MenuStereo
             return true;
         }
 
+        // A clip's position before it was placed.
+        bool OwnPosition(const GFx::Value& clip, double& x, double& y)
+        {
+            {
+                std::scoped_lock _{ g_placed_mutex };
+                if (const auto it = g_placed.find(clip.GetData()); it != g_placed.end() && it->second.placed) {
+                    x = it->second.base[0];
+                    y = it->second.base[1];
+                    return true;
+                }
+            }
+            return Number(clip, "x", x) && Number(clip, "y", y);
+        }
+
         // The focal length and projection centre of the movie's perspective, in stage pixels.
         bool Perspective(const GFx::Value& clip, double& focal, double& cx, double& cy)
         {
@@ -145,7 +251,8 @@ namespace MenuStereo
 
         // Moves a clip `z` along its axis in the perspective, and toward the projection centre by as much as that makes
         // it larger, so it keeps its place and size on the panel. (cx, cy) is the centre in the clip's parent's space.
-        void Place(GFx::Value& clip, double z, double focal, double cx, double cy)
+        // Tilted clips turn about their vertical axis so the edge nearer the centre goes back.
+        void Place(GFx::Value& clip, double z, double tilt, double focal, double cx, double cy)
         {
             static const char* kNames[4]{ "x", "y", "scaleX", "scaleY" };
             double now[4]{};
@@ -166,11 +273,16 @@ namespace MenuStereo
             }
             if (!placed.placed) {
                 placed.placed = true;
-                spdlog::info("[MenuStereo] Clip at {:.1f}, {:.1f} scale {:.3f} placed {:.1f} along the perspective", now[0], now[1], now[2], z);
+                double width = 0.0;
+                Number(clip, "width", width);
+                placed.side = now[0] + width * 0.5 < cx ? -1.0 : 1.0;
+                spdlog::info("[MenuStereo] Clip at {:.1f}, {:.1f} scale {:.3f} width {:.1f} placed {:.1f} along the perspective", now[0], now[1], now[2], width, z);
             }
             const double k = (focal + z) / focal;
             const double out[4]{ cx + (placed.base[0] - cx) * k, cy + (placed.base[1] - cy) * k, placed.base[2] * k, placed.base[3] * k };
             clip.SetMember("z", GFx::Value(z));
+            // Positive rotationY brings a clip's right edge toward the viewer.
+            clip.SetMember("rotationY", GFx::Value(tilt * placed.side));
             for (int i = 0; i < 4; ++i) {
                 clip.SetMember(kNames[i], GFx::Value(out[i]));
                 placed.wrote[i] = out[i];
@@ -479,6 +591,11 @@ namespace MenuStereo
             return;
         }
         std::scoped_lock _{ g_menus_mutex };
+        static std::unordered_map<std::string, bool> seen;
+        if (!seen[name]) {
+            seen[name] = true;
+            spdlog::info("[MenuStereo] Menu {} opened", name);
+        }
         g_menus[movie] = MenuMovie{ menu, name };
     }
 
@@ -544,6 +661,7 @@ namespace MenuStereo
         }
 
         // A metre on the panel, 3 m away, is a third of the focal length in the menu's depth.
+        const double tilt = g_tilt_degrees.load();
         constexpr size_t kMaxDepth = 8;
         for (const auto& clip_depth : clips) {
             if (clip_depth.path.empty() || clip_depth.path.size() > kMaxDepth) {
@@ -575,7 +693,39 @@ namespace MenuStereo
                 continue;
             }
             const double z = -clip_depth.metres * focal / VR::kMenuPanelDistance;
-            Place(chain[clip_depth.path.size() - 1], z, focal, (cx - px) / ps, (cy - py) / ps);
+            Place(chain[clip_depth.path.size() - 1], z, clip_depth.tilt ? tilt : 0.0, focal, (cx - px) / ps, (cy - py) / ps);
+        }
+
+        // Regions: the root clip's children whose own position lies inside, in stage pixels.
+        bool any_region = false;
+        for (const auto& clip_depth : clips) {
+            any_region = any_region || clip_depth.path.empty();
+        }
+        if (!any_region) {
+            return;
+        }
+        auto root = const_cast<GFx::Value*>(menu_root);
+        double children = 0.0;
+        if (!Number(*root, "numChildren", children)) {
+            return;
+        }
+        for (uint32_t i = 0; i < (uint32_t)children && i < 512; ++i) {
+            GFx::Value child, index{ i };
+            double x = 0.0, y = 0.0;
+            if (!root->Invoke("getChildAt", &child, &index, 1) || !child.IsObjectLike() || !OwnPosition(child, x, y)) {
+                continue;
+            }
+            const double sx = ox + x * scale;
+            const double sy = oy + y * scale;
+            for (const auto& clip_depth : clips) {
+                const auto& r = clip_depth.region;
+                if (!clip_depth.path.empty() || sx < r[0] || sx > r[2] || sy < r[1] || sy > r[3]) {
+                    continue;
+                }
+                const double z = -clip_depth.metres * focal / VR::kMenuPanelDistance;
+                Place(child, z, clip_depth.tilt ? tilt : 0.0, focal, (cx - ox) / scale, (cy - oy) / scale);
+                break;
+            }
         }
     }
 
