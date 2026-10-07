@@ -7,6 +7,7 @@
 #include <Framework.hpp>
 #include <RE/C/CreationRendererPrivate.h>
 #include <_deps/directxtk12-src/Src/d3dx12.h>
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -269,6 +270,27 @@ namespace MenuStereo
             set((int)selected, z);
         }
 
+        // The clip a clip is masked by, or null.
+        void* MaskOf(const GFx::Value& clip)
+        {
+            GFx::Value mask;
+            return clip.GetMember("mask", &mask) && mask.IsObjectLike() ? mask.GetData() : nullptr;
+        }
+
+        void LogKept(const GFx::Value& clip, const char* why)
+        {
+            static std::mutex                      mutex;
+            static std::unordered_map<void*, bool> logged;
+            std::scoped_lock _{ mutex };
+            if (logged[clip.GetData()]) {
+                return;
+            }
+            logged[clip.GetData()] = true;
+            GFx::Value name;
+            const char* text = clip.GetMember("name", &name) ? name.GetString() : nullptr;
+            spdlog::info("[MenuStereo] {} stays on the surface: {}", text ? text : "(unnamed)", why);
+        }
+
         // A clip's position before it was placed.
         bool OwnPosition(const GFx::Value& clip, double& x, double& y)
         {
@@ -324,7 +346,10 @@ namespace MenuStereo
                     placed.side = 0.0;
                     spdlog::error("[MenuStereo] A clip {:.0f} wide is set to tilt; only parts narrower than half the stage tilt", width);
                 }
-                spdlog::info("[MenuStereo] Clip at {:.1f}, {:.1f} scale {:.3f} width {:.1f} placed {:.1f} along the perspective", now[0], now[1], now[2], width, z);
+                GFx::Value name;
+                const char* text = clip.GetMember("name", &name) ? name.GetString() : nullptr;
+                spdlog::info("[MenuStereo] {} at {:.1f}, {:.1f} scale {:.3f} width {:.1f} placed {:.1f} along the perspective", text ? text : "(unnamed)", now[0], now[1],
+                             now[2], width, z);
             }
             const double k = (focal + z) / focal;
             const double out[4]{ cx + (placed.base[0] - cx) * k, cy + (placed.base[1] - cy) * k, placed.base[2] * k, placed.base[3] * k };
@@ -711,6 +736,8 @@ namespace MenuStereo
         // A metre on the panel, 3 m away, is a third of the focal length in the menu's depth.
         const double tilt = g_tilt_degrees.load();
         constexpr size_t kMaxDepth = 8;
+        // Clips named on a line of their own; regions leave them to that line.
+        std::vector<void*> named;
         for (const auto& clip_depth : clips) {
             if (clip_depth.path.empty() || clip_depth.path.size() > kMaxDepth) {
                 continue;
@@ -741,11 +768,17 @@ namespace MenuStereo
                 continue;
             }
             const double z = -clip_depth.metres * focal / VR::kMenuPanelDistance;
+            auto& clip = chain[clip_depth.path.size() - 1];
             if (clip_depth.lift) {
-                LiftSelection(chain[clip_depth.path.size() - 1], z / ps);
+                LiftSelection(clip, z / ps);
                 continue;
             }
-            Place(chain[clip_depth.path.size() - 1], z, clip_depth.tilt ? tilt : 0.0, focal, (cx - px) / ps, (cy - py) / ps);
+            named.push_back(clip.GetData());
+            if (MaskOf(clip) != nullptr) {
+                LogKept(clip, "it is masked");
+                continue;
+            }
+            Place(clip, z, clip_depth.tilt ? tilt : 0.0, focal, (cx - px) / ps, (cy - py) / ps);
         }
 
         // Regions: the root clip's children whose own position lies inside, in stage pixels.
@@ -761,18 +794,37 @@ namespace MenuStereo
         if (!Number(*root, "numChildren", children)) {
             return;
         }
-        for (uint32_t i = 0; i < (uint32_t)children && i < 512; ++i) {
+        const uint32_t count = std::min<uint32_t>((uint32_t)children, 512);
+        std::vector<void*> masks;
+        for (uint32_t i = 0; i < count; ++i) {
+            GFx::Value child, index{ i };
+            if (root->Invoke("getChildAt", &child, &index, 1) && child.IsObjectLike()) {
+                if (auto mask = MaskOf(child)) {
+                    masks.push_back(mask);
+                }
+            }
+        }
+        for (uint32_t i = 0; i < count; ++i) {
             GFx::Value child, index{ i };
             double x = 0.0, y = 0.0;
             if (!root->Invoke("getChildAt", &child, &index, 1) || !child.IsObjectLike() || !OwnPosition(child, x, y)) {
                 continue;
             }
+            if (std::find(named.begin(), named.end(), child.GetData()) != named.end()) {
+                continue;
+            }
+            const bool is_mask = std::find(masks.begin(), masks.end(), child.GetData()) != masks.end();
+            const bool masked  = MaskOf(child) != nullptr;
             const double sx = ox + x * scale;
             const double sy = oy + y * scale;
             for (const auto& clip_depth : clips) {
                 const auto& r = clip_depth.region;
                 if (!clip_depth.path.empty() || sx < r[0] || sx > r[2] || sy < r[1] || sy > r[3]) {
                     continue;
+                }
+                if (is_mask || masked) {
+                    LogKept(child, is_mask ? "it masks another clip" : "it is masked");
+                    break;
                 }
                 const double z = -clip_depth.metres * focal / VR::kMenuPanelDistance;
                 Place(child, z, clip_depth.tilt ? tilt : 0.0, focal, (cx - ox) / scale, (cy - oy) / scale);
