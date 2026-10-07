@@ -391,18 +391,43 @@ namespace MenuStereo
         };
         StereoParams g_params{};
 
-        // A parallax-only projection for one eye. Every point is drawn where the stage plane would show it, as if it lay on
-        // that plane (depth `zp`), so nothing changes place or size with depth; depth only moves it across, by `shift` NDC
-        // per view unit nearer than the stage plane, the opposite way in the other eye.
-        void EyeProjection(const float* p, float zp, float shift, float* out)
+        // Each eye sees the menu through a genuine perspective projection, so everything in Scaleform that relies on one
+        // (filter caches, culling, bounds) works as designed. Its camera is kFarther times farther from the stage than the
+        // movie's own, with the field of view narrowed to match, so the stage maps exactly as before and a clip moved to
+        // a menu depth changes size by well under a percent: depth shows as the offset between the eyes, not as growth.
+        constexpr float kFarther = 20.0f;
+
+        // The movie's projection `p` seen from kFarther times its distance `distance` to the stage: the x and y rows
+        // scaled by kFarther, after a move back along z by (kFarther - 1) times the distance.
+        void FarProjection(const float* p, float distance, float* out)
         {
+            float m[16];
+            std::memcpy(m, p, sizeof(m));
+            for (int c = 0; c < 4; ++c) {
+                m[c] *= kFarther;
+                m[4 + c] *= kFarther;
+            }
+            const float back = -(kFarther - 1.0f) * distance;
+            for (int r = 0; r < 4; ++r) {
+                m[r * 4 + 3] += m[r * 4 + 2] * back;
+            }
+            std::memcpy(out, m, sizeof(m));
+        }
+
+        // A projection for an eye `s` view units across from the centre, which leaves the stage plane (view depth `zp`)
+        // where it is: the eye's shift, then the shear that brings the stage plane back.
+        void EyeProjection(const float* p, float zp, float s, float* out)
+        {
+            float m[16];
+            std::memcpy(m, p, sizeof(m));
+            for (int r = 0; r < 4; ++r) {
+                m[r * 4 + 3] -= s * m[r * 4 + 0];
+            }
             const float w0 = p[14] * zp + p[15];
-            float m[16]{
-                p[0], p[1], shift * w0, p[3] + p[2] * zp - shift * w0 * zp,
-                p[4], p[5], 0.0f,       p[7] + p[6] * zp,
-                p[8], p[9], p[10],      p[11],
-                0.0f, 0.0f, 0.0f,       w0,
-            };
+            const float k  = p[0] * s / w0;
+            for (int c = 0; c < 4; ++c) {
+                m[c] += k * m[12 + c];
+            }
             std::memcpy(out, m, sizeof(m));
         }
 
@@ -416,19 +441,21 @@ namespace MenuStereo
         {
             // The stage plane spans NDC -1..1 across the panel, so view units per metre on it are its width over the
             // panel's. Seen from a panel D away, a point m nearer moves each eye's image by half the eye distance times
-            // m / (D - m); with z set to give that ratio over the stage plane's distance, each eye moves by half the eye
-            // distance per stage distance of z. Nearer points move right in the left eye.
+            // m / (D - m), which z is chosen to give over the stage plane's distance. From the far camera the eyes are
+            // kFarther times farther apart to give the same offsets. Nearer points move right in the left eye.
             const float zp    = -screen_distance;
             const float w0    = projection[14] * zp + projection[15];
             const float width = 2.0f * w0 / std::abs(projection[0]);
             const float half  = 0.5f * g_ipd.load() * width / VR::menu_panel_width();
-            const float shift = 2.0f * half / (width * screen_distance);
+            float distant[16];
+            FarProjection(projection, screen_distance, distant);
+            const float s = (projection[0] < 0.0f ? -half : half) * kFarther;
             if (left) {
-                EyeProjection(projection, zp, shift, left);
+                EyeProjection(distant, zp, -s, left);
                 g_eye_projections[0].fetch_add(1);
             }
             if (right) {
-                EyeProjection(projection, zp, -shift, right);
+                EyeProjection(distant, zp, s, right);
                 g_eye_projections[1].fetch_add(1);
             }
             static bool logged = false;
@@ -436,7 +463,7 @@ namespace MenuStereo
                 logged = true;
                 // A point halfway to the camera must sit further right in the left eye than in the right.
                 float r[16];
-                EyeProjection(projection, zp, -shift, r);
+                EyeProjection(distant, zp, s, r);
                 const float zc = zp * 0.5f;
                 const float lx = (left[2] * zc + left[3]) / (left[14] * zc + left[15]);
                 const float rx = (r[2] * zc + r[3]) / (r[14] * zc + r[15]);
