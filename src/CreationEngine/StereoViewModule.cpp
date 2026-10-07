@@ -1000,6 +1000,75 @@ void StereoViewModule::CaptureUiLayer(void* render_graph_data, void* pass_data)
     };
     command_list->ResourceBarrier(2, restore);
     vr->set_native_ui_source(m_ui_capture.Get());
+
+    // A fullscreen menu's backdrop: the composite's other large texture, the image the UI is drawn over, copied
+    // before the composite runs. A texture it reads is the scene; one it writes still holds what is under the UI.
+    if (!m_menu_fallback.load()) {
+        return;
+    }
+    const uint32_t count = (uint32_t)data->renderPassItems->_size;
+    ID3D12Resource*       backdrop{ nullptr };
+    D3D12_RESOURCE_STATES backdrop_state{};
+    bool                  backdrop_read{ false };
+    static int            logged = 0;
+    for (uint32_t i = 1; i < count && i < 16; ++i) {
+        auto other_item = data->getRenderPassItemByIndex(i);
+        auto other      = data->getNativeResourceByIndex(i);
+        if (other_item == nullptr || other == nullptr) {
+            continue;
+        }
+        const auto other_desc  = other->GetDesc();
+        const auto other_state = (D3D12_RESOURCE_STATES)RE::CreationRendererPrivate::RenderPassItem::getDXGIState(other_item->stateOrFlags);
+        if (logged < 1) {
+            spdlog::info("[Stereo] Menu composite texture {}: {}x{} format {} state {:x}", i, other_desc.Width, other_desc.Height, (uint32_t)other_desc.Format,
+                         (uint32_t)other_state);
+        }
+        if (other_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || other_desc.SampleDesc.Count != 1 || other_desc.Width < 1024) {
+            continue;
+        }
+        const bool read = (other_state & (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)) != 0;
+        const bool written = (other_state & (D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) != 0;
+        if ((read && !backdrop_read) || (written && backdrop == nullptr)) {
+            backdrop       = other;
+            backdrop_state = other_state;
+            backdrop_read  = read;
+        }
+    }
+    if (logged < 1) {
+        ++logged;
+        spdlog::info("[Stereo] Menu backdrop {} from the composite's {} texture", backdrop ? "taken" : "not found", backdrop_read ? "read" : "written");
+    }
+    if (backdrop == nullptr) {
+        return;
+    }
+    const auto backdrop_desc = backdrop->GetDesc();
+    if (m_backdrop_capture == nullptr || m_backdrop_capture->GetDesc().Width != backdrop_desc.Width || m_backdrop_capture->GetDesc().Height != backdrop_desc.Height ||
+        m_backdrop_capture->GetDesc().Format != backdrop_desc.Format) {
+        m_backdrop_capture.Reset();
+        auto capture_desc = CD3DX12_RESOURCE_DESC::Tex2D(backdrop_desc.Format, backdrop_desc.Width, backdrop_desc.Height, 1, 1, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        const CD3DX12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
+        if (FAILED(g_framework->get_d3d12_hook()->get_device()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &capture_desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                                                       nullptr, IID_PPV_ARGS(&m_backdrop_capture)))) {
+            spdlog::error("[Stereo] Failed to create the menu backdrop capture texture");
+            return;
+        }
+        m_backdrop_capture->SetName(L"Menu backdrop capture");
+        spdlog::info("[Stereo] Menu backdrop captured: {}x{} format {}", backdrop_desc.Width, backdrop_desc.Height, (uint32_t)backdrop_desc.Format);
+    }
+    D3D12_RESOURCE_BARRIER backdrop_to_copy[]{
+        CD3DX12_RESOURCE_BARRIER::Transition(backdrop, backdrop_state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        CD3DX12_RESOURCE_BARRIER::Transition(m_backdrop_capture.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+    };
+    command_list->ResourceBarrier(2, backdrop_to_copy);
+    CD3DX12_TEXTURE_COPY_LOCATION backdrop_dst{ m_backdrop_capture.Get(), 0 };
+    CD3DX12_TEXTURE_COPY_LOCATION backdrop_src{ backdrop, 0 };
+    command_list->CopyTextureRegion(&backdrop_dst, 0, 0, 0, &backdrop_src, nullptr);
+    D3D12_RESOURCE_BARRIER backdrop_restore[]{
+        CD3DX12_RESOURCE_BARRIER::Transition(backdrop, D3D12_RESOURCE_STATE_COPY_SOURCE, backdrop_state),
+        CD3DX12_RESOURCE_BARRIER::Transition(m_backdrop_capture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+    };
+    command_list->ResourceBarrier(2, backdrop_restore);
+    vr->set_native_menu_scene(m_backdrop_capture.Get());
 }
 
 namespace
@@ -1057,25 +1126,6 @@ uintptr_t StereoViewModule::RunLatePass(int pass_kind, void* pass, void* render_
     const int eye = EyeOfGraph(render_graph_data);
     if (eye >= 0) {
         CaptureEyeImage((uint32_t)eye, pass_kind, render_graph_data, pass_data);
-    } else if (m_menu_fallback.load()) {
-        // A fullscreen menu: the main view's graph renders the menu's scene, before the menu's UI is drawn over it.
-        // Some menus render 3D content of their own in another graph, which is left out of this capture.
-        auto       root  = CreationEngineSingletonManager::GetSceneGraphRoot();
-        const auto scene = SceneOf(render_graph_data) & 0xFFFFFF;
-        if (root != nullptr && scene == (At<uint32_t>(root, kRootMainView) & 0xFFFFFF)) {
-            CaptureEyeImage(kMenuSceneCapture, pass_kind, render_graph_data, pass_data);
-        } else {
-            static std::array<uint32_t, 8> logged{};
-            if (std::find(logged.begin(), logged.end(), scene) == logged.end()) {
-                for (auto& slot : logged) {
-                    if (slot == 0) {
-                        slot = scene;
-                        spdlog::info("[Stereo] A menu frame also renders view {:x} in another graph; it is not captured", scene);
-                        break;
-                    }
-                }
-            }
-        }
     }
     return result;
 }

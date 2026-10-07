@@ -150,6 +150,7 @@ private:
     std::array<D3D12_RESOURCE_DESC, 3>                                 m_eye_output_desc{};
     std::array<std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>, 3> m_eye_capture{};
     Microsoft::WRL::ComPtr<ID3D12Resource>                             m_ui_capture{};
+    Microsoft::WRL::ComPtr<ID3D12Resource>                             m_backdrop_capture{};
 
     bool  m_shadow_settings_applied{ false };
     float m_saved_shadow_fade_seconds{ 0.75f };
