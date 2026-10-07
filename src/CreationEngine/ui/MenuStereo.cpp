@@ -26,36 +26,41 @@ namespace MenuStereo
     {
         // ---- The layout: per menu, clips and regions, each at a depth tier (docs/vr-menu-rules.md).
 
-        constexpr const char* kLayoutHeader = "# SFVR menu depth 2";
+        constexpr const char* kLayoutHeader = "# SFVR menu depth 3";
         constexpr const char* kDefaultLayout =
-            "# SFVR menu depth 2\n"
+            "# SFVR menu depth 3\n"
             "# Fullscreen menus sit on a flat panel 3 m away. Each line puts part of a menu at a depth tier, in metres toward\n"
             "# the player (negative is behind the panel). Saved changes apply while the game runs.\n"
             "#   tier <name> <metres>               a depth every menu shares\n"
             "#   tilt <degrees>                     how far tilted parts turn toward the player\n"
             "#   <menu> <clip.path> <tier> [tilt]   a clip, by its path from the menu's root clip\n"
             "#   <menu> @x0,y0,x1,y1 <tier> [tilt]  the root clip's children placed inside that rectangle of the 1920x1080 stage\n"
-            "tier backdrop -0.5\n"
+            "#   <menu> <list.path> lift            the list's selected entry rises off the list by the lift tier\n"
+            "# Logos, decoration and anything covering the stage stay on the surface; nothing goes behind it.\n"
             "tier surface 0\n"
-            "tier info 0.3\n"
-            "tier controls 0.8\n"
-            "tier focus 1.0\n"
-            "tier modal 1.2\n"
+            "tier info 0.1\n"
+            "tier controls 0.2\n"
+            "tier focus 0.35\n"
+            "tier modal 0.5\n"
+            "tier lift 0.08\n"
             "tilt 12\n"
             "\n"
-            "MainMenu GameLogo_mc backdrop\n"
+            "MainMenu GameLogo_mc surface\n"
             "MainMenu AdBannerHolder_mc info\n"
             "MainMenu MOTDHolder_mc info\n"
             "MainMenu MainPanel_mc focus tilt\n"
             "MainMenu LoadPanel_mc focus\n"
+            "MainMenu MainPanel_mc.MainList_mc lift\n"
+            "MainMenu LoadPanel_mc.LoadList_mc lift\n"
             "MainMenu SettingsPanel_mc controls\n"
             "MainMenu ButtonBar_mc controls\n"
             "MainMenu EngagementPrompt_mc controls\n"
             "\n"
-            "PauseMenu GameLogo_mc backdrop\n"
+            "PauseMenu GameLogo_mc surface\n"
             "PauseMenu MainPanel_mc focus tilt\n"
             "PauseMenu LoadPanel_mc focus\n"
             "PauseMenu SavePanel_mc focus\n"
+            "PauseMenu MainPanel_mc.MainList_mc lift\n"
             "PauseMenu SettingsPanel_mc controls\n"
             "PauseMenu HelpPanel_mc controls\n"
             "PauseMenu InstalledContentPanel_mc controls\n"
@@ -81,6 +86,8 @@ namespace MenuStereo
             "InventoryMenu CategoryFooter_mc focus tilt\n"
             "InventoryMenu ItemHeader_mc focus tilt\n"
             "InventoryMenu ItemList_mc focus tilt\n"
+            "InventoryMenu CategoryList_mc lift\n"
+            "InventoryMenu ItemList_mc lift\n"
             "InventoryMenu ItemCard_mc info\n"
             "InventoryMenu EquippedItemCard_mc info\n"
             "InventoryMenu PlayerStatus_mc info\n"
@@ -94,6 +101,7 @@ namespace MenuStereo
             double                   region[4]{};
             double                   metres{ 0.0 };
             bool                     tilt{ false };
+            bool                     lift{ false };  // the path is a list whose selected entry rises
         };
 
         std::mutex                                              g_layout_mutex;
@@ -112,7 +120,8 @@ namespace MenuStereo
                 std::string first;
                 std::getline(std::ifstream{ path }, first);
                 if (first.rfind(kLayoutHeader, 0) != 0) {
-                    const auto old = Framework::get_persistent_dir("menu_depth.v1.txt");
+                    const auto old = Framework::get_persistent_dir("menu_depth.previous.txt");
+                    std::filesystem::remove(old, error);
                     std::filesystem::rename(path, old, error);
                     spdlog::info("[MenuStereo] menu_depth.txt is from an older version; kept as {}", old.string());
                     write = true;
@@ -169,6 +178,7 @@ namespace MenuStereo
                     }
                 }
                 entry.tilt = fourth == "tilt";
+                entry.lift = third == "lift";
                 if (second[0] == '@') {
                     if (std::sscanf(second.c_str() + 1, "%lf,%lf,%lf,%lf", &entry.region[0], &entry.region[1], &entry.region[2], &entry.region[3]) != 4) {
                         spdlog::error("[MenuStereo] menu_depth.txt: \"{}\": a region is @x0,y0,x1,y1", line);
@@ -224,6 +234,36 @@ namespace MenuStereo
             }
             out = value.GetNumber();
             return true;
+        }
+
+        // The entry clip each list last lifted.
+        std::unordered_map<void*, int> g_lifted;  // list -> clip index
+
+        // BSScrollingContainer: selectedClipIndex and GetClipByIndex give the selected entry's clip.
+        void LiftSelection(GFx::Value& list, double z)
+        {
+            double selected = -1.0;
+            if (!Number(list, "selectedClipIndex", selected)) {
+                static bool logged = false;
+                if (!logged) {
+                    logged = true;
+                    spdlog::error("[MenuStereo] A lift entry is not a scrolling list (no selectedClipIndex)");
+                }
+                return;
+            }
+            auto set = [&](int index, double value) {
+                GFx::Value clip, argument{ (double)index };
+                if (index >= 0 && list.Invoke("GetClipByIndex", &clip, &argument, 1) && clip.IsObjectLike()) {
+                    clip.SetMember("z", GFx::Value(value));
+                }
+            };
+            std::scoped_lock _{ g_placed_mutex };
+            auto [it, added] = g_lifted.try_emplace(list.GetData(), -1);
+            if (it->second != (int)selected) {
+                set(it->second, 0.0);
+                it->second = (int)selected;
+            }
+            set((int)selected, z);
         }
 
         // A clip's position before it was placed.
@@ -693,6 +733,10 @@ namespace MenuStereo
                 continue;
             }
             const double z = -clip_depth.metres * focal / VR::kMenuPanelDistance;
+            if (clip_depth.lift) {
+                LiftSelection(chain[clip_depth.path.size() - 1], z / ps);
+                continue;
+            }
             Place(chain[clip_depth.path.size() - 1], z, clip_depth.tilt ? tilt : 0.0, focal, (cx - px) / ps, (cy - py) / ps);
         }
 
