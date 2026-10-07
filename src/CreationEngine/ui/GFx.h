@@ -46,7 +46,13 @@ namespace GFx
 
         [[nodiscard]] bool          GetBool() const { return m_value.b; }
         [[nodiscard]] double        GetNumber() const;
-        [[nodiscard]] const char*   GetString() const { return GetType() == kString ? m_value.s : nullptr; }
+        [[nodiscard]] const char*   GetString() const
+        {
+            if (GetType() != kString) {
+                return nullptr;
+            }
+            return (m_type & kManagedBit) ? *reinterpret_cast<const char* const*>(m_value.s) : m_value.s;
+        }
         [[nodiscard]] void*         GetData() const { return m_value.data; }
 
         bool          GetMember(const char* name, Value* out) const;

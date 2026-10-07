@@ -9,6 +9,8 @@
 #include <_deps/directxtk12-src/Src/d3dx12.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <format>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -27,9 +29,9 @@ namespace MenuStereo
     {
         // ---- The layout: per menu, clips and regions, each at a depth tier (docs/vr-menu-rules.md).
 
-        constexpr const char* kLayoutHeader = "# SFVR menu depth 4";
+        constexpr const char* kLayoutHeader = "# SFVR menu depth 5";
         constexpr const char* kDefaultLayout =
-            "# SFVR menu depth 4\n"
+            "# SFVR menu depth 5\n"
             "# Fullscreen menus sit on a flat panel 3 m away. Each line puts part of a menu at a depth tier, in metres toward\n"
             "# the player (negative is behind the panel). Saved changes apply while the game runs.\n"
             "#   tier <name> <metres>               a depth every menu shares\n"
@@ -50,7 +52,10 @@ namespace MenuStereo
             "MainMenu GameLogo_mc surface\n"
             "MainMenu AdBannerHolder_mc info\n"
             "MainMenu MOTDHolder_mc info\n"
-            "MainMenu MainPanel_mc focus tilt\n"
+            "MainMenu MainPanel_mc.MainList_mc focus tilt\n"
+            "MainMenu MainPanel_mc.ConfirmPrompt_mc modal\n"
+            "MainMenu MainPanel_mc.ButtonBar_mc controls\n"
+            "MainMenu MainPanel_mc.LargeButtonBar_mc controls\n"
             "MainMenu LoadPanel_mc focus\n"
             "MainMenu MainPanel_mc.MainList_mc lift\n"
             "MainMenu LoadPanel_mc.LoadList_mc lift\n"
@@ -213,6 +218,9 @@ namespace MenuStereo
         std::mutex                            g_menus_mutex;
         std::unordered_map<void*, MenuMovie>  g_menus;  // movie -> menu
         std::atomic<float>                    g_ipd{ 0.064f };
+        // A menu opened for the first time this session, snapshotted after this many per-eye frames.
+        std::string                           g_snapshot_name;
+        int                                   g_snapshot_frames{ -1 };
 
         // The values last written to a clip, and the clip's own values they were made from.
         struct Placed
@@ -668,6 +676,8 @@ namespace MenuStereo
         if (!seen[name]) {
             seen[name] = true;
             spdlog::info("[MenuStereo] Menu {} opened", name);
+            g_snapshot_name   = name;
+            g_snapshot_frames = 90;
         }
         g_menus[movie] = MenuMovie{ menu, name };
     }
@@ -845,6 +855,14 @@ namespace MenuStereo
         Copy(command_list, g_left_out.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, g_left.Get(), D3D12_RESOURCE_STATE_COPY_DEST);
         VR::get()->set_native_ui_source_left(g_left_out.Get());
 
+        {
+            std::scoped_lock _{ g_menus_mutex };
+            if (g_snapshot_frames >= 0 && g_snapshot_frames-- == 0) {
+                const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                VR::get()->request_menu_dump(Framework::get_persistent_dir(std::format("vr_menu_{}_{}.png", g_snapshot_name, stamp)).wstring());
+                spdlog::info("[MenuStereo] Saved a snapshot of {}", g_snapshot_name);
+            }
+        }
         static int frames = 0;
         if (++frames % 600 == 1) {
             spdlog::info("[MenuStereo] Per-eye menu frame: eye projections so far left {}, right {}", g_eye_projections[0].load(), g_eye_projections[1].load());

@@ -112,11 +112,13 @@ private:
     static uintptr_t onSetMultiCameraViewData(void* column, uint32_t graph_index, ViewIdArray* views);
     static uintptr_t onSubmitRenderGraph(void* frame_list, void* record);
     static uintptr_t onScaleformComposite(void* pass, void* render_graph_data, void* pass_data);
+    static uintptr_t onUIRenderPass(void* pass, void* render_graph_data, void* pass_data);
     static uintptr_t onSetupSceneView(uintptr_t a1, uintptr_t view, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8);
 
     std::unique_ptr<FunctionHook> m_set_multi_view_hook{};
     std::unique_ptr<FunctionHook> m_submit_graph_hook{};
     std::unique_ptr<FunctionHook> m_scaleform_composite_hook{};
+    std::unique_ptr<FunctionHook> m_ui_render_hook{};
     std::unique_ptr<FunctionHook> m_setup_view_hook{};
     std::unique_ptr<FunctionHook> m_upscaler_hooks[kUpscalerPassCount]{};
     std::unique_ptr<FunctionHook> m_late_hooks[kLatePassCount]{};
@@ -154,6 +156,11 @@ private:
     std::array<std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>, 3> m_eye_capture{};
     Microsoft::WRL::ComPtr<ID3D12Resource>                             m_ui_capture{};
     Microsoft::WRL::ComPtr<ID3D12Resource>                             m_backdrop_capture{};
+    // The texture the composite draws the UI over, and whether it has this frame; menus' 3D models drawn into it
+    // afterwards are drawn onto the backdrop too, through a holding copy.
+    ID3D12Resource*                                                    m_backdrop_source{ nullptr };
+    std::atomic<bool>                                                  m_composited{ false };
+    Microsoft::WRL::ComPtr<ID3D12Resource>                             m_ui3d_hold{};
 
     bool  m_shadow_settings_applied{ false };
     float m_saved_shadow_fade_seconds{ 0.75f };
