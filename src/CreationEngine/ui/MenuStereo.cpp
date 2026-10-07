@@ -14,7 +14,6 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
-#include <limits>
 #include <fstream>
 #include <memory/FunctionHook.h>
 #include <mods/VR.hpp>
@@ -230,16 +229,11 @@ namespace MenuStereo
         std::mutex                            g_menus_mutex;
         std::unordered_map<void*, MenuMovie>  g_menus;  // movie -> menu
         std::atomic<float>                    g_ipd{ 0.064f };
-        // The engine frame a menu with a 3D scene last advanced.
-        std::atomic<int64_t>                  g_scene_frame{ -100 };
-        bool IsSceneMenu(const std::string& name) { return name == "DataMenu" || name == "InventoryMenu"; }
-
         // A menu opened for the first time this session, snapshotted after this many per-eye frames.
         std::string                           g_snapshot_name;
         int                                   g_snapshot_frames{ -1 };
 
-        // Per clip: -1 when it lies left of the projection centre, 1 right of it, 0 when it is too wide to tilt, and
-        // NaN when it stays on the surface because it is drawn through an offscreen cache.
+        // Per clip: -1 when it lies left of the projection centre, 1 right of it, 0 when it is too wide to tilt.
         std::mutex                        g_placed_mutex;
         std::unordered_map<void*, double> g_side;
 
@@ -320,30 +314,6 @@ namespace MenuStereo
                    Number(centre, "y", cy) && focal > 1.0;
         }
 
-        // A clip or a descendant drawn through an offscreen cache: filters (glows, shadows, blurs) or cacheAsBitmap.
-        bool Cached(const GFx::Value& clip, int levels)
-        {
-            GFx::Value filters, cache;
-            if (clip.GetMember("filters", &filters) && filters.IsObjectLike() && filters.GetArraySize() > 0) {
-                return true;
-            }
-            if (clip.GetMember("cacheAsBitmap", &cache) && cache.GetType() == GFx::Value::kBoolean && cache.GetBool()) {
-                return true;
-            }
-            double children = 0.0;
-            if (levels <= 0 || !Number(clip, "numChildren", children)) {
-                return false;
-            }
-            auto& self = const_cast<GFx::Value&>(clip);
-            for (uint32_t i = 0; i < (uint32_t)children && i < 32; ++i) {
-                GFx::Value child, index{ i };
-                if (self.Invoke("getChildAt", &child, &index, 1) && child.IsObjectLike() && Cached(child, levels - 1)) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
         // Gives a clip its depth, and its tilt about its vertical axis so the edge nearer the centre goes back. Only z and
         // rotationY are set: the menu's own code and timelines own every other property, and each eye's projection
         // draws the clip at its 2D place and size. cx is the projection centre in the clip's parent's space.
@@ -367,17 +337,9 @@ namespace MenuStereo
                     }
                     GFx::Value name;
                     const char* text = clip.GetMember("name", &name) ? name.GetString() : nullptr;
-                    if (Cached(clip, 3)) {
-                        it->second = std::numeric_limits<double>::quiet_NaN();
-                        spdlog::info("[MenuStereo] {} stays on the surface: it has filters or a bitmap cache", text ? text : "(unnamed)");
-                    } else {
-                        spdlog::info("[MenuStereo] {} at {:.1f} width {:.1f}: depth {:.1f}{}", text ? text : "(unnamed)", x, width, z, tilt != 0.0 ? ", tilted" : "");
-                    }
+                    spdlog::info("[MenuStereo] {} at {:.1f} width {:.1f}: depth {:.1f}{}", text ? text : "(unnamed)", x, width, z, tilt != 0.0 ? ", tilted" : "");
                 }
                 side = it->second;
-            }
-            if (std::isnan(side)) {
-                return;
             }
             clip.SetMember("z", GFx::Value(z));
             if (tilt != 0.0) {
@@ -754,9 +716,6 @@ namespace MenuStereo
             }
             menu = it->second;
         }
-        if (IsSceneMenu(menu.name)) {
-            g_scene_frame.store(vr->m_engine_frame_count);
-        }
         std::vector<ClipDepth> clips;
         {
             std::scoped_lock _{ g_layout_mutex };
@@ -925,6 +884,4 @@ namespace MenuStereo
     }
 
     void EndFrame() { g_frame_open = false; }
-
-    bool SceneMenuShowing() { return VR::get()->m_engine_frame_count - g_scene_frame.load() <= 3; }
 }

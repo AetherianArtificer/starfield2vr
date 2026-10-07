@@ -15,6 +15,4 @@ namespace MenuStereo
     void OnComposite(ID3D12GraphicsCommandList* command_list, ID3D12Resource* layer);
     // After the Scaleform composite; the next Scaleform pass starts a new frame.
     void EndFrame();
-    // A menu showing a 3D scene of the game's (the data menu's character, the inventory's items) is open.
-    bool SceneMenuShowing();
 }
