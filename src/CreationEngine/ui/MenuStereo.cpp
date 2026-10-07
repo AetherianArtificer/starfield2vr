@@ -115,6 +115,7 @@ namespace MenuStereo
         {
             double base[4]{};
             double wrote[4]{};
+            bool   placed{ false };
         };
         std::mutex                        g_placed_mutex;
         std::unordered_map<void*, Placed> g_placed;  // clip -> values
@@ -155,11 +156,17 @@ namespace MenuStereo
             }
             std::scoped_lock _{ g_placed_mutex };
             auto& placed = g_placed[clip.GetData()];
+            // Positions are kept in twentieths of a pixel, so a value read back differs from the one written by up to
+            // that much; a larger change is the menu moving the clip itself, and its new value is the clip's own.
             for (int i = 0; i < 4; ++i) {
-                // The menu moved the clip itself since it was last placed: its new value is the clip's own.
-                if (std::abs(now[i] - placed.wrote[i]) > 1e-4) {
+                const double tolerance = i < 2 ? 0.1 : 0.002;
+                if (!placed.placed || std::abs(now[i] - placed.wrote[i]) > tolerance) {
                     placed.base[i] = now[i];
                 }
+            }
+            if (!placed.placed) {
+                placed.placed = true;
+                spdlog::info("[MenuStereo] Clip at {:.1f}, {:.1f} scale {:.3f} placed {:.1f} along the perspective", now[0], now[1], now[2], z);
             }
             const double k = (focal + z) / focal;
             const double out[4]{ cx + (placed.base[0] - cx) * k, cy + (placed.base[1] - cy) * k, placed.base[2] * k, placed.base[3] * k };
