@@ -29,9 +29,9 @@ namespace MenuStereo
     {
         // ---- The layout: per menu, clips and regions, each at a depth tier (docs/vr-menu-rules.md).
 
-        constexpr const char* kLayoutHeader = "# SFVR menu depth 5";
+        constexpr const char* kLayoutHeader = "# SFVR menu depth 6";
         constexpr const char* kDefaultLayout =
-            "# SFVR menu depth 5\n"
+            "# SFVR menu depth 6\n"
             "# Fullscreen menus sit on a flat panel 3 m away. Each line puts part of a menu at a depth tier, in metres toward\n"
             "# the player (negative is behind the panel). Saved changes apply while the game runs.\n"
             "#   tier <name> <metres>               a depth every menu shares\n"
@@ -39,7 +39,8 @@ namespace MenuStereo
             "#   <menu> <clip.path> <tier> [tilt]   a clip, by its path from the menu's root clip\n"
             "#   <menu> @x0,y0,x1,y1 <tier> [tilt]  the root clip's children placed inside that rectangle of the 1920x1080 stage\n"
             "#   <menu> <list.path> lift            the list's selected entry rises off the list by the lift tier\n"
-            "# Only parts narrower than half the stage tilt.\n"
+            "# Only parts narrower than half the stage tilt. A line at the surface tier leaves its clips untouched: timeline masks\n"
+            "# (clip depths) and what they mask must stay there, or everything drawn after them vanishes.\n"
             "# Logos, decoration and anything covering the stage stay on the surface; nothing goes behind it.\n"
             "tier surface 0\n"
             "tier info 0.1\n"
@@ -75,7 +76,13 @@ namespace MenuStereo
             "PauseMenu InstalledContentPanel_mc controls\n"
             "PauseMenu CreationsLibraryPanel_mc controls\n"
             "\n"
-            "# The hub: the player stays on the surface, the six tiles and the selection highlight come forward.\n"
+            "# The hub: the player stays on the surface, the six tiles and the selection highlight come forward. The planet,\n"
+            "# weapon and ship previews are cut out by timeline masks, which stay on the surface with what they mask.\n"
+            "DataMenu @125,135,135,150 surface\n"
+            "DataMenu InventoryPreviewClipMask_mc surface\n"
+            "DataMenu InventoryWeaponPreview_mc surface\n"
+            "DataMenu ShipPreviewClipMask_mc surface\n"
+            "DataMenu ShipPreview_mc surface\n"
             "DataMenu @0,60,520,480 focus\n"
             "DataMenu Map_mc focus\n"
             "DataMenu @0,560,520,940 focus\n"
@@ -230,6 +237,7 @@ namespace MenuStereo
             bool   placed{ false };
             // -1 when the clip lies left of the projection centre, 1 right of it; 0 when it is too wide to tilt.
             double side{ 1.0 };
+            int    rebases{ 0 };
         };
         std::mutex                        g_placed_mutex;
         std::unordered_map<void*, Placed> g_placed;  // clip -> values
@@ -338,11 +346,18 @@ namespace MenuStereo
             auto& placed = g_placed[clip.GetData()];
             // Positions are kept in twentieths of a pixel, so a value read back differs from the one written by up to
             // that much; a larger change is the menu moving the clip itself, and its new value is the clip's own.
+            // Scale read back from a tilted clip comes from its 3D matrix, smaller by the cosine of the tilt, so only a
+            // change well beyond that is the menu scaling the clip itself.
+            int rebased = 0;
             for (int i = 0; i < 4; ++i) {
-                const double tolerance = i < 2 ? 0.1 : 0.002;
+                const double tolerance = i < 2 ? 0.1 : std::max(0.002, std::abs(placed.wrote[i]) * 0.05);
                 if (!placed.placed || std::abs(now[i] - placed.wrote[i]) > tolerance) {
                     placed.base[i] = now[i];
+                    rebased += placed.placed ? 1 : 0;
                 }
+            }
+            if (rebased > 0 && ++placed.rebases == 30) {
+                spdlog::error("[MenuStereo] A clip at {:.1f}, {:.1f} keeps changing under its placement; it may drift", now[0], now[1]);
             }
             if (!placed.placed) {
                 placed.placed = true;
@@ -784,6 +799,9 @@ namespace MenuStereo
                 continue;
             }
             named.push_back(clip.GetData());
+            if (clip_depth.metres == 0.0 && !clip_depth.tilt) {
+                continue;
+            }
             if (MaskOf(clip) != nullptr) {
                 LogKept(clip, "it is masked");
                 continue;
@@ -831,6 +849,9 @@ namespace MenuStereo
                 const auto& r = clip_depth.region;
                 if (!clip_depth.path.empty() || sx < r[0] || sx > r[2] || sy < r[1] || sy > r[3]) {
                     continue;
+                }
+                if (clip_depth.metres == 0.0 && !clip_depth.tilt) {
+                    break;
                 }
                 if (is_mask || masked) {
                     LogKept(child, is_mask ? "it masks another clip" : "it is masked");
