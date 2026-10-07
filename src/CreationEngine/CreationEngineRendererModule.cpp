@@ -215,9 +215,10 @@ uintptr_t CreationEngineRendererModule::setReflexMarkerInternal(uintptr_t rcx, u
         // One menu decision per frame: the render thread updates its flag while the game thread runs ahead.
         ModSettings::g_internalSettings.showQuadDisplayFrame = ModSettings::g_internalSettings.showQuadDisplay;
         vr->set_frame_flat(ModSettings::showFlatScreenDisplay());
-        // The main menu's button list (MainMenu.swf: MainPanel_mc at 60, 381 on the 1920x1080 stage, its list 364 by
-        // 426) floats in front of the title and planet.
-        vr->set_menu_floats({ GameFlow::isMainMenuShowing() ? std::array<float, 4>{ 48.0f / 1920.0f, 369.0f / 1080.0f, 436.0f / 1920.0f, 819.0f / 1080.0f }
+        // The main menu's panels float in front of the title and planet: on the 1920x1080 stage, MainPanel_mc's list at
+        // 60, 381 (364 by 426) and LoadPanel_mc at 286, 381 (its list about 975 by 508, the continue strip and mods note
+        // above it).
+        vr->set_menu_floats({ GameFlow::isMainMenuShowing() ? std::array<float, 4>{ 48.0f / 1920.0f, 335.0f / 1080.0f, 1290.0f / 1920.0f, 900.0f / 1080.0f }
                                                             : std::array<float, 4>{},
                               std::array<float, 4>{}, std::array<float, 4>{}, std::array<float, 4>{} });
         start = clock::now();
