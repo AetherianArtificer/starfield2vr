@@ -26,9 +26,9 @@ namespace MenuStereo
     {
         // ---- The layout: per menu, clips and regions, each at a depth tier (docs/vr-menu-rules.md).
 
-        constexpr const char* kLayoutHeader = "# SFVR menu depth 3";
+        constexpr const char* kLayoutHeader = "# SFVR menu depth 4";
         constexpr const char* kDefaultLayout =
-            "# SFVR menu depth 3\n"
+            "# SFVR menu depth 4\n"
             "# Fullscreen menus sit on a flat panel 3 m away. Each line puts part of a menu at a depth tier, in metres toward\n"
             "# the player (negative is behind the panel). Saved changes apply while the game runs.\n"
             "#   tier <name> <metres>               a depth every menu shares\n"
@@ -36,6 +36,7 @@ namespace MenuStereo
             "#   <menu> <clip.path> <tier> [tilt]   a clip, by its path from the menu's root clip\n"
             "#   <menu> @x0,y0,x1,y1 <tier> [tilt]  the root clip's children placed inside that rectangle of the 1920x1080 stage\n"
             "#   <menu> <list.path> lift            the list's selected entry rises off the list by the lift tier\n"
+            "# Only parts narrower than half the stage tilt.\n"
             "# Logos, decoration and anything covering the stage stay on the surface; nothing goes behind it.\n"
             "tier surface 0\n"
             "tier info 0.1\n"
@@ -57,7 +58,9 @@ namespace MenuStereo
             "MainMenu EngagementPrompt_mc controls\n"
             "\n"
             "PauseMenu GameLogo_mc surface\n"
-            "PauseMenu MainPanel_mc focus tilt\n"
+            "PauseMenu MainPanel_mc.MainList_mc focus tilt\n"
+            "PauseMenu MainPanel_mc.ConfirmPrompt_mc modal\n"
+            "PauseMenu MainPanel_mc.ButtonBar_mc controls\n"
             "PauseMenu LoadPanel_mc focus\n"
             "PauseMenu SavePanel_mc focus\n"
             "PauseMenu MainPanel_mc.MainList_mc lift\n"
@@ -216,7 +219,7 @@ namespace MenuStereo
             double base[4]{};
             double wrote[4]{};
             bool   placed{ false };
-            // -1 when the clip lies left of the projection centre, 1 right of it.
+            // -1 when the clip lies left of the projection centre, 1 right of it; 0 when it is too wide to tilt.
             double side{ 1.0 };
         };
         std::mutex                        g_placed_mutex;
@@ -316,6 +319,11 @@ namespace MenuStereo
                 double width = 0.0;
                 Number(clip, "width", width);
                 placed.side = now[0] + width * 0.5 < cx ? -1.0 : 1.0;
+                // Only side-anchored lists tilt; a part as wide as half the stage would swing far out of its place.
+                if (tilt != 0.0 && width > 960.0) {
+                    placed.side = 0.0;
+                    spdlog::error("[MenuStereo] A clip {:.0f} wide is set to tilt; only parts narrower than half the stage tilt", width);
+                }
                 spdlog::info("[MenuStereo] Clip at {:.1f}, {:.1f} scale {:.3f} width {:.1f} placed {:.1f} along the perspective", now[0], now[1], now[2], width, z);
             }
             const double k = (focal + z) / focal;
