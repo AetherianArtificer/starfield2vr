@@ -1,5 +1,6 @@
 #ifdef USE_SFSE_PLUGIN
 
+#include <CreationEngine/ui/MenuStereo.h>
 #include <cstdint>
 #include <windows.h>
 
@@ -66,6 +67,7 @@ __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
     if (sfse && sfse->QueryInterface) {
         if (auto menu = static_cast<SFSEMenuInterface*>(sfse->QueryInterface(kInterface_Menu)); menu && menu->RegisterMenuMovieCreated) {
             menu->RegisterMenuMovieCreated(&VRSettingsMenu::OnMenuMovieCreated);
+            menu->RegisterMenuMovieCreated(&MenuStereo::OnMenuMovieCreated);
         }
     }
     StartVR();

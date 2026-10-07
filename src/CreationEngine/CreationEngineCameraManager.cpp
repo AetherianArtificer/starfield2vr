@@ -2,6 +2,7 @@
 // Created by sergp on 6/23/2024.
 //
 
+#include <CreationEngine/ui/MenuStereo.h>
 #include "CreationEngineCameraManager.h"
 #include "CreationEngineConstants.h"
 #include "CreationEngineRendererModule.h"
@@ -177,6 +178,7 @@ CreationEngineCameraManager::onScaleformSetViewPortInternal(uintptr_t *thisMovie
     auto file_url = cc->GetMovieDef()->GetFileURL();
     GameFlow::renderMenu(file_url);
     VRSettingsMenu::OnMovieFrame(thisMovie, file_url);
+    MenuStereo::OnMovieFrame(thisMovie);
 
     auto backbuffer_size = vr->get_backbuffer_size();
     auto viewport_buffer_width = viewport->bufferWidth;

@@ -36,7 +36,6 @@ namespace GameFlow {
     MenuSettings getMenuSettings(std::string_view menuNameHash);
     bool isShowingMenu();
     bool isPilotingShip();
-    bool isMainMenuShowing();
     bool isAimingDownSights();
     bool isWeaponDrawn();
     bool isImmovable();

@@ -11,6 +11,7 @@
 #include <CreationEngine/memory/stereo_offsets.h>
 #include <CreationEngine/models/GameFlow.h>
 #include <CreationEngine/models/ModSettingsStore.h>
+#include <CreationEngine/ui/MenuStereo.h>
 #include <Framework.hpp>
 #include <RE/C/CreationRendererPrivate.h>
 #include <RE/M/Main.h>
@@ -340,6 +341,7 @@ void StereoViewModule::InstallHooks()
         m_scaleform_composite_hook = std::make_unique<FunctionHook>(vtable[7], reinterpret_cast<uintptr_t>(&onScaleformComposite));
         m_scaleform_composite_hook->create();
     }
+    MenuStereo::InstallHooks();
 }
 
 int StereoViewModule::EyeOf(const RE::NiCamera* camera) const
@@ -697,6 +699,7 @@ uintptr_t StereoViewModule::onScaleformComposite(void* pass, void* render_graph_
         instance->CaptureUiLayer(render_graph_data, pass_data);
     }
     const auto result = original(pass, render_graph_data, pass_data);
+    MenuStereo::EndFrame();
     RenderPassProfiler::MarkPass(pass, render_graph_data);
     return result;
 }
@@ -1000,6 +1003,7 @@ void StereoViewModule::CaptureUiLayer(void* render_graph_data, void* pass_data)
     };
     command_list->ResourceBarrier(2, restore);
     vr->set_native_ui_source(m_ui_capture.Get());
+    MenuStereo::OnComposite(command_list, layer);
 
     // A fullscreen menu's backdrop: the composite's other large texture, the image the UI is drawn over, copied
     // before the composite runs. A texture it reads is the scene; one it writes still holds what is under the UI.

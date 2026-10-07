@@ -37,6 +37,9 @@ public:
     // Eye a camera renders in native stereo: 0 left, 1 right, -1 not an eye camera.
     [[nodiscard]] int EyeOf(const RE::NiCamera* camera) const;
 
+    // A fullscreen menu shows this frame: the game's own single view, shown on the menu panel.
+    [[nodiscard]] bool IsMenuFallback() const { return m_menu_fallback.load(); }
+
     // Saves the back buffer and the image each eye of the headset receives on the next frame.
     void RequestEyeScreenshots() { m_screenshot_requested.store(true); }
 
