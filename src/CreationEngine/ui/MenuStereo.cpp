@@ -29,15 +29,17 @@ namespace MenuStereo
     {
         // ---- The layout: per menu, clips and regions, each at a depth tier (docs/vr-menu-rules.md).
 
-        constexpr const char* kLayoutHeader = "# SFVR menu depth 6";
+        constexpr const char* kLayoutHeader = "# SFVR menu depth 7";
         constexpr const char* kDefaultLayout =
-            "# SFVR menu depth 6\n"
+            "# SFVR menu depth 7\n"
             "# Fullscreen menus sit on a flat panel 3 m away. Each line puts part of a menu at a depth tier, in metres toward\n"
             "# the player (negative is behind the panel). Saved changes apply while the game runs.\n"
             "#   tier <name> <metres>               a depth every menu shares\n"
             "#   tilt <degrees>                     how far tilted parts turn toward the player\n"
-            "#   <menu> <clip.path> <tier> [tilt]   a clip, by its path from the menu's root clip\n"
-            "#   <menu> @x0,y0,x1,y1 <tier> [tilt]  the root clip's children placed inside that rectangle of the 1920x1080 stage\n"
+            "#   <menu> <clip.path> <tier> [tilt] [inner]   a clip, by its path from the menu's root clip\n"
+            "#   <menu> @x0,y0,x1,y1 <tier> [tilt] [inner]  the root clip's children placed inside that rectangle of the 1920x1080 stage\n"
+            "# inner moves a clip's children instead of the clip: a clip its parent's timeline animates (a fade in) stops being\n"
+            "# animated once a script moves it, and stays as it was, often invisible.\n"
             "#   <menu> <list.path> lift            the list's selected entry rises off the list by the lift tier\n"
             "# Only parts narrower than half the stage tilt. A line at the surface tier leaves its clips untouched: timeline masks\n"
             "# (clip depths) and what they mask must stay there, or everything drawn after them vanishes.\n"
@@ -83,23 +85,23 @@ namespace MenuStereo
             "DataMenu InventoryWeaponPreview_mc surface\n"
             "DataMenu ShipPreviewClipMask_mc surface\n"
             "DataMenu ShipPreview_mc surface\n"
-            "DataMenu @0,60,520,480 focus\n"
-            "DataMenu Map_mc focus\n"
-            "DataMenu @0,560,520,940 focus\n"
-            "DataMenu Ship_mc focus\n"
-            "DataMenu @1400,60,1920,480 focus\n"
-            "DataMenu Skill_mc focus\n"
-            "DataMenu @1400,560,1920,940 focus\n"
-            "DataMenu Inventory_mc focus\n"
-            "DataMenu @900,40,1020,120 focus\n"
-            "DataMenu Power_mc focus\n"
-            "DataMenu @0,880,1920,1000 focus\n"
-            "DataMenu Mission_mc focus\n"
-            "DataMenu MenuHighlight_mc focus\n"
+            "DataMenu @0,60,520,480 focus inner\n"
+            "DataMenu Map_mc focus inner\n"
+            "DataMenu @0,560,520,940 focus inner\n"
+            "DataMenu Ship_mc focus inner\n"
+            "DataMenu @1400,60,1920,480 focus inner\n"
+            "DataMenu Skill_mc focus inner\n"
+            "DataMenu @1400,560,1920,940 focus inner\n"
+            "DataMenu Inventory_mc focus inner\n"
+            "DataMenu @900,40,1020,120 focus inner\n"
+            "DataMenu Power_mc focus inner\n"
+            "DataMenu @0,880,1920,1000 focus inner\n"
+            "DataMenu Mission_mc focus inner\n"
+            "DataMenu MenuHighlight_mc focus inner\n"
             "\n"
-            "InventoryMenu CategoryHeader_mc focus tilt\n"
-            "InventoryMenu CategoryList_mc focus tilt\n"
-            "InventoryMenu CategoryFooter_mc focus tilt\n"
+            "InventoryMenu CategoryHeader_mc focus tilt inner\n"
+            "InventoryMenu CategoryList_mc focus tilt inner\n"
+            "InventoryMenu CategoryFooter_mc focus tilt inner\n"
             "InventoryMenu ItemHeader_mc focus tilt\n"
             "InventoryMenu ItemList_mc focus tilt\n"
             "InventoryMenu CategoryList_mc lift\n"
@@ -118,6 +120,7 @@ namespace MenuStereo
             double                   metres{ 0.0 };
             bool                     tilt{ false };
             bool                     lift{ false };  // the path is a list whose selected entry rises
+            bool                     inner{ false };  // its children move, not the clip
         };
 
         std::mutex                                              g_layout_mutex;
@@ -163,13 +166,13 @@ namespace MenuStereo
                     continue;
                 }
                 std::istringstream words{ line };
-                std::string first, second, third, fourth;
+                std::string first, second, third, fourth, fifth;
                 words >> first >> second;
                 if (first == "tilt") {
                     tilt = std::atof(second.c_str());
                     continue;
                 }
-                words >> third >> fourth;
+                words >> third >> fourth >> fifth;
                 if (first == "tier") {
                     if (third.empty()) {
                         spdlog::error("[MenuStereo] menu_depth.txt: \"{}\" has no depth", line);
@@ -193,7 +196,8 @@ namespace MenuStereo
                         continue;
                     }
                 }
-                entry.tilt = fourth == "tilt";
+                entry.tilt  = fourth == "tilt" || fifth == "tilt";
+                entry.inner = fourth == "inner" || fifth == "inner";
                 entry.lift = third == "lift";
                 if (second[0] == '@') {
                     if (std::sscanf(second.c_str() + 1, "%lf,%lf,%lf,%lf", &entry.region[0], &entry.region[1], &entry.region[2], &entry.region[3]) != 4) {
@@ -390,6 +394,28 @@ namespace MenuStereo
             for (int i = 0; i < 4; ++i) {
                 clip.SetMember(kNames[i], GFx::Value(out[i]));
                 placed.wrote[i] = out[i];
+            }
+        }
+
+        // Places a clip, or its children for an inner line. (ox, oy, scale) places the clip's parent on the stage.
+        void PlaceGroup(GFx::Value& clip, bool inner, double z, double tilt, double focal, double cx, double cy, double ox, double oy, double scale)
+        {
+            if (!inner) {
+                Place(clip, z, tilt, focal, (cx - ox) / scale, (cy - oy) / scale);
+                return;
+            }
+            double x = 0.0, y = 0.0, s = 1.0, children = 0.0;
+            if (!Number(clip, "x", x) || !Number(clip, "y", y) || !Number(clip, "scaleX", s) || s == 0.0 || !Number(clip, "numChildren", children)) {
+                return;
+            }
+            const double px = ox + x * scale;
+            const double py = oy + y * scale;
+            const double ps = scale * s;
+            for (uint32_t i = 0; i < (uint32_t)children && i < 256; ++i) {
+                GFx::Value child, index{ i };
+                if (clip.Invoke("getChildAt", &child, &index, 1) && child.IsObjectLike()) {
+                    Place(child, z, tilt, focal, (cx - px) / ps, (cy - py) / ps);
+                }
             }
         }
 
@@ -834,7 +860,8 @@ namespace MenuStereo
                 LogKept(clip, "it is masked");
                 continue;
             }
-            Place(clip, z, clip_depth.tilt ? tilt : 0.0, focal, (cx - px) / ps, (cy - py) / ps);
+            // (px, py, ps) places the clip's parent on the stage.
+            PlaceGroup(clip, clip_depth.inner, z, clip_depth.tilt ? tilt : 0.0, focal, cx, cy, px, py, ps);
         }
 
         // Regions: the root clip's children whose own position lies inside, in stage pixels.
@@ -886,7 +913,7 @@ namespace MenuStereo
                     break;
                 }
                 const double z = -clip_depth.metres * focal / VR::kMenuPanelDistance;
-                Place(child, z, clip_depth.tilt ? tilt : 0.0, focal, (cx - ox) / scale, (cy - oy) / scale);
+                PlaceGroup(child, clip_depth.inner, z, clip_depth.tilt ? tilt : 0.0, focal, cx, cy, ox, oy, scale);
                 break;
             }
         }
