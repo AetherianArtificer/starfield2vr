@@ -39,6 +39,9 @@ public:
 
     // A fullscreen menu shows this frame: the game's own single view, shown on the menu panel.
     [[nodiscard]] bool IsMenuFallback() const { return m_menu_fallback.load(); }
+    // A fullscreen menu showing a 3D scene: both eye views keep rendering it, from eye cameras on either side of the
+    // game's camera, and each eye's image is that menu's backdrop.
+    [[nodiscard]] bool IsSceneStereo() const { return m_scene_stereo.load(); }
 
     // Saves the back buffer and the image each eye of the headset receives on the next frame.
     void RequestEyeScreenshots() { m_screenshot_requested.store(true); }
@@ -146,6 +149,7 @@ private:
 
     // Fullscreen menus run the game's own single view; they are shown on the flat screen.
     std::atomic<bool> m_menu_fallback{ false };
+    std::atomic<bool> m_scene_stereo{ false };
 
     // Per eye, one capture texture for each output size the post chain writes.
     // Captures per eye, and a third for the menu's scene while a fullscreen menu shows.

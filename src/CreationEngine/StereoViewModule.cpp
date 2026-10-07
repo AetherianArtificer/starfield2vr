@@ -417,6 +417,20 @@ void StereoViewModule::OnFrameStart()
 
     const bool stereo = vr->is_native_stereo() && m_registered;
     UpdateMenuFallback(stereo);
+    const bool scene = stereo && m_menu_fallback.load() && MenuStereo::SceneMenuShowing();
+    if (scene != m_scene_stereo.exchange(scene)) {
+        spdlog::info("[Stereo] {}", scene ? "A menu's 3D scene renders in stereo" : "Menu 3D scene stereo ended");
+        if (scene) {
+            auto root = CreationEngineSingletonManager::GetSceneGraphRoot();
+            if (root && root->worldCamera) {
+                const auto& f = root->worldCamera->viewFrustum;
+                const float* viewport = reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(root->worldCamera) + kCameraViewport);
+                spdlog::info("[Stereo] Menu camera frustum ({:.3f}, {:.3f}, {:.3f}, {:.3f}) near {:.3f}, viewport ({:.2f}, {:.2f}, {:.2f}, {:.2f})", f.left, f.right, f.top,
+                             f.bottom, f._near, viewport[0], viewport[1], viewport[2], viewport[3]);
+            }
+        }
+    }
+    vr->set_menu_scene_stereo(scene);
     KeepEyeViewportsFull();
     ApplyNativeShadowSettings(stereo);
     // Floating quest markers sit flat on the HUD where the target would be on screen, which does not line up with the
@@ -608,7 +622,7 @@ uintptr_t StereoViewModule::onSetMultiCameraViewData(void* column, uint32_t grap
 
     // The main render graph draws the left eye's view instead of the world camera's.
     auto root = CreationEngineSingletonManager::GetSceneGraphRoot();
-    if (instance->m_registered && vr->is_native_stereo() && !instance->m_menu_fallback.load() && views && root && views->size == 1 &&
+    if (instance->m_registered && vr->is_native_stereo() && (!instance->m_menu_fallback.load() || instance->m_scene_stereo.load()) && views && root && views->size == 1 &&
         column == StorageColumn(offsets::RenderGraphStorage(), kMultiCameraViewColumn) && graph_index == (At<uint32_t>(root, kRootMainRenderGraph) & 0xFFFFFF) &&
         (views->data()[0] & 0xFFFFFF) == (At<uint32_t>(root, kRootMainView) & 0xFFFFFF)) {
         ViewIdArray left{};
@@ -773,7 +787,7 @@ uintptr_t StereoViewModule::onSubmitRenderGraph(void* frame_list, void* record)
 
     // The right eye's graph goes in just ahead of the main graph, which renders the left eye.
     auto root = CreationEngineSingletonManager::GetSceneGraphRoot();
-    if (instance->m_registered && vr->is_native_stereo() && !instance->m_menu_fallback.load() && root &&
+    if (instance->m_registered && vr->is_native_stereo() && (!instance->m_menu_fallback.load() || instance->m_scene_stereo.load()) && root &&
         record == reinterpret_cast<uint8_t*>(root) + kRootMainGraphRecord && At<uint32_t>(root, kRootMainView) != kInvalidId) {
         instance->PrepareRightGraph();
         original(frame_list, instance->m_right_graph_record);

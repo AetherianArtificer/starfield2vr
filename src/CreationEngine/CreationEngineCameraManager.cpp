@@ -224,6 +224,17 @@ void CreationEngineCameraManager::onSetNiFrustumInternal(RE::NiCamera *pCamera, 
         return;
     }
     auto eye = StereoViewModule::Get()->EyeOf(pCamera);
+    if (StereoViewModule::Get()->IsSceneStereo()) {
+        // The game's own frustum, skewed so the eyes converge 3 m ahead: what is 3 m from the game's camera shows at
+        // the menu panel's depth, nearer comes out of it and farther sinks behind.
+        const auto  l     = glm::vec3{ vr->get_eye_transform(VRRuntime::Eye::LEFT)[3] };
+        const auto  r     = glm::vec3{ vr->get_eye_transform(VRRuntime::Eye::RIGHT)[3] };
+        const float shift = 0.5f * glm::length(r - l) / VR::kMenuPanelDistance;
+        const float sign  = eye == 0 ? 1.0f : -1.0f;
+        pFrustum->left += sign * shift;
+        pFrustum->right += sign * shift;
+        return;
+    }
     auto runtime = vr->get_runtime();
     Vector4f frustum = runtime->frustums[eye];
     aiming_adjustments(frustum, get_fov_adjustment());
@@ -284,6 +295,25 @@ void CreationEngineCameraManager::UpdateWorldCamera() {
     if (!vr->is_hmd_active() || ModConstants::cameraShake || ModSettings::showFlatScreenDisplay()) {
         worldCamera->local.rotate = originalRotation;
         worldCamera->local.translate = originalPosition;
+        // A menu's 3D scene in stereo: each eye camera at the game's camera, moved by that eye's offset from the head.
+        if (StereoViewModule::Get()->IsSceneStereo()) {
+            const float scale = tracking::TrackingScale();
+            for (int eye = 0; eye < 2; ++eye) {
+                auto camera = eye == 0 ? StereoViewModule::Get()->LeftCamera() : StereoViewModule::Get()->RightCamera();
+                if (camera == nullptr) {
+                    continue;
+                }
+                const auto offset = tracking::ToHavokVector(glm::vec3{ vr->get_eye_transform(eye == 0 ? VRRuntime::Eye::LEFT : VRRuntime::Eye::RIGHT)[3] } * scale);
+                camera->local.rotate      = originalRotation;
+                camera->local.translate.x = originalPosition.x + offset.x;
+                camera->local.translate.y = originalPosition.y + offset.y;
+                camera->local.translate.z = originalPosition.z + offset.z;
+                if (camera->parent != nullptr) {
+                    RE::NiUpdateData data{};
+                    camera->UpdateWorldData(&data);
+                }
+            }
+        }
         return;
     }
 
