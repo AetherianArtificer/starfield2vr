@@ -233,14 +233,6 @@ namespace MenuStereo
         std::string                           g_snapshot_name;
         int                                   g_snapshot_frames{ -1 };
 
-        // The depth probe: the menu being probed, its step and the frames into that step.
-        constexpr double                      kProbeMetres[]{ 0.35, 0.25, 0.15, 0.05 };
-        constexpr int                         kProbeSteps  = 4;
-        constexpr int                         kProbeFrames = 110;
-        std::string                           g_probe_menu;
-        std::atomic<int>                      g_probe_step{ kProbeSteps };
-        int                                   g_probe_frames{ 0 };
-
         // The values last written to a clip, and the clip's own values they were made from.
         struct Placed
         {
@@ -728,15 +720,6 @@ namespace MenuStereo
             g_snapshot_name   = name;
             g_snapshot_frames = 90;
         }
-        // Each probed menu once a session, whenever it opens while no probe runs.
-        static std::unordered_map<std::string, bool> probed;
-        if ((std::string_view{ name } == "DataMenu" || std::string_view{ name } == "InventoryMenu") && !probed[name] && g_probe_step.load() >= kProbeSteps) {
-            probed[name]   = true;
-            g_probe_menu   = name;
-            g_probe_frames = 0;
-            g_probe_step.store(0);
-            spdlog::info("[MenuStereo] Probing {}: its focus parts step through depths, a snapshot at each", name);
-        }
         g_menus[movie] = MenuMovie{ menu, name };
     }
 
@@ -803,17 +786,6 @@ namespace MenuStereo
 
         // A metre on the panel, 3 m away, is a third of the focal length in the menu's depth.
         const double tilt = g_tilt_degrees.load();
-        {
-            std::scoped_lock _{ g_menus_mutex };
-            const int step = g_probe_step.load();
-            if (step < kProbeSteps && g_probe_menu == menu.name) {
-                for (auto& clip_depth : clips) {
-                    if (clip_depth.metres >= 0.3 && !clip_depth.lift) {
-                        clip_depth.metres = kProbeMetres[step];
-                    }
-                }
-            }
-        }
         constexpr size_t kMaxDepth = 8;
         // Clips named on a line of their own; regions leave them to that line.
         std::vector<void*> named;
@@ -933,15 +905,6 @@ namespace MenuStereo
 
         {
             std::scoped_lock _{ g_menus_mutex };
-            const int step = g_probe_step.load();
-            if (step < kProbeSteps && ++g_probe_frames == kProbeFrames) {
-                g_probe_frames = 0;
-                const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-                VR::get()->request_menu_dump(
-                    Framework::get_persistent_dir(std::format("vr_menu_{}_focus{}cm_{}.png", g_probe_menu, (int)(kProbeMetres[step] * 100.0 + 0.5), stamp)).wstring());
-                spdlog::info("[MenuStereo] Probe of {}: snapshot with focus parts at {:.2f} m", g_probe_menu, kProbeMetres[step]);
-                g_probe_step.store(step + 1);
-            }
             if (g_snapshot_frames >= 0 && g_snapshot_frames-- == 0) {
                 const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
                 VR::get()->request_menu_dump(Framework::get_persistent_dir(std::format("vr_menu_{}_{}.png", g_snapshot_name, stamp)).wstring());
