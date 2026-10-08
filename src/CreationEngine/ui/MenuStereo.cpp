@@ -234,8 +234,14 @@ namespace MenuStereo
         int                                   g_snapshot_frames{ -1 };
 
         // Per clip: -1 when it lies left of the projection centre, 1 right of it, 0 when it is too wide to tilt.
+        struct Placed
+        {
+            double side{ 1.0 };
+            double limit{ 0.0 };   // metres it may come toward the player and stay on the panel
+            double metres{ 0.0 };  // metres it came
+        };
         std::mutex                        g_placed_mutex;
-        std::unordered_map<void*, double> g_side;
+        std::unordered_map<void*, Placed> g_placed;
 
         bool Number(const GFx::Value& object, const char* name, double& out)
         {
@@ -254,8 +260,10 @@ namespace MenuStereo
         // The entry clip each list last lifted.
         std::unordered_map<void*, int> g_lifted;  // list -> clip index
 
-        // BSScrollingContainer: selectedClipIndex and GetClipByIndex give the selected entry's clip.
-        void LiftSelection(GFx::Value& list, double z)
+        // BSScrollingContainer: selectedClipIndex and GetClipByIndex give the selected entry's clip. The entry rises by
+        // `metres`, or as far as its list may still come toward the player.
+        double DepthZ(double metres, double stage_width);
+        void LiftSelection(GFx::Value& list, double metres, double stage_width, double scale)
         {
             double selected = -1.0;
             if (!Number(list, "selectedClipIndex", selected)) {
@@ -273,12 +281,16 @@ namespace MenuStereo
                 }
             };
             std::scoped_lock _{ g_placed_mutex };
+            double lift = metres;
+            if (const auto placed = g_placed.find(list.GetData()); placed != g_placed.end()) {
+                lift = std::min(lift, std::max(0.0, placed->second.limit - placed->second.metres));
+            }
             auto [it, added] = g_lifted.try_emplace(list.GetData(), -1);
             if (it->second != (int)selected) {
                 set(it->second, 0.0);
                 it->second = (int)selected;
             }
-            set((int)selected, z);
+            set((int)selected, DepthZ(lift, stage_width) / scale);
         }
 
         // The clip a clip is masked by, or null.
@@ -314,66 +326,85 @@ namespace MenuStereo
                    Number(centre, "y", cy) && focal > 1.0;
         }
 
-        // Gives a clip its depth, and its tilt about its vertical axis so the edge nearer the centre goes back. Only z and
-        // rotationY are set: the menu's own code and timelines own every other property, and each eye's projection
-        // draws the clip at its 2D place and size. cx is the projection centre in the clip's parent's space.
-        void Place(GFx::Value& clip, double z, double tilt, double focal, double cx, double cy)
+        // How far toward the player a clip may come and still not cross an edge of the stage it does not already touch.
+        // Seen from the eye cameras, a clip m nearer grows about the stage centre by D / (D - m), D the panel's distance;
+        // an edge a gap g from the stage's edge, h from the centre to that stage edge, reaches it at m = D g / h.
+        double Limit(GFx::Value& clip, double cx, double cy)
         {
-            (void)focal;
-            (void)cy;
-            double side = 1.0;
+            GFx::Value root, bounds;
+            double x = 0.0, y = 0.0, w = 0.0, h = 0.0;
+            if (!clip.GetMember("root", &root) || !clip.Invoke("getBounds", &bounds, &root, 1) || !Number(bounds, "x", x) || !Number(bounds, "y", y) ||
+                !Number(bounds, "width", w) || !Number(bounds, "height", h)) {
+                return 0.0;
+            }
+            const double distance = VR::kMenuPanelDistance;
+            double limit = distance;
+            const double gaps[4][2]{ { x, cx }, { 2.0 * cx - (x + w), cx }, { y, cy }, { 2.0 * cy - (y + h), cy } };
+            for (const auto& gap : gaps) {
+                if (gap[0] > 0.0) {
+                    limit = std::min(limit, distance * gap[0] / gap[1]);
+                }
+            }
+            return limit;
+        }
+
+        // Gives a clip its depth, and its tilt about its vertical axis so the edge nearer the centre goes back. Only z and
+        // rotationY are set: the menu's own code and timelines own every other property. (cx, cy) is the stage centre;
+        // parent_cx the stage centre's x in the clip's parent's space.
+        void Place(GFx::Value& clip, double metres, double tilt, double cx, double cy, double parent_cx, double reserve = 0.0)
+        {
+            Placed placed{};
             {
                 std::scoped_lock _{ g_placed_mutex };
-                auto [it, added] = g_side.try_emplace(clip.GetData(), 1.0);
+                auto [it, added] = g_placed.try_emplace(clip.GetData());
                 if (added) {
                     double x = 0.0, width = 0.0;
                     Number(clip, "x", x);
                     Number(clip, "width", width);
-                    it->second = x + width * 0.5 < cx ? -1.0 : 1.0;
+                    it->second.side  = x + width * 0.5 < parent_cx ? -1.0 : 1.0;
+                    it->second.limit = Limit(clip, cx, cy);
                     // Only side-anchored lists tilt; a part as wide as half the stage would swing far out of its place.
                     if (tilt != 0.0 && width > 960.0) {
-                        it->second = 0.0;
+                        it->second.side = 0.0;
                         spdlog::error("[MenuStereo] A clip {:.0f} wide is set to tilt; only parts narrower than half the stage tilt", width);
                     }
                     GFx::Value name;
                     const char* text = clip.GetMember("name", &name) ? name.GetString() : nullptr;
-                    spdlog::info("[MenuStereo] {} at {:.1f} width {:.1f}: depth {:.1f}{}", text ? text : "(unnamed)", x, width, z, tilt != 0.0 ? ", tilted" : "");
+                    const double room = std::max(0.0, it->second.limit - reserve);
+                    spdlog::info("[MenuStereo] {} at {:.1f} width {:.1f}: {:.2f} m toward the player{}{}", text ? text : "(unnamed)", x, width, std::min(metres, room),
+                                 metres > room ? " (as far as the stage's edges allow)" : "", tilt != 0.0 ? ", tilted" : "");
                 }
-                side = it->second;
+                it->second.metres = std::min(metres, std::max(0.0, it->second.limit - reserve));
+                placed            = it->second;
             }
-            clip.SetMember("z", GFx::Value(z));
+            clip.SetMember("z", GFx::Value(DepthZ(placed.metres, 2.0 * cx)));
             if (tilt != 0.0) {
                 // Positive rotationY brings a clip's right edge toward the viewer.
-                clip.SetMember("rotationY", GFx::Value(tilt * side));
+                clip.SetMember("rotationY", GFx::Value(tilt * placed.side));
             }
         }
 
-        // A clip's z for a depth in metres toward the player from the panel. The eyes' projections turn z into disparity in
-        // proportion; m in front of a panel D away has the disparity of z / focal = m / (D - m).
-        double DepthZ(double metres, double focal)
-        {
-            const double distance = VR::kMenuPanelDistance;
-            return -metres * focal / (distance - std::min(metres, distance * 0.9));
-        }
+        // A clip's z for a depth in metres toward the player from the panel: the stage, `stage_width` pixels across, spans
+        // the panel's width.
+        double DepthZ(double metres, double stage_width) { return -metres * stage_width / VR::menu_panel_width(); }
 
         // Places a clip, or its children for an inner line. (ox, oy, scale) places the clip's parent on the stage.
-        void PlaceGroup(GFx::Value& clip, bool inner, double z, double tilt, double focal, double cx, double cy, double ox, double oy, double scale)
+        void PlaceGroup(GFx::Value& clip, bool inner, double metres, double tilt, double cx, double cy, double ox, double oy, double scale, double reserve = 0.0)
         {
             if (!inner) {
-                Place(clip, z, tilt, focal, (cx - ox) / scale, (cy - oy) / scale);
+                Place(clip, metres, tilt, cx, cy, (cx - ox) / scale, reserve);
                 return;
             }
-            double x = 0.0, y = 0.0, s = 1.0, children = 0.0;
-            if (!Number(clip, "x", x) || !Number(clip, "y", y) || !Number(clip, "scaleX", s) || s == 0.0 || !Number(clip, "numChildren", children)) {
+            double x = 0.0, s = 1.0, children = 0.0;
+            if (!Number(clip, "x", x) || !Number(clip, "scaleX", s) || s == 0.0 || !Number(clip, "numChildren", children)) {
                 return;
             }
             const double px = ox + x * scale;
-            const double py = oy + y * scale;
             const double ps = scale * s;
             for (uint32_t i = 0; i < (uint32_t)children && i < 256; ++i) {
                 GFx::Value child, index{ i };
                 if (clip.Invoke("getChildAt", &child, &index, 1) && child.IsObjectLike()) {
-                    Place(child, z, tilt, focal, (cx - px) / ps, (cy - py) / ps);
+                    Place(child, metres, tilt, cx, cy, (cx - px) / ps, reserve);
                 }
             }
         }
@@ -391,18 +422,37 @@ namespace MenuStereo
         };
         StereoParams g_params{};
 
-        // A parallax-only projection for one eye. Every point is drawn where the stage plane would show it, as if it lay on
-        // that plane (depth `zp`), so nothing changes place or size with depth; depth only moves it across, by `shift` NDC
-        // per view unit nearer than the stage plane, the opposite way in the other eye.
-        void EyeProjection(const float* p, float zp, float shift, float* out)
+        // The movie's projection `p`, its camera `distance` from the stage, seen instead from a camera `ratio` times as
+        // far: the x and y rows scaled by the ratio after the move along z, so the stage maps as before.
+        void CameraAt(const float* p, float distance, float ratio, float* out)
         {
+            float m[16];
+            std::memcpy(m, p, sizeof(m));
+            for (int c = 0; c < 4; ++c) {
+                m[c] *= ratio;
+                m[4 + c] *= ratio;
+            }
+            const float back = -(ratio - 1.0f) * distance;
+            for (int r = 0; r < 4; ++r) {
+                m[r * 4 + 3] += m[r * 4 + 2] * back;
+            }
+            std::memcpy(out, m, sizeof(m));
+        }
+
+        // A projection for an eye `s` view units across from the centre, which leaves the stage plane (view depth `zp`)
+        // where it is: the eye's shift, then the shear that brings the stage plane back.
+        void EyeProjection(const float* p, float zp, float s, float* out)
+        {
+            float m[16];
+            std::memcpy(m, p, sizeof(m));
+            for (int r = 0; r < 4; ++r) {
+                m[r * 4 + 3] -= s * m[r * 4 + 0];
+            }
             const float w0 = p[14] * zp + p[15];
-            float m[16]{
-                p[0], p[1], shift * w0, p[3] + p[2] * zp - shift * w0 * zp,
-                p[4], p[5], 0.0f,       p[7] + p[6] * zp,
-                p[8], p[9], p[10],      p[11],
-                0.0f, 0.0f, 0.0f,       w0,
-            };
+            const float k  = p[0] * s / w0;
+            for (int c = 0; c < 4; ++c) {
+                m[c] += k * m[12 + c];
+            }
             std::memcpy(out, m, sizeof(m));
         }
 
@@ -414,21 +464,23 @@ namespace MenuStereo
         void* StereoGetParams(void*) { return &g_params; }
         void  StereoGetProj(void*, const float* projection, float screen_distance, float* left, float* right, float)
         {
-            // The stage plane spans NDC -1..1 across the panel, so view units per metre on it are its width over the
-            // panel's. Seen from a panel D away, a point m nearer moves each eye's image by half the eye distance times
-            // m / (D - m); with z set to give that ratio over the stage plane's distance, each eye moves by half the eye
-            // distance per stage distance of z. Nearer points move right in the left eye.
-            const float zp    = -screen_distance;
-            const float w0    = projection[14] * zp + projection[15];
-            const float width = 2.0f * w0 / std::abs(projection[0]);
-            const float half  = 0.5f * g_ipd.load() * width / VR::menu_panel_width();
-            const float shift = 2.0f * half / (width * screen_distance);
+            // Each eye is a real camera where that eye is: the stage spans the panel's 75 degrees 3 m away, so the camera
+            // sits at the distance that gives that width, and the eyes sit the player's eye distance apart, in view
+            // units per metre on the stage plane. Nearer points move right in the left eye and grow as they come closer.
+            const float zp       = -screen_distance;
+            const float w0       = projection[14] * zp + projection[15];
+            const float width    = 2.0f * w0 / std::abs(projection[0]);
+            const float distance = width * 0.5f / std::tan(VR::kMenuPanelDegrees * 0.5f * 3.14159265f / 180.0f);
+            const float half     = 0.5f * g_ipd.load() * width / VR::menu_panel_width();
+            float camera[16];
+            CameraAt(projection, screen_distance, distance / screen_distance, camera);
+            const float s = projection[0] < 0.0f ? -half : half;
             if (left) {
-                EyeProjection(projection, zp, shift, left);
+                EyeProjection(camera, zp, -s, left);
                 g_eye_projections[0].fetch_add(1);
             }
             if (right) {
-                EyeProjection(projection, zp, -shift, right);
+                EyeProjection(camera, zp, s, right);
                 g_eye_projections[1].fetch_add(1);
             }
             static bool logged = false;
@@ -436,13 +488,13 @@ namespace MenuStereo
                 logged = true;
                 // A point halfway to the camera must sit further right in the left eye than in the right.
                 float r[16];
-                EyeProjection(projection, zp, -shift, r);
+                EyeProjection(camera, zp, s, r);
                 const float zc = zp * 0.5f;
                 const float lx = (left[2] * zc + left[3]) / (left[14] * zc + left[15]);
                 const float rx = (r[2] * zc + r[3]) / (r[14] * zc + r[15]);
-                spdlog::info("[MenuStereo] Menu perspective: camera {:.1f} view units from the stage, stage {:.1f} wide, eye offset {:.2f}; a nearer point is at x {:.4f} "
-                             "left, {:.4f} right ({})",
-                             screen_distance, width, half, lx, rx, lx > rx ? "correct" : "WRONG: depth is inverted");
+                spdlog::info("[MenuStereo] Eye cameras {:.1f} view units from the stage (the movie's {:.1f}), stage {:.1f} wide, eyes {:.2f} apart; a nearer point "
+                             "is at x {:.4f} left, {:.4f} right ({})",
+                             distance, screen_distance, width, 2.0f * half, lx, rx, lx > rx ? "correct" : "WRONG: depth is inverted");
                 spdlog::info("[MenuStereo] Projection rows: [{:.4f} {:.4f} {:.4f} {:.4f}] [{:.4f} {:.4f} {:.4f} {:.4f}] [{:.4f} {:.4f} {:.4f} {:.4f}] [{:.4f} {:.4f} {:.4f} {:.4f}]",
                              projection[0], projection[1], projection[2], projection[3], projection[4], projection[5], projection[6], projection[7], projection[8],
                              projection[9], projection[10], projection[11], projection[12], projection[13], projection[14], projection[15]);
@@ -784,10 +836,9 @@ namespace MenuStereo
             if (!found) {
                 continue;
             }
-            const double z = DepthZ(clip_depth.metres, focal);
             auto& clip = chain[clip_depth.path.size() - 1];
             if (clip_depth.lift) {
-                LiftSelection(clip, z / ps);
+                LiftSelection(clip, clip_depth.metres, 2.0 * cx, ps);
                 continue;
             }
             named.push_back(clip.GetData());
@@ -799,7 +850,14 @@ namespace MenuStereo
                 continue;
             }
             // (px, py, ps) places the clip's parent on the stage.
-            PlaceGroup(clip, clip_depth.inner, z, clip_depth.tilt ? tilt : 0.0, focal, cx, cy, px, py, ps);
+            // A list whose selected entry lifts keeps room for the lift.
+            double reserve = 0.0;
+            for (const auto& other : clips) {
+                if (other.lift && other.path == clip_depth.path) {
+                    reserve = other.metres;
+                }
+            }
+            PlaceGroup(clip, clip_depth.inner, clip_depth.metres, clip_depth.tilt ? tilt : 0.0, cx, cy, px, py, ps, reserve);
         }
 
         // Regions: the root clip's children whose own position lies inside, in stage pixels.
@@ -850,8 +908,7 @@ namespace MenuStereo
                     LogKept(child, is_mask ? "it masks another clip" : "it is masked");
                     break;
                 }
-                const double z = DepthZ(clip_depth.metres, focal);
-                PlaceGroup(child, clip_depth.inner, z, clip_depth.tilt ? tilt : 0.0, focal, cx, cy, ox, oy, scale);
+                PlaceGroup(child, clip_depth.inner, clip_depth.metres, clip_depth.tilt ? tilt : 0.0, cx, cy, ox, oy, scale);
                 break;
             }
         }
