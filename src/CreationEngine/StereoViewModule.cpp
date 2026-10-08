@@ -608,6 +608,26 @@ uintptr_t StereoViewModule::onSetMultiCameraViewData(void* column, uint32_t grap
 
     // The main render graph draws the left eye's view instead of the world camera's.
     auto root = CreationEngineSingletonManager::GetSceneGraphRoot();
+    // Each graph's views, once per distinct set, with what is showing, to learn how menus draw their 3D scenes.
+    if (vr->is_native_stereo() && views && root &&
+        column == StorageColumn(offsets::RenderGraphStorage(), kMultiCameraViewColumn)) {
+        static std::mutex                 mutex;
+        static std::vector<std::string>   seen;
+        std::string ids;
+        for (uint32_t i = 0; i < views->size && i < 8; ++i) {
+            ids += std::format(" {:x}", views->data()[i] & 0xFFFFFF);
+        }
+        const auto line = std::format("{}: graph {:x}{}: {} view(s):{} (main graph {:x}, main view {:x}, left eye view {:x}, right eye view {:x})",
+                                      !instance->m_menu_fallback.load() ? "gameplay" : MenuStereo::SceneMenuShowing() ? "menu with a 3D scene" : "menu", graph_index,
+                                      graph_index == (At<uint32_t>(root, kRootMainRenderGraph) & 0xFFFFFF) ? " (main)" : "", views->size, ids,
+                                      At<uint32_t>(root, kRootMainRenderGraph) & 0xFFFFFF, At<uint32_t>(root, kRootMainView) & 0xFFFFFF,
+                                      instance->m_left_view_id & 0xFFFFFF, instance->m_right_view_id & 0xFFFFFF);
+        std::scoped_lock _{ mutex };
+        if (seen.size() < 80 && std::find(seen.begin(), seen.end(), line) == seen.end()) {
+            seen.push_back(line);
+            spdlog::info("[Stereo] Graph views, {}", line);
+        }
+    }
     if (instance->m_registered && vr->is_native_stereo() && !instance->m_menu_fallback.load() && views && root && views->size == 1 &&
         column == StorageColumn(offsets::RenderGraphStorage(), kMultiCameraViewColumn) && graph_index == (At<uint32_t>(root, kRootMainRenderGraph) & 0xFFFFFF) &&
         (views->data()[0] & 0xFFFFFF) == (At<uint32_t>(root, kRootMainView) & 0xFFFFFF)) {

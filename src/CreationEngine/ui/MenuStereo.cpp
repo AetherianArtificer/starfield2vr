@@ -9,6 +9,7 @@
 #include <_deps/directxtk12-src/Src/d3dx12.h>
 #include <algorithm>
 #include <atomic>
+#include <memory>
 #include <chrono>
 #include <format>
 #include <cmath>
@@ -229,6 +230,9 @@ namespace MenuStereo
         std::mutex                            g_menus_mutex;
         std::unordered_map<void*, MenuMovie>  g_menus;  // movie -> menu
         std::atomic<float>                    g_ipd{ 0.064f };
+        // The engine frame a menu showing a 3D scene of the game's last advanced.
+        std::atomic<int64_t> g_scene_frame{ -100 };
+
         // A menu opened for the first time this session, snapshotted after this many per-eye frames.
         std::string                           g_snapshot_name;
         int                                   g_snapshot_frames{ -1 };
@@ -329,7 +333,7 @@ namespace MenuStereo
         // How far toward the player a clip may come and still not cross an edge of the stage it does not already touch.
         // Seen from the eye cameras, a clip m nearer grows about the stage centre by D / (D - m), D the panel's distance;
         // an edge a gap g from the stage's edge, h from the centre to that stage edge, reaches it at m = D g / h.
-        double Limit(GFx::Value& clip, double cx, double cy)
+        double MeasureLimit(GFx::Value& clip, double cx, double cy)
         {
             GFx::Value root, bounds;
             double x = 0.0, y = 0.0, w = 0.0, h = 0.0;
@@ -348,39 +352,52 @@ namespace MenuStereo
             return limit;
         }
 
-        // Gives a clip its depth, and its tilt about its vertical axis so the edge nearer the centre goes back. Only z and
-        // rotationY are set: the menu's own code and timelines own every other property. (cx, cy) is the stage centre;
-        // parent_cx the stage centre's x in the clip's parent's space.
-        void Place(GFx::Value& clip, double metres, double tilt, double cx, double cy, double parent_cx, double reserve = 0.0)
+        // A clip's limit, measured the first time it is placed.
+        double Limit(GFx::Value& clip, double cx, double cy)
         {
-            Placed placed{};
             {
                 std::scoped_lock _{ g_placed_mutex };
-                auto [it, added] = g_placed.try_emplace(clip.GetData());
-                if (added) {
+                if (const auto it = g_placed.find(clip.GetData()); it != g_placed.end()) {
+                    return it->second.limit;
+                }
+            }
+            const double limit = MeasureLimit(clip, cx, cy);
+            std::scoped_lock _{ g_placed_mutex };
+            g_placed.try_emplace(clip.GetData(), Placed{ 1.0, limit, 0.0 });
+            return limit;
+        }
+
+        // Gives a clip its group's depth, and its tilt about its vertical axis so the edge nearer the centre goes back.
+        // Only z and rotationY are set: the menu's own code and timelines own every other property. parent_cx is the
+        // stage centre's x in the clip's parent's space.
+        void Place(GFx::Value& clip, double metres, double tilt, double cx, double parent_cx)
+        {
+            double side = 1.0;
+            {
+                std::scoped_lock _{ g_placed_mutex };
+                auto& placed = g_placed[clip.GetData()];
+                if (placed.metres != metres || placed.side == 1.0 && tilt != 0.0 && placed.metres == 0.0) {
                     double x = 0.0, width = 0.0;
                     Number(clip, "x", x);
                     Number(clip, "width", width);
-                    it->second.side  = x + width * 0.5 < parent_cx ? -1.0 : 1.0;
-                    it->second.limit = Limit(clip, cx, cy);
+                    placed.side = x + width * 0.5 < parent_cx ? -1.0 : 1.0;
                     // Only side-anchored lists tilt; a part as wide as half the stage would swing far out of its place.
                     if (tilt != 0.0 && width > 960.0) {
-                        it->second.side = 0.0;
+                        placed.side = 0.0;
                         spdlog::error("[MenuStereo] A clip {:.0f} wide is set to tilt; only parts narrower than half the stage tilt", width);
                     }
                     GFx::Value name;
                     const char* text = clip.GetMember("name", &name) ? name.GetString() : nullptr;
-                    const double room = std::max(0.0, it->second.limit - reserve);
-                    spdlog::info("[MenuStereo] {} at {:.1f} width {:.1f}: {:.2f} m toward the player{}{}", text ? text : "(unnamed)", x, width, std::min(metres, room),
-                                 metres > room ? " (as far as the stage's edges allow)" : "", tilt != 0.0 ? ", tilted" : "");
+                    spdlog::info("[MenuStereo] {} at {:.1f} width {:.1f}: {:.2f} m toward the player{}", text ? text : "(unnamed)", x, width, metres,
+                                 tilt != 0.0 ? ", tilted" : "");
                 }
-                it->second.metres = std::min(metres, std::max(0.0, it->second.limit - reserve));
-                placed            = it->second;
+                placed.metres = metres;
+                side          = placed.side;
             }
-            clip.SetMember("z", GFx::Value(DepthZ(placed.metres, 2.0 * cx)));
+            clip.SetMember("z", GFx::Value(DepthZ(metres, 2.0 * cx)));
             if (tilt != 0.0) {
                 // Positive rotationY brings a clip's right edge toward the viewer.
-                clip.SetMember("rotationY", GFx::Value(tilt * placed.side));
+                clip.SetMember("rotationY", GFx::Value(tilt * side));
             }
         }
 
@@ -388,23 +405,31 @@ namespace MenuStereo
         // the panel's width.
         double DepthZ(double metres, double stage_width) { return -metres * stage_width / VR::menu_panel_width(); }
 
-        // Places a clip, or its children for an inner line. (ox, oy, scale) places the clip's parent on the stage.
-        void PlaceGroup(GFx::Value& clip, bool inner, double metres, double tilt, double cx, double cy, double ox, double oy, double scale, double reserve = 0.0)
+        // A clip a layout line moves, and the stage centre's x in its parent's space.
+        struct Member
+        {
+            std::unique_ptr<GFx::Value> clip;
+            double                      parent_cx;
+        };
+
+        // The clip itself, or its children for an inner line. (ox, scale) places the clip's parent on the stage.
+        void AddMembers(std::vector<Member>& members, std::unique_ptr<GFx::Value> clip, bool inner, double cx, double ox, double scale)
         {
             if (!inner) {
-                Place(clip, metres, tilt, cx, cy, (cx - ox) / scale, reserve);
+                members.push_back(Member{ std::move(clip), (cx - ox) / scale });
                 return;
             }
             double x = 0.0, s = 1.0, children = 0.0;
-            if (!Number(clip, "x", x) || !Number(clip, "scaleX", s) || s == 0.0 || !Number(clip, "numChildren", children)) {
+            if (!Number(*clip, "x", x) || !Number(*clip, "scaleX", s) || s == 0.0 || !Number(*clip, "numChildren", children)) {
                 return;
             }
             const double px = ox + x * scale;
             const double ps = scale * s;
             for (uint32_t i = 0; i < (uint32_t)children && i < 256; ++i) {
-                GFx::Value child, index{ i };
-                if (clip.Invoke("getChildAt", &child, &index, 1) && child.IsObjectLike()) {
-                    Place(child, metres, tilt, cx, cy, (cx - px) / ps, reserve);
+                auto child = std::make_unique<GFx::Value>();
+                GFx::Value index{ i };
+                if (clip->Invoke("getChildAt", child.get(), &index, 1) && child->IsObjectLike()) {
+                    members.push_back(Member{ std::move(child), (cx - px) / ps });
                 }
             }
         }
@@ -768,6 +793,9 @@ namespace MenuStereo
             }
             menu = it->second;
         }
+        if (menu.name == "DataMenu" || menu.name == "InventoryMenu") {
+            g_scene_frame.store(vr->m_engine_frame_count);
+        }
         std::vector<ClipDepth> clips;
         {
             std::scoped_lock _{ g_layout_mutex };
@@ -802,19 +830,29 @@ namespace MenuStereo
             return;
         }
 
-        // A metre on the panel, 3 m away, is a third of the focal length in the menu's depth.
+        // Each layout line moves a group: the named clip, or the root clip's children inside its region, or their children
+        // for an inner line. Every member of a group gets the same depth: the line's tier, or as far as the group's
+        // nearest-to-the-edge member allows, less room for any lift inside it.
         const double tilt = g_tilt_degrees.load();
         constexpr size_t kMaxDepth = 8;
-        // Clips named on a line of their own; regions leave them to that line.
-        std::vector<void*> named;
-        for (const auto& clip_depth : clips) {
+        std::vector<std::vector<Member>> groups(clips.size());
+        std::vector<double>              placed_metres(clips.size(), 0.0);
+        std::vector<void*>               named;
+        struct Lift
+        {
+            std::unique_ptr<GFx::Value> list;
+            size_t                      line;
+            double                      scale;
+        };
+        std::vector<Lift> lifts;
+        for (size_t line = 0; line < clips.size(); ++line) {
+            const auto& clip_depth = clips[line];
             if (clip_depth.path.empty() || clip_depth.path.size() > kMaxDepth) {
                 continue;
             }
-            // The centre in the clip's parent's space, through the 2D placement of the clips above it.
             GFx::Value chain[kMaxDepth];
             const GFx::Value* at = menu_root;
-            double px = ox, py = oy, ps = scale;
+            double px = ox, ps = scale;
             bool found = true;
             for (size_t i = 0; i < clip_depth.path.size(); ++i) {
                 if (!at->GetMember(clip_depth.path[i].c_str(), &chain[i]) || !chain[i].IsObjectLike()) {
@@ -822,13 +860,12 @@ namespace MenuStereo
                     break;
                 }
                 if (i + 1 < clip_depth.path.size()) {
-                    double x = 0.0, y = 0.0, s = 1.0;
-                    if (!Number(chain[i], "x", x) || !Number(chain[i], "y", y) || !Number(chain[i], "scaleX", s) || s == 0.0) {
+                    double x = 0.0, s = 1.0;
+                    if (!Number(chain[i], "x", x) || !Number(chain[i], "scaleX", s) || s == 0.0) {
                         found = false;
                         break;
                     }
                     px += x * ps;
-                    py += y * ps;
                     ps *= s;
                 }
                 at = &chain[i];
@@ -838,7 +875,10 @@ namespace MenuStereo
             }
             auto& clip = chain[clip_depth.path.size() - 1];
             if (clip_depth.lift) {
-                LiftSelection(clip, clip_depth.metres, 2.0 * cx, ps);
+                auto list = std::make_unique<GFx::Value>();
+                if (at->GetMember(clip_depth.path.back().c_str(), list.get()) && list->IsObjectLike()) {
+                    lifts.push_back(Lift{ std::move(list), line, ps });
+                }
                 continue;
             }
             named.push_back(clip.GetData());
@@ -849,15 +889,11 @@ namespace MenuStereo
                 LogKept(clip, "it is masked");
                 continue;
             }
-            // (px, py, ps) places the clip's parent on the stage.
-            // A list whose selected entry lifts keeps room for the lift.
-            double reserve = 0.0;
-            for (const auto& other : clips) {
-                if (other.lift && other.path == clip_depth.path) {
-                    reserve = other.metres;
-                }
+            auto held = std::make_unique<GFx::Value>();
+            if (!at->GetMember(clip_depth.path.back().c_str(), held.get()) || !held->IsObjectLike()) {
+                continue;
             }
-            PlaceGroup(clip, clip_depth.inner, clip_depth.metres, clip_depth.tilt ? tilt : 0.0, cx, cy, px, py, ps, reserve);
+            AddMembers(groups[line], std::move(held), clip_depth.inner, cx, px, ps);
         }
 
         // Regions: the root clip's children whose own position lies inside, in stage pixels.
@@ -865,52 +901,88 @@ namespace MenuStereo
         for (const auto& clip_depth : clips) {
             any_region = any_region || clip_depth.path.empty();
         }
-        if (!any_region) {
-            return;
-        }
         auto root = const_cast<GFx::Value*>(menu_root);
         double children = 0.0;
-        if (!Number(*root, "numChildren", children)) {
-            return;
-        }
-        const uint32_t count = std::min<uint32_t>((uint32_t)children, 512);
-        std::vector<void*> masks;
-        for (uint32_t i = 0; i < count; ++i) {
-            GFx::Value child, index{ i };
-            if (root->Invoke("getChildAt", &child, &index, 1) && child.IsObjectLike()) {
-                if (auto mask = MaskOf(child)) {
-                    masks.push_back(mask);
+        if (any_region && Number(*root, "numChildren", children)) {
+            const uint32_t count = std::min<uint32_t>((uint32_t)children, 512);
+            std::vector<void*> masks;
+            for (uint32_t i = 0; i < count; ++i) {
+                GFx::Value child, index{ i };
+                if (root->Invoke("getChildAt", &child, &index, 1) && child.IsObjectLike()) {
+                    if (auto mask = MaskOf(child)) {
+                        masks.push_back(mask);
+                    }
                 }
             }
-        }
-        for (uint32_t i = 0; i < count; ++i) {
-            GFx::Value child, index{ i };
-            double x = 0.0, y = 0.0;
-            if (!root->Invoke("getChildAt", &child, &index, 1) || !child.IsObjectLike() || !OwnPosition(child, x, y)) {
-                continue;
-            }
-            if (std::find(named.begin(), named.end(), child.GetData()) != named.end()) {
-                continue;
-            }
-            const bool is_mask = std::find(masks.begin(), masks.end(), child.GetData()) != masks.end();
-            const bool masked  = MaskOf(child) != nullptr;
-            const double sx = ox + x * scale;
-            const double sy = oy + y * scale;
-            for (const auto& clip_depth : clips) {
-                const auto& r = clip_depth.region;
-                if (!clip_depth.path.empty() || sx < r[0] || sx > r[2] || sy < r[1] || sy > r[3]) {
+            for (uint32_t i = 0; i < count; ++i) {
+                auto child = std::make_unique<GFx::Value>();
+                GFx::Value index{ i };
+                double x = 0.0, y = 0.0;
+                if (!root->Invoke("getChildAt", child.get(), &index, 1) || !child->IsObjectLike() || !OwnPosition(*child, x, y)) {
                     continue;
                 }
-                if (clip_depth.metres == 0.0 && !clip_depth.tilt) {
+                if (std::find(named.begin(), named.end(), child->GetData()) != named.end()) {
+                    continue;
+                }
+                const bool is_mask = std::find(masks.begin(), masks.end(), child->GetData()) != masks.end();
+                const bool masked  = MaskOf(*child) != nullptr;
+                const double sx = ox + x * scale;
+                const double sy = oy + y * scale;
+                for (size_t line = 0; line < clips.size(); ++line) {
+                    const auto& clip_depth = clips[line];
+                    const auto& r = clip_depth.region;
+                    if (!clip_depth.path.empty() || sx < r[0] || sx > r[2] || sy < r[1] || sy > r[3]) {
+                        continue;
+                    }
+                    if (clip_depth.metres == 0.0 && !clip_depth.tilt) {
+                        break;
+                    }
+                    if (is_mask || masked) {
+                        LogKept(*child, is_mask ? "it masks another clip" : "it is masked");
+                        break;
+                    }
+                    AddMembers(groups[line], std::move(child), clip_depth.inner, cx, ox, scale);
                     break;
                 }
-                if (is_mask || masked) {
-                    LogKept(child, is_mask ? "it masks another clip" : "it is masked");
-                    break;
-                }
-                PlaceGroup(child, clip_depth.inner, clip_depth.metres, clip_depth.tilt ? tilt : 0.0, cx, cy, ox, oy, scale);
-                break;
             }
+        }
+
+        for (size_t line = 0; line < clips.size(); ++line) {
+            auto& members = groups[line];
+            if (members.empty()) {
+                continue;
+            }
+            const auto& clip_depth = clips[line];
+            double limit = VR::kMenuPanelDistance;
+            for (auto& member : members) {
+                limit = std::min(limit, Limit(*member.clip, cx, cy));
+            }
+            double reserve = 0.0;
+            for (const auto& o : clips) {
+                if (o.lift && !clip_depth.path.empty() && clip_depth.path.size() <= o.path.size() &&
+                    std::equal(clip_depth.path.begin(), clip_depth.path.end(), o.path.begin())) {
+                    reserve = std::max(reserve, o.metres);
+                }
+            }
+            const double metres = std::min(clip_depth.metres, std::max(0.0, limit - reserve));
+            placed_metres[line] = metres;
+            for (auto& member : members) {
+                Place(*member.clip, metres, clip_depth.tilt ? tilt : 0.0, cx, member.parent_cx);
+            }
+        }
+
+        // A lift rises from where its list's group was placed, as far as its list's own limit allows.
+        for (auto& lift : lifts) {
+            const auto& path   = clips[lift.line].path;
+            double      carried = 0.0;
+            for (size_t other = 0; other < clips.size(); ++other) {
+                const auto& o = clips[other].path;
+                if (!clips[other].lift && !o.empty() && o.size() <= path.size() && std::equal(o.begin(), o.end(), path.begin())) {
+                    carried = std::max(carried, placed_metres[other]);
+                }
+            }
+            const double room = std::max(0.0, Limit(*lift.list, cx, cy) - carried);
+            LiftSelection(*lift.list, std::min(clips[lift.line].metres, room), 2.0 * cx, lift.scale);
         }
     }
 
@@ -941,4 +1013,6 @@ namespace MenuStereo
     }
 
     void EndFrame() { g_frame_open = false; }
+
+    bool SceneMenuShowing() { return VR::get()->m_engine_frame_count - g_scene_frame.load() <= 3; }
 }
